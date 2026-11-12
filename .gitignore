@@ -211,6 +211,17 @@ cython_debug/
 #  settings.local.json contains personal/local overrides and should not be shared
 .claude/settings.local.json
 
+# Kilo
+#  Project config under .kilo/ (agent/*.md, command/*.md) is shareable and stays
+#  tracked — do not ignore the whole folder.
+#  agent-manager.json is local UI/recovery state. Kilo ships a nested .kilo/.gitignore
+#  that hides it but also hides itself, so those rules never reach other clones;
+#  mirroring the path here keeps local state out of every clone.
+.kilo/agent-manager.json
+#  Scratch plan files written by plan mode. Intentional plans belong in
+#  docs/superpowers/plans/ (see the SDD note at the bottom of this file).
+.kilo/plans/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
