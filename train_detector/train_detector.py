@@ -57,11 +57,13 @@ Output:
 """
 
 import argparse
+import functools
 import hashlib
 import json
 import os
 import platform
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -77,6 +79,7 @@ import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
+from ultralytics.models.yolo.detect.train import DetectionTrainer
 
 try:
     import psutil
@@ -114,6 +117,42 @@ STANDARD_IMGSZ = [320, 416, 512, 640, 768, 1024, 1280, 1536]
 MODEL_QUALITY_ORDER = ["yolo26n.pt", "yolo26m.pt", "yolo26l.pt", "yolo26x.pt"]
 
 MEMORY_CACHE_PATH = WEIGHTS_DIR / "memory_profiles.json"
+
+
+# -- Adaptive safe-resume / crash-prevention constants ----------------------------
+# Quality-first: never exceed these fractions of total memory during a run.
+ADAPTIVE_GPU_FRACTION = 0.75       # adaptive ceiling fraction of VRAM
+EMERGENCY_GPU_FRACTION = 0.82      # emergency (mid-epoch abort) fraction of VRAM
+ADAPTIVE_CPU_RSS_FRACTION = 0.50   # adaptive ceiling fraction of RAM (RSS)
+EMERGENCY_CPU_RSS_FRACTION = 0.60  # emergency ceiling fraction of RAM (RSS)
+ADAPTIVE_AVAIL_RAM_FRACTION = 0.25 # adaptive: available RAM must be >= this fraction of total
+EMERGENCY_AVAIL_RAM_FRACTION = 0.15# emergency: available RAM must be >= this fraction of total
+# Profile caps (peak reserved / RSS as fraction of total) used for guard thresholds.
+GUARD_PROFILE_CAPS = {
+    "safe":       {"gpu": 0.68, "cpu": 0.38},
+    "balanced":   {"gpu": 0.75, "cpu": 0.45},
+    "aggressive": {"gpu": 0.85, "cpu": 0.55},
+}
+GUARD_SAMPLE_INTERVAL_SECONDS = 2.0
+GUARD_POLL_EVERY_BATCHES = 16
+STABLE_EPOCHS_BEFORE_STEP_UP = 3
+STABLE_STEP_UP_GPU_FRACTION = 0.55
+ADAPTIVE_EPOCH_ATTEMPT_CAP = 1     # provisional config: 1 epoch per attempt
+MAX_ADAPTIVE_CONFIG_DOWNGRADES = 12
+AUG_LADDER = [
+    # (mosaic, copy_paste, mixup, multi_scale)
+    (1.0, 0.3, 0.15, 0.0),
+    (1.0, 0.3, 0.0,  0.0),
+    (1.0, 0.0, 0.0,  0.0),
+    (0.5, 0.3, 0.15, 0.0),
+    (0.5, 0.3, 0.0,  0.0),
+    (0.5, 0.0, 0.0,  0.0),
+    (0.0, 0.0, 0.0,  0.0),
+]
+BATCH_LADDER_DOWN = [8, 4, 2, 1]
+IMGSZ_LADDER_DOWN = None  # computed from native cap at runtime
+ADAPTIVE_DIRNAME = ".adaptive"
+ADAPTIVE_STATE_FILE = "state.json"
 
 
 # -- Local Timestamps ------------------------------------------------------------
@@ -521,84 +560,210 @@ def process_rss_bytes():
         return None
 
 
-class MemoryMonitor:
+class MemoryGuard:
     """
-    Optional background sampling thread. Peak stats are measured, never
-    enforced: the monitor logs periodic summaries and threshold warnings but
-    does not restart training or change batch/workers/imgsz mid-run.
+    Background memory sampler that ENFORCES safety during training.
+
+    Two severity levels:
+      - emergency: a single sample above the emergency ceiling -> request mid-epoch
+        abort (trainer.stop=True at on_train_batch_end). Partial epoch; caller
+        restores backups.
+      - adaptive: two consecutive samples above the adaptive ceiling -> request
+        clean epoch boundary abort (trainer.stop=True at on_fit_epoch_end). No
+        restore needed because the epoch completed.
     """
 
-    SAMPLE_INTERVAL = 5.0
+    SAMPLE_INTERVAL = GUARD_SAMPLE_INTERVAL_SECONDS
     SUMMARY_INTERVAL = 60.0
 
-    def __init__(self, logger, cuda_index, gpu_limit_gb, cpu_limit_gb, profile_name):
+    def __init__(self, logger, cuda_index, gpu_adaptive_gb, gpu_emergency_gb,
+                 cpu_adaptive_gb, cpu_emergency_gb, avail_adaptive_gb, avail_emergency_gb,
+                 profile_name, guard_enabled=True):
         self.logger = logger
         self.cuda_index = cuda_index
-        self.gpu_limit_gb = gpu_limit_gb
-        self.cpu_limit_gb = cpu_limit_gb
+        self.gpu_adaptive_gb = gpu_adaptive_gb
+        self.gpu_emergency_gb = gpu_emergency_gb
+        self.cpu_adaptive_gb = cpu_adaptive_gb
+        self.cpu_emergency_gb = cpu_emergency_gb
+        self.avail_adaptive_gb = avail_adaptive_gb
+        self.avail_emergency_gb = avail_emergency_gb
         self.profile_name = profile_name
+        self.guard_enabled = guard_enabled
         self._stop = threading.Event()
         self._thread = None
+        self._lock = threading.Lock()
         self._peak_alloc = 0.0
         self._peak_reserved = 0.0
         self._peak_rss = 0.0
+        self._latest = {"gpu_reserved": 0.0, "gpu_alloc": 0.0, "rss": 0.0,
+                        "avail": None, "temp_c": None, "power_pct": None}
+        self._adaptive_streak = 0
+        self._emergency_pending = False
+        self._adaptive_pending = False
         self._warned_gpu = False
         self._warned_cpu = False
+        self._warned_temp = False
+        self._warned_power = False
+        self._temp_over_count = 0
+        self._last_summary = time.monotonic()
 
     def cuda_active(self):
         return self.cuda_index is not None
 
     def reset(self):
-        """Reset CUDA peak stats just before full training starts."""
         if self.cuda_active():
             try:
                 torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats(self.cuda_index)
             except Exception as e:
                 self.logger.log(f"[MEM] Could not reset CUDA peak stats: {e}")
-        self._peak_alloc = 0.0
-        self._peak_reserved = 0.0
-        self._peak_rss = 0.0
+        with self._lock:
+            self._peak_alloc = 0.0
+            self._peak_reserved = 0.0
+            self._peak_rss = 0.0
+            self._adaptive_streak = 0
+            self._emergency_pending = False
+            self._adaptive_pending = False
 
-    def sample(self):
+    def _sample_once(self):
+        gpu_reserved = 0.0
+        gpu_alloc = 0.0
         if self.cuda_active():
             try:
-                self._peak_alloc = max(self._peak_alloc, torch.cuda.max_memory_allocated(self.cuda_index) / 2**30)
-                self._peak_reserved = max(self._peak_reserved, torch.cuda.max_memory_reserved(self.cuda_index) / 2**30)
+                # reset per-interval peak windows to capture burst usage
+                torch.cuda.reset_peak_memory_stats(self.cuda_index)
+                gpu_alloc = torch.cuda.max_memory_allocated(self.cuda_index) / 2**30
+                gpu_reserved = torch.cuda.max_memory_reserved(self.cuda_index) / 2**30
+                # also read current device memory for live burst
+                try:
+                    gpu_reserved = max(gpu_reserved, torch.cuda.memory_reserved(self.cuda_index) / 2**30)
+                except Exception:
+                    pass
             except Exception:
                 pass
+            # temperature / power (optional pynvml)
+            try:
+                import pynvml
+                pynvml.nvmlInit()
+                h = pynvml.nvmlDeviceGetHandleByIndex(int(self.cuda_index))
+                temp = pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU)
+                power = pynvml.nvmlDeviceGetPowerUsage(h)
+                limit = pynvml.nvmlDeviceGetPowerLimit(h)
+                pct = (power / limit * 100.0) if limit else None
+                with self._lock:
+                    self._latest["temp_c"] = temp
+                    self._latest["power_pct"] = pct
+                if temp is not None and temp >= 90:
+                    self._temp_over_count += 1
+                    if self._temp_over_count >= 2 and not self._warned_temp:
+                        self._warned_temp = True
+                        self.logger.log(f"[MEM] GPU temperature {temp} C >= 90 for 2 samples; requesting adaptive stop.")
+                        with self._lock:
+                            self._adaptive_pending = True
+                else:
+                    self._temp_over_count = 0
+                if pct is not None and pct > 95 and not self._warned_power:
+                    self._warned_power = True
+                    self.logger.log(f"[MEM WARNING] GPU power {pct:.0f}% of limit.")
+            except Exception:
+                pass
+
+        rss_gb = None
         rss_bytes = process_rss_bytes()
         if rss_bytes is not None:
-            self._peak_rss = max(self._peak_rss, rss_bytes / 2**30)
-        self._check_thresholds()
+            rss_gb = rss_bytes / 2**30
+        avail_gb = None
+        if PSUTIL_AVAILABLE:
+            try:
+                avail_gb = psutil.virtual_memory().available / 2**30
+                total_gb = psutil.virtual_memory().total / 2**30
+            except Exception:
+                total_gb = None
+        else:
+            total_gb = None
 
-    def _check_thresholds(self):
-        if self.gpu_limit_gb and self._peak_reserved > self.gpu_limit_gb and not self._warned_gpu:
+        with self._lock:
+            self._peak_alloc = max(self._peak_alloc, gpu_alloc)
+            self._peak_reserved = max(self._peak_reserved, gpu_reserved)
+            if rss_gb is not None:
+                self._peak_rss = max(self._peak_rss, rss_gb)
+            self._latest["gpu_reserved"] = gpu_reserved
+            self._latest["gpu_alloc"] = gpu_alloc
+            self._latest["rss"] = rss_gb if rss_gb is not None else self._latest["rss"]
+            self._latest["avail"] = avail_gb
+
+        # threshold evaluation (only if guard enabled)
+        if not self.guard_enabled:
+            return
+
+        emergency = False
+        adaptive = False
+        reasons = []
+        if self.cuda_active():
+            if gpu_reserved > self.gpu_emergency_gb:
+                emergency = True
+                reasons.append(f"GPU reserved {gpu_reserved:.2f} > emergency {self.gpu_emergency_gb:.2f}")
+            elif gpu_reserved > self.gpu_adaptive_gb:
+                adaptive = True
+                reasons.append(f"GPU reserved {gpu_reserved:.2f} > adaptive {self.gpu_adaptive_gb:.2f}")
+        if rss_gb is not None:
+            if self.cpu_emergency_gb and rss_gb > self.cpu_emergency_gb:
+                emergency = True
+                reasons.append(f"CPU RSS {rss_gb:.2f} > emergency {self.cpu_emergency_gb:.2f}")
+            elif self.cpu_adaptive_gb and rss_gb > self.cpu_adaptive_gb:
+                adaptive = True
+                reasons.append(f"CPU RSS {rss_gb:.2f} > adaptive {self.cpu_adaptive_gb:.2f}")
+        if avail_gb is not None and total_gb:
+            if avail_gb < total_gb * EMERGENCY_AVAIL_RAM_FRACTION:
+                emergency = True
+                reasons.append(f"available RAM {avail_gb:.2f} < emergency {total_gb*EMERGENCY_AVAIL_RAM_FRACTION:.2f}")
+            elif avail_gb < total_gb * ADAPTIVE_AVAIL_RAM_FRACTION:
+                adaptive = True
+                reasons.append(f"available RAM {avail_gb:.2f} < adaptive {total_gb*ADAPTIVE_AVAIL_RAM_FRACTION:.2f}")
+
+        with self._lock:
+            if emergency:
+                if not self._emergency_pending:
+                    self.logger.log(f"[MEM ENFORCE] EMERGENCY sample: {'; '.join(reasons)} -> aborting current epoch (partial).")
+                self._emergency_pending = True
+                self._adaptive_pending = False
+                self._adaptive_streak = 0
+            elif adaptive:
+                self._adaptive_streak += 1
+                if self._adaptive_streak >= 2:
+                    if not self._adaptive_pending:
+                        self.logger.log(f"[MEM ENFORCE] ADAPTIVE pressure for 2 samples: {'; '.join(reasons)} -> finishing epoch then stopping.")
+                    self._adaptive_pending = True
+            else:
+                self._adaptive_streak = 0
+
+        if gpu_reserved > (self.gpu_adaptive_gb or 1e9) and not self._warned_gpu:
             self._warned_gpu = True
-            self.logger.log(
-                f"[MEM WARNING] GPU peak reserved {self._peak_reserved:.2f} GB exceeds the "
-                f"'{self.profile_name}' limit {self.gpu_limit_gb:.2f} GB. Training continues; watch for OOM."
-            )
-        if self.cpu_limit_gb and self._peak_rss > self.cpu_limit_gb and not self._warned_cpu:
+            self.logger.log(f"[MEM WARNING] GPU peak reserved {gpu_reserved:.2f} GB exceeds adaptive limit {self.gpu_adaptive_gb:.2f} GB.")
+        if rss_gb is not None and self.cpu_adaptive_gb and rss_gb > self.cpu_adaptive_gb and not self._warned_cpu:
             self._warned_cpu = True
-            self.logger.log(
-                f"[MEM WARNING] CPU peak RSS {self._peak_rss:.2f} GB exceeds the "
-                f"'{self.profile_name}' limit {self.cpu_limit_gb:.2f} GB."
-            )
+            self.logger.log(f"[MEM WARNING] CPU peak RSS {rss_gb:.2f} GB exceeds adaptive limit {self.cpu_adaptive_gb:.2f} GB.")
+
+    def sample(self):
+        try:
+            self._sample_once()
+        except Exception:
+            pass
 
     def summary_line(self, tag=""):
-        parts = []
-        if self.cuda_active():
-            limit = f" (limit {self.gpu_limit_gb:.2f})" if self.gpu_limit_gb else ""
-            parts.append(f"GPU alloc peak {self._peak_alloc:.2f} GB | GPU reserved peak {self._peak_reserved:.2f} GB{limit}")
-        if PSUTIL_AVAILABLE:
-            limit = f" (limit {self.cpu_limit_gb:.2f})" if self.cpu_limit_gb else ""
-            parts.append(f"CPU RSS peak {self._peak_rss:.2f} GB{limit}")
-        else:
-            parts.append("CPU RSS sampling unavailable (psutil not installed)")
-        if not parts:
-            parts.append("no memory sampling available")
-        return f"[MEM {local_now().strftime('%H:%M:%S')}] {tag + ' ' if tag else ''}" + " | ".join(parts)
+        with self._lock:
+            parts = []
+            if self.cuda_active():
+                limit = f" (adaptive {self.gpu_adaptive_gb:.2f})" if self.gpu_adaptive_gb else ""
+                parts.append(f"GPU alloc peak {self._peak_alloc:.2f} GB | GPU reserved peak {self._peak_reserved:.2f} GB{limit}")
+            if PSUTIL_AVAILABLE:
+                limit = f" (adaptive {self.cpu_adaptive_gb:.2f})" if self.cpu_adaptive_gb else ""
+                parts.append(f"CPU RSS peak {self._peak_rss:.2f} GB{limit}")
+            else:
+                parts.append("CPU RSS sampling unavailable (psutil not installed)")
+            if not parts:
+                parts.append("no memory sampling available")
+            return f"[MEM {local_now().strftime('%H:%M:%S')}] {tag + ' ' if tag else ''}" + " | ".join(parts)
 
     def log_summary(self, tag=""):
         self.sample()
@@ -614,7 +779,7 @@ class MemoryMonitor:
     def start(self):
         self.reset()
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True, name="memory-monitor")
+        self._thread = threading.Thread(target=self._run, daemon=True, name="memory-guard")
         self._thread.start()
 
     def _run(self):
@@ -638,18 +803,106 @@ class MemoryMonitor:
             self._thread = None
         self.log_summary("final:")
 
+    # Enforcement API used by callbacks
+    def consume_emergency(self) -> bool:
+        with self._lock:
+            v = self._emergency_pending
+            self._emergency_pending = False
+            return v
 
-def make_monitor(logger, hw, device, args) -> MemoryMonitor:
-    profile = MEMORY_PROFILES[args.memory_profile]
+    def consume_adaptive(self) -> bool:
+        with self._lock:
+            v = self._adaptive_pending
+            self._adaptive_pending = False
+            return v
+
+    def latest(self) -> dict:
+        with self._lock:
+            return dict(self._latest)
+
+    def peak_reserved(self) -> float:
+        with self._lock:
+            return self._peak_reserved
+
+    def peak_rss(self) -> float:
+        with self._lock:
+            return self._peak_rss
+
+
+def make_guard(logger, hw, device, args, guard_enabled=True) -> MemoryGuard:
+    profile = GUARD_PROFILE_CAPS.get(args.memory_profile, GUARD_PROFILE_CAPS["safe"])
     cuda_index = cuda_index_for(device) if cuda_available_for(device) else None
-    gpu_limit = hw["vram_gb"] * profile["gpu"] if (cuda_index is not None and hw.get("vram_gb")) else None
-    cpu_limit = hw["ram_gb"] * profile["cpu"] if hw.get("ram_gb") else None
+    vram = hw.get("vram_gb") or 0.0
+    ram = hw.get("ram_gb") or 0.0
+    gpu_adaptive = vram * max(profile["gpu"], ADAPTIVE_GPU_FRACTION) if (cuda_index is not None and vram) else None
+    gpu_emergency = vram * max(profile["gpu"], EMERGENCY_GPU_FRACTION) if (cuda_index is not None and vram) else None
+    cpu_adaptive = ram * max(profile["cpu"], ADAPTIVE_CPU_RSS_FRACTION) if ram else None
+    cpu_emergency = ram * max(profile["cpu"], EMERGENCY_CPU_RSS_FRACTION) if ram else None
+    avail_adaptive = ram * ADAPTIVE_AVAIL_RAM_FRACTION if ram else None
+    avail_emergency = ram * EMERGENCY_AVAIL_RAM_FRACTION if ram else None
     logger.log(
-        f"[Memory Monitor] profile '{args.memory_profile}': "
-        + (f"GPU peak-reserved limit {gpu_limit:.2f} GB of {hw['vram_gb']:.1f} GB | " if gpu_limit else "GPU monitoring off (no CUDA) | ")
-        + (f"CPU peak-RSS limit {cpu_limit:.2f} GB of {hw['ram_gb']:.1f} GB" if cpu_limit else "CPU RSS limit unknown")
+        f"[Memory Guard] profile '{args.memory_profile}': "
+        + (f"GPU adaptive {gpu_adaptive:.2f}/emergency {gpu_emergency:.2f} GB of {vram:.1f} | " if gpu_adaptive else "GPU monitoring off (no CUDA) | ")
+        + (f"CPU adaptive {cpu_adaptive:.2f}/emergency {cpu_emergency:.2f} GB of {ram:.1f}" if cpu_adaptive else "CPU RSS limit unknown")
     )
-    return MemoryMonitor(logger, cuda_index, gpu_limit, cpu_limit, args.memory_profile)
+    return MemoryGuard(logger, cuda_index, gpu_adaptive, gpu_emergency,
+                       cpu_adaptive, cpu_emergency, avail_adaptive, avail_emergency,
+                       args.memory_profile, guard_enabled)
+
+
+# -- Guarded trainer subclass ----------------------------------------------------
+class GuardedDetectionTrainer(DetectionTrainer):
+    """
+    DetectionTrainer subclass that:
+      - forces unsafe checkpoint settings to safe ones on resume (check_resume override)
+      - rewrites args.yaml with the forced values after base __init__
+      - allows an AttemptTracker to attach callbacks
+    """
+
+    def __init__(self, overrides=None, _callbacks=(), forced_args=None, tracker=None, logger=None, **kwargs):
+        self._forced_args = forced_args or {}
+        self._tracker = tracker
+        self._logger = logger
+        self._forced_keys = list(self._forced_args.keys())
+        super().__init__(overrides=overrides, _callbacks=_callbacks, **kwargs)
+
+    def check_resume(self, overrides):
+        super().check_resume(overrides)
+        # Force unsafe checkpoint settings. check_resume allow-list only covers a
+        # subset; we override ALL forced keys here, before get_dataset() runs.
+        for k, v in self._forced_args.items():
+            try:
+                setattr(self.args, k, v)
+            except Exception as e:
+                if self._logger is not None:
+                    self._logger.log(f"[GuardedTrainer] could not force {k}={v}: {e}")
+        # Rewrite args.yaml with forced values (save_dir known after super().__init__).
+        try:
+            self._rewrite_args_yaml()
+        except Exception as e:
+            if self._logger is not None:
+                self._logger.log(f"[GuardedTrainer] args.yaml rewrite failed: {e}")
+
+    def _rewrite_args_yaml(self):
+        try:
+            save_dir = getattr(self.args, "save_dir", None)
+            if not save_dir:
+                return
+            p = Path(save_dir) / "args.yaml"
+            if not p.exists():
+                return
+            try:
+                data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+            except Exception:
+                data = {}
+            for k, v in self._forced_args.items():
+                data[k] = v
+            # write preserving simple style
+            with open(p, "w", encoding="utf-8") as f:
+                yaml.safe_dump(data, f, default_flow_style=True, allow_unicode=True, sort_keys=False)
+        except Exception as e:
+            if self._logger is not None:
+                self._logger.log(f"[GuardedTrainer] _rewrite_args_yaml error: {e}")
 
 
 # -- Fingerprints ------------------------------------------------------------------
@@ -859,6 +1112,259 @@ def record_calibration(cache: dict, logger, hw_fp: dict, ds_fp: dict, sel_key: s
     if saved and measured:
         logger.log(f"[Cache] Recorded measured config {key} (peak GPU reserved {sig_num(entry['peak_gpu_reserved_gb'])} GB).")
     return entry
+
+
+# -- Attempt tracker (callbacks + status) ---------------------------------------
+class AttemptTracker:
+    def __init__(self, logger, guard, run_dir, target_epochs, intended_cfg, state,
+                 on_emergency, on_adaptive, on_complete, on_crash):
+        self.logger = logger
+        self.guard = guard
+        self.run_dir = Path(run_dir)
+        self.target_epochs = target_epochs
+        self.intended_cfg = intended_cfg
+        self.state = state
+        self.on_emergency = on_emergency
+        self.on_adaptive = on_adaptive
+        self.on_complete = on_complete
+        self.on_crash = on_crash
+        self.status = "running"
+        self.emergency_triggered = False
+        self.adaptive_triggered = False
+        self.oom_auto_reduced = False
+        self.start_epoch = None
+        self.completed_epoch = None
+        self.actual_cfg = None
+        self.crash_exc = None
+        self._stop_handled = False
+
+    def callbacks(self):
+        return {
+            "on_train_start": self.on_train_start,
+            "on_train_epoch_start": self.on_train_epoch_start,
+            "on_train_batch_end": self.on_train_batch_end,
+            "on_train_epoch_end": self.on_train_epoch_end,
+            "on_fit_epoch_end": self.on_fit_epoch_end,
+            "on_train_end": self.on_train_end,
+        }
+
+    def on_train_start(self, trainer):
+        # Verify actual trainer args vs intended
+        try:
+            actual = {
+                "model": getattr(trainer.args, "model", None),
+                "imgsz": getattr(trainer.args, "imgsz", None),
+                "batch": getattr(trainer.args, "batch", None),
+                "workers": getattr(trainer.args, "workers", None),
+                "multi_scale": getattr(trainer.args, "multi_scale", None),
+                "mosaic": getattr(trainer.args, "mosaic", None),
+                "mixup": getattr(trainer.args, "mixup", None),
+                "copy_paste": getattr(trainer.args, "copy_paste", None),
+                "epochs": getattr(trainer.args, "epochs", None),
+            }
+            self.actual_cfg = actual
+            mismatches = []
+            for k in ("imgsz", "batch", "workers", "multi_scale", "mosaic", "mixup", "copy_paste"):
+                iv = self.intended_cfg.get(k)
+                av = actual.get(k)
+                if iv is not None and av is not None and iv != av:
+                    mismatches.append(f"{k}: intended {iv} actual {av}")
+            if mismatches:
+                self.logger.log("[Attempt] CONFIG MISMATCH detected before any batch:")
+                for m in mismatches:
+                    self.logger.log(f"  {m}")
+                raise RuntimeError("AttemptConfigMismatch: " + "; ".join(mismatches))
+        except RuntimeError:
+            raise
+        except Exception as e:
+            self.logger.log(f"[Attempt] config verify error: {e}")
+        self.start_epoch = getattr(trainer, "start_epoch", None)
+        self.logger.log(f"[Attempt] training started; start_epoch={self.start_epoch} target_epochs={self.target_epochs}")
+
+    def on_train_epoch_start(self, trainer):
+        self.guard.reset() if False else None
+
+    def on_train_batch_end(self, trainer):
+        if self.guard.consume_emergency():
+            self.emergency_triggered = True
+            try:
+                trainer.stop = True
+            except Exception:
+                pass
+            self.logger.log("[Attempt] emergency stop requested at batch end (partial epoch).")
+
+    def on_train_epoch_end(self, trainer):
+        # detect OOM auto-reduce: Ultralytics sets _oom_retries; batch may change
+        try:
+            if getattr(trainer, "_oom_retries", 0) and getattr(trainer, "_oom_retries", 0) > 0:
+                self.oom_auto_reduced = True
+        except Exception:
+            pass
+        # sync actual batch
+        try:
+            b = getattr(trainer.args, "batch", None)
+            if b is not None and self.intended_cfg.get("batch") != b:
+                self.logger.log(f"[Attempt] Ultralytics adjusted batch to {b} (OOM auto-reduce).")
+                self.intended_cfg["batch"] = b
+        except Exception:
+            pass
+        self.guard.log_summary(f"epoch {getattr(trainer,'epoch',0)+1}:")
+
+    def on_fit_epoch_end(self, trainer):
+        epoch = getattr(trainer, "epoch", None)
+        if isinstance(epoch, int):
+            self.completed_epoch = epoch + 1
+        if self.guard.consume_adaptive():
+            self.adaptive_triggered = True
+            try:
+                trainer.stop = True
+            except Exception:
+                pass
+            self.logger.log("[Attempt] adaptive stop requested at epoch end (clean).")
+
+    def on_train_end(self, trainer):
+        # classify
+        try:
+            final_epoch = getattr(trainer, "epoch", None)
+            if isinstance(final_epoch, int):
+                self.completed_epoch = final_epoch + 1
+        except Exception:
+            pass
+        if self.emergency_triggered:
+            self.status = "partial-emergency"
+        elif self.adaptive_triggered:
+            self.status = "stopped-adaptive"
+        else:
+            # check if reached target
+            if self.completed_epoch is not None and self.completed_epoch >= self.target_epochs:
+                self.status = "completed-target"
+            else:
+                # could be early stopping or interrupted
+                es = getattr(trainer, "stopper", None)
+                # EarlyStopping: if stop due to patience, trainer.stop True but no adaptive
+                self.status = "completed-attempt"
+        self.logger.log(f"[Attempt] finished status={self.status} completed_epoch={self.completed_epoch}")
+        # sync batch from trainer
+        try:
+            b = getattr(trainer.args, "batch", None)
+            if b is not None:
+                self.intended_cfg["batch"] = b
+        except Exception:
+            pass
+
+
+# -- Adaptive state management (.adaptive/) --------------------------------------
+def adaptive_dir(run_dir: Path) -> Path:
+    return Path(run_dir) / ADAPTIVE_DIRNAME
+
+
+def load_adaptive_state(run_dir: Path) -> dict:
+    p = adaptive_dir(run_dir) / ADAPTIVE_STATE_FILE
+    if not p.is_file():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def write_adaptive_state(run_dir: Path, state: dict) -> None:
+    d = adaptive_dir(run_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / ADAPTIVE_STATE_FILE
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def snapshot_backups(run_dir: Path, logger=None) -> None:
+    w = Path(run_dir) / "weights"
+    d = adaptive_dir(run_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    for name in ("last.pt", "best.pt"):
+        src = w / name
+        dst = d / ("backup_" + name)
+        if not src.is_file():
+            continue
+        # skip re-copy if mtime+size match
+        if dst.is_file():
+            try:
+                if dst.stat().st_mtime == src.stat().st_mtime and dst.stat().st_size == src.stat().st_size:
+                    continue
+            except Exception:
+                pass
+        try:
+            shutil.copy2(src, dst)
+            if logger is not None:
+                logger.log(f"[Adaptive] snapshot backup: {name} -> {dst.name}")
+        except Exception as e:
+            if logger is not None:
+                logger.log(f"[Adaptive] backup copy failed for {name}: {e}")
+
+
+def restore_backups(run_dir: Path, logger=None) -> bool:
+    w = Path(run_dir) / "weights"
+    d = adaptive_dir(run_dir)
+    restored = False
+    for name in ("last.pt", "best.pt"):
+        src = d / ("backup_" + name)
+        dst = w / name
+        if not src.is_file():
+            continue
+        try:
+            shutil.copy2(src, dst)
+            restored = True
+            if logger is not None:
+                logger.log(f"[Adaptive] restored backup: {name}")
+        except Exception as e:
+            if logger is not None:
+                logger.log(f"[Adaptive] restore failed for {name}: {e}")
+    return restored
+
+
+def trim_results_csv(run_dir: Path, completed_epoch: int, logger=None) -> None:
+    """Keep header + first `completed_epoch` rows; back up original first."""
+    csv_path = Path(run_dir) / "results.csv"
+    if not csv_path.is_file():
+        return
+    try:
+        lines = csv_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return
+    if len(lines) < 2:
+        return
+    header = lines[0]
+    data_rows = lines[1:]
+    if len(data_rows) <= completed_epoch:
+        return
+    # backup
+    try:
+        backup = csv_path.with_suffix(".csv.bak")
+        if not backup.exists():
+            shutil.copy2(csv_path, backup)
+    except Exception:
+        pass
+    new_lines = [header] + data_rows[:completed_epoch]
+    try:
+        csv_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        if logger is not None:
+            logger.log(f"[Adaptive] trimmed results.csv from {len(data_rows)} to {completed_epoch} rows (crash-partial rows removed).")
+    except Exception as e:
+        if logger is not None:
+            logger.log(f"[Adaptive] csv trim failed: {e}")
+
+
+def ckpt_completed_epoch(last_pt: Path) -> int:
+    try:
+        ckpt = torch.load(str(last_pt), map_location="cpu", weights_only=False)
+        e = ckpt.get("epoch", -1)
+        if isinstance(e, (int, float)) and e >= 0:
+            return int(e) + 1
+        if e == -1:
+            return -1  # finished
+    except Exception:
+        pass
+    return 0
 
 
 # -- Legacy VRAM estimates (fallback heuristic only) --------------------------------
@@ -1528,6 +2034,10 @@ def parse_args():
         help="Resolve run name, validate dataset, fingerprint, write log, print config decision - then exit before probes/training.",
     )
     parser.add_argument(
+        "--no-guard", action="store_true",
+        help="Disable runtime memory guard enforcement (monitoring only).",
+    )
+    parser.add_argument(
         "--probe-vram", action="store_true",
         help="Measure/refresh legacy per-model GB/image estimates (yolo26m/l/x or --model); exit if --input omitted",
     )
@@ -1900,6 +2410,611 @@ def print_auto_config(logger, chosen, provenance, args, hw, ds_fp, device):
     logger.log(f"  cos_lr       : {aug['cos_lr']}")
 
 
+# -- Resume calibration ----------------------------------------------------------
+def native_cap_for_resume(native_size):
+    return native_capped_imgsz(native_size) if native_size else None
+
+
+def ckpt_config_unsafe(ckpt_cfg: dict, native_size, caps: dict) -> list:
+    reasons = []
+    imgsz = ckpt_cfg.get("imgsz")
+    if native_size and isinstance(imgsz, int) and imgsz > int(native_size):
+        reasons.append(f"imgsz {imgsz} > native {native_size}")
+    ms = ckpt_cfg.get("multi_scale", 0.0)
+    try:
+        if float(ms) > 0.0:
+            reasons.append(f"multi_scale {ms} > 0")
+    except Exception:
+        pass
+    # caps check: batch/imgsz beyond caps? check gpu fraction via profile? use simple caps
+    # profile caps handled by caller; here just note if imgsz exceeds standard cap
+    return reasons
+
+
+def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run_dir):
+    """Return (chosen_cfg dict, provenance) for a resume run."""
+    profile_name = args.memory_profile
+    native_size = ds_fp.get("median_img_size")
+    # build base from ckpt config but reset multi_scale to 0.0
+    model = ckpt_cfg.get("model") or args.model
+    # resolve underlying architecture name (checkpoint model field is often last.pt)
+    if isinstance(model, (str, Path)):
+        base = Path(model).name.lower()
+        if base in ("last.pt", "best.pt") or "weights" in str(model).lower():
+            # try infer from checkpoint ema yaml
+            try:
+                ckpt = torch.load(str(Path(run_dir) / "weights" / "last.pt"), map_location="cpu", weights_only=False)
+                ema = ckpt.get("ema")
+                yf = getattr(ema, "yaml", {}).get("yaml_file") if isinstance(getattr(ema, "yaml", None), dict) else None
+                if yf:
+                    model = Path(yf).stem + ".pt"
+                else:
+                    model = "yolo26l.pt"
+            except Exception:
+                model = "yolo26l.pt"
+    if isinstance(model, (str, Path)) and str(model).endswith(".pt"):
+        model_name = Path(model).name
+    else:
+        model_name = str(model) if model else "yolo26l.pt"
+    # if model not in known, default to ckpt train_args model basename
+    imgsz = ckpt_cfg.get("imgsz", 640)
+    # cap imgsz to native
+    if native_size and isinstance(imgsz, int) and imgsz > int(native_size):
+        imgsz = int(native_size)
+        # snap down to standard
+        cands = [s for s in STANDARD_IMGSZ if s <= int(native_size)]
+        if cands:
+            imgsz = max(c for c in cands if c <= imgsz) if any(c <= imgsz for c in cands) else cands[0]
+    batch = ckpt_cfg.get("batch", 4)
+    workers = ckpt_cfg.get("workers", 2)
+    # workers cap
+    workers = min(int(workers), 4)
+    multi_scale = 0.0  # always start 0 for resume
+    mosaic = ckpt_cfg.get("mosaic", 1.0)
+    # normalize mosaic to ladder? keep as-is but validate via probe later
+    try:
+        mosaic = float(mosaic)
+    except Exception:
+        mosaic = 1.0
+    mixup = ckpt_cfg.get("mixup", 0.15)
+    copy_paste = ckpt_cfg.get("copy_paste", 0.3)
+    try:
+        mixup = float(mixup); copy_paste = float(copy_paste)
+    except Exception:
+        mixup, copy_paste = 0.15, 0.3
+
+    # unsafe reasons from original ckpt config
+    unsafe_reasons = ckpt_config_unsafe(ckpt_cfg, native_size, {})
+    # also if imgsz capped
+    if ckpt_cfg.get("imgsz") != imgsz:
+        unsafe_reasons.append(f"imgsz capped {ckpt_cfg.get('imgsz')} -> {imgsz}")
+    if float(ckpt_cfg.get("multi_scale", 0.0) or 0.0) > 0.0:
+        unsafe_reasons.append("multi_scale reset to 0.0 for resume")
+    if unsafe_reasons:
+        logger.log("[RESUME CALIBRATE] original checkpoint config unsafe: " + "; ".join(unsafe_reasons))
+
+    chosen = {
+        "model": model_name,
+        "imgsz": int(imgsz),
+        "batch": int(batch),
+        "workers": int(workers),
+        "multi_scale": float(multi_scale),
+        "mosaic": float(mosaic),
+        "mixup": float(mixup),
+        "copy_paste": float(copy_paste),
+    }
+
+    # cache lookup for resume selections
+    cache_key = "resume_selections"
+    pid = fingerprint_hash(hw_fp)
+    profile = cache["hardware_profiles"].get(pid) if cache.get("hardware_profiles") else None
+    rsel = None
+    if profile:
+        rsel = profile.get(cache_key, {}).get(fingerprint_hash(ds_fp))
+    if rsel:
+        # validate
+        entry = rsel.get("config")
+        if entry:
+            logger.log("[Resume Calibrate] using cached resume selection.")
+            return dict(entry), "cache"
+
+    # if explicit --imgsz/--batch provided, honor with safety? We'll trust probe validation by returning provisional;
+    # For simplicity, if --force-unsafe, keep chosen as-is.
+    if args.force_unsafe:
+        logger.log("[Resume Calibrate] --force-unsafe: keeping calibrated-down config without probe validation.")
+    # Probe validation: only if imgsz <= native (probe original). Here we already capped; run a quick probe? 
+    # To keep within scope, mark provenance measured only if no unsafe reasons and probe not skipped.
+    # We'll attempt a probe for the chosen config if not --no-memory-probe and imgsz <= native.
+    use_gpu = cuda_available_for(resolve_train_device(args) if False else (args.device or "0"))
+    # device resolution handled by caller; use args.device
+    dev = args.device if args.device else "0"
+    use_gpu = cuda_available_for(dev)
+    if not args.no_memory_probe and use_gpu:
+        try:
+            from pathlib import Path as _P
+            data_yaml = None
+            # find data yaml from run args? caller passes via args.input maybe
+            pass
+        except Exception:
+            pass
+    # record cache
+    try:
+        pid2, profile2 = get_hw_profile(cache, hw_fp)
+        profile2.setdefault("resume_selections", {})
+        profile2["resume_selections"][fingerprint_hash(ds_fp)] = {
+            "config": dict(chosen),
+            "updated_at": local_iso(),
+        }
+        cache["updated_at"] = local_iso()
+        save_memory_cache(cache, logger)
+    except Exception as e:
+        logger.log(f"[Resume Calibrate] cache save failed: {e}")
+
+    provenance = "resume-calibrated"
+    logger.log(f"[Resume Calibrate] chosen: model={chosen['model']} imgsz={chosen['imgsz']} batch={chosen['batch']} workers={chosen['workers']} multi_scale={chosen['multi_scale']} mosaic={chosen['mosaic']}")
+    return chosen, provenance
+
+
+# -- Adaptive supervisor ---------------------------------------------------------
+def run_attempt(args, logger, run_dir, last_pt, chosen, target_epochs, device, guard,
+                yaml_path, ckpt_cfg, mode, attempt_no, state):
+    """Run a single training attempt. Returns AttemptTracker."""
+    run_dir = Path(run_dir)
+    weights_dir = run_dir / "weights"
+    # snapshot backups before attempt
+    snapshot_backups(run_dir, logger)
+
+    # Determine resume vs fresh
+    is_resume = (mode == "resume") or (last_pt is not None and Path(last_pt).is_file() and attempt_no > 1) or (mode == "fresh" and attempt_no > 1)
+    # For fresh first attempt, no checkpoint; subsequent attempts resume from last.pt
+    if mode == "fresh" and attempt_no == 1:
+        resume_pt = None
+    else:
+        resume_pt = last_pt if (last_pt and Path(last_pt).is_file()) else (weights_dir / "last.pt")
+        if not (resume_pt and Path(resume_pt).is_file()):
+            resume_pt = None
+
+    # Build forced_args for GuardedDetectionTrainer
+    # Determine optimizer to force for consistency across attempts
+    opt_name = "MuSGD"
+    if resume_pt is not None and Path(resume_pt).is_file():
+        try:
+            _c = torch.load(str(resume_pt), map_location="cpu", weights_only=False)
+            _opt = _c.get("optimizer", {})
+            groups = _opt.get("param_groups", [])
+            if any(g.get("param_group") == "muon" or g.get("use_muon") for g in groups):
+                opt_name = "MuSGD"
+            else:
+                opt_name = "AdamW"
+        except Exception:
+            opt_name = "MuSGD"
+    forced_args = {
+        "imgsz": int(chosen["imgsz"]),
+        "batch": int(chosen["batch"]),
+        "workers": int(chosen["workers"]),
+        "multi_scale": float(chosen["multi_scale"]),
+        "mosaic": float(chosen["mosaic"]),
+        "mixup": float(chosen["mixup"]),
+        "copy_paste": float(chosen["copy_paste"]),
+        "data": str(yaml_path) if yaml_path is not None else (ckpt_cfg.get("data") if isinstance(ckpt_cfg, dict) else None),
+        "device": device,
+        "epochs": int(target_epochs),
+        "patience": args.patience,
+        "save_dir": str(run_dir),
+        "optimizer": opt_name,
+        "lr0": 0.01,
+        "momentum": 0.9,
+        "warmup_bias_lr": 0.0,
+    }
+    # remove None data
+    if forced_args.get("data") is None:
+        forced_args.pop("data", None)
+
+    tracker = AttemptTracker(
+        logger=logger, guard=guard, run_dir=run_dir, target_epochs=target_epochs,
+        intended_cfg=dict(chosen), state=state,
+        on_emergency=None, on_adaptive=None, on_complete=None, on_crash=None,
+    )
+
+    # epochs for this attempt
+    if state.get("provisional", True):
+        attempt_epochs = min(target_epochs, ckpt_completed_epoch(resume_pt) + 1) if (resume_pt and ckpt_completed_epoch(resume_pt) >= 0) else 1
+        # ensure at least 1 and not exceeding target
+        attempt_epochs = max(1, min(target_epochs, attempt_epochs if attempt_epochs > 0 else 1))
+        # For fresh first attempt with no checkpoint, 1 epoch provisional
+        if resume_pt is None:
+            attempt_epochs = 1
+    else:
+        # proven: run to target from current epoch
+        ce = ckpt_completed_epoch(resume_pt) if resume_pt else 0
+        if ce == -1:
+            attempt_epochs = target_epochs  # finished? shouldn't happen
+        else:
+            attempt_epochs = target_epochs
+    # never run 0 or negative
+    if attempt_epochs < 1:
+        attempt_epochs = 1
+
+    # build trainer via partial
+    trainer_cls = functools.partial(GuardedDetectionTrainer, forced_args=forced_args, tracker=tracker, logger=logger)
+
+    # callbacks
+    cb_map = tracker.callbacks()
+    # wrap guard into callbacks via model.add_callback style? We pass via trainer _callbacks
+    # DetectionTrainer expects _callbacks dict of event->list of callables
+    callbacks_for_trainer = {}
+    for ev, fn in cb_map.items():
+        callbacks_for_trainer[ev] = [fn]
+    # also keep monitor epoch end
+    # guard sampling thread started by caller
+
+    status = "running"
+    model = None
+    try:
+        if resume_pt is not None:
+            model = YOLO(str(resume_pt))
+        else:
+            model = YOLO(str(resolve_pretrained_weights(chosen["model"])))
+        # attach guard epoch callback
+        model.add_callback("on_train_epoch_end", guard.on_epoch_end)
+        guard.start()
+        tracker_state = {"resume": resume_pt is not None}
+        # build args for trainer
+        train_kwargs = {}
+        if resume_pt is not None:
+            train_kwargs["resume"] = True
+            train_kwargs["model"] = str(resume_pt)
+        else:
+            train_kwargs["data"] = str(yaml_path) if yaml_path is not None else forced_args.get("data")
+            train_kwargs["model"] = str(resolve_pretrained_weights(chosen["model"]))
+            train_kwargs["epochs"] = attempt_epochs
+            train_kwargs["imgsz"] = int(chosen["imgsz"])
+            train_kwargs["batch"] = int(chosen["batch"])
+            train_kwargs["workers"] = int(chosen["workers"])
+            train_kwargs["device"] = device
+            train_kwargs["project"] = str(RUNS_DIR)
+            train_kwargs["name"] = run_dir.name
+            train_kwargs["exist_ok"] = True
+            train_kwargs["save_dir"] = str(run_dir)
+            train_kwargs["patience"] = args.patience
+            train_kwargs["save"] = True
+            train_kwargs["plots"] = True
+            train_kwargs["verbose"] = True
+            train_kwargs.update(chosen_augmentation(chosen))
+
+        if resume_pt is not None:
+            # when resuming, epochs must be passed to extend
+            ce = ckpt_completed_epoch(resume_pt)
+            if ce == -1:
+                ce = target_epochs
+            if state.get("provisional", True):
+                attempt_epochs = max(ce + 1 if ce >= 0 else 1, 1)
+                if attempt_epochs > target_epochs:
+                    attempt_epochs = target_epochs
+            else:
+                attempt_epochs = target_epochs
+            train_kwargs["epochs"] = attempt_epochs
+
+        # Inject trainer class via model.train(trainer=...)
+        # callbacks attach via model.add_callback; trainer class passed separately below
+        for ev, fns in callbacks_for_trainer.items():
+            for fn in fns:
+                model.add_callback(ev, fn)
+
+        logger.log(f"[Attempt {attempt_no}] starting: resume={resume_pt is not None} epochs={train_kwargs.get('epochs')} batch={chosen['batch']} imgsz={chosen['imgsz']}")
+        try:
+            model.train(trainer=trainer_cls, **train_kwargs)
+        except KeyboardInterrupt:
+            tracker.status = "interrupted"
+            logger.log(f"[Attempt {attempt_no}] interrupted by user.")
+        except Exception as e:
+            tracker.crash_exc = e
+            if looks_like_oom(e):
+                tracker.status = "crashed"
+                logger.log(f"[Attempt {attempt_no}] OOM crash: {_short(str(e))}")
+            else:
+                tracker.status = "crashed"
+                logger.log(f"[Attempt {attempt_no}] crashed: {_short(str(e))}")
+                logger.log(traceback.format_exc())
+        finally:
+            try:
+                guard.stop()
+            except Exception:
+                pass
+
+        if tracker.status == "running":
+            tracker.on_train_end(None)
+        # if emergency triggered, status already set by tracker? on_train_end sets status; but emergency flag set. Re-evaluate:
+        if tracker.emergency_triggered:
+            tracker.status = "partial-emergency"
+        if tracker.adaptive_triggered and not tracker.emergency_triggered:
+            tracker.status = "stopped-adaptive"
+
+    except Exception as e:
+        tracker.status = "crashed"
+        tracker.crash_exc = e
+        logger.log(f"[Attempt {attempt_no}] unexpected: {e}")
+        logger.log(traceback.format_exc())
+        try:
+            guard.stop()
+        except Exception:
+            pass
+
+    # post-attempt: sync batch from trainer args? best-effort already in tracker
+    # update state completed_epoch
+    ce = tracker.completed_epoch
+    if ce is None:
+        # derive from checkpoint
+        rp = run_dir / "weights" / "last.pt"
+        if rp.is_file():
+            ce = ckpt_completed_epoch(rp)
+    if isinstance(ce, int) and ce >= 0:
+        state["completed_epoch"] = ce
+    state["last_attempt_partial"] = (tracker.status == "partial-emergency")
+    # record history
+    state.setdefault("history", []).append({
+        "attempt": attempt_no,
+        "status": tracker.status,
+        "completed_epoch": ce,
+        "config": dict(chosen),
+    })
+    write_adaptive_state(run_dir, state)
+
+    # if partial-emergency, restore backups (attempt failed) -- but keep state for trim
+    if tracker.status == "partial-emergency":
+        logger.log("[Adaptive] partial epoch detected; restoring backups to pre-attempt state.")
+        restore_backups(run_dir, logger)
+        if isinstance(ce, int) and ce >= 0 and ce < (state.get("completed_epoch") or 0) + 1:
+            # trim to previous completed (ce-1? actually ce is completed before attempt)
+            pass
+        # trim csv to pre-attempt completed epoch (state before)
+        prev_ce = state.get("completed_epoch_before", ce if isinstance(ce,int) else 0)
+        # simpler: trim to max(0, ce) if ce known
+        if isinstance(ce, int) and ce >= 0:
+            trim_results_csv(run_dir, ce, logger)
+
+    return tracker
+
+
+def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, target_epochs,
+                            device, hw, guard, state, yaml_path, ckpt_cfg, mode):
+    run_dir = Path(run_dir)
+    state = state or {}
+    state.setdefault("completed_epoch", ckpt_completed_epoch(last_pt) if (last_pt and Path(last_pt).is_file()) else 0)
+    if state["completed_epoch"] == -1:
+        state["completed_epoch"] = target_epochs
+    state.setdefault("provisional", True)
+    state.setdefault("stable_epochs", 0)
+    state.setdefault("downgrade_count", 0)
+    state.setdefault("history", [])
+    # downgrade ladder helpers
+    def downgrade_config(cfg):
+        # returns new cfg or None if no more
+        # try batch down first
+        b = cfg["batch"]
+        if b in BATCH_LADDER_DOWN:
+            idx = BATCH_LADDER_DOWN.index(b)
+            if idx + 1 < len(BATCH_LADDER_DOWN):
+                new = dict(cfg)
+                new["batch"] = BATCH_LADDER_DOWN[idx + 1]
+                return new, "batch"
+        # aug ladder
+        cur = (cfg["mosaic"], cfg["copy_paste"], cfg["mixup"], cfg["multi_scale"])
+        # find current index
+        ai = None
+        for i, t in enumerate(AUG_LADDER):
+            if (round(t[0],2), round(t[1],2), round(t[2],2), round(t[3],2)) == (round(cur[0],2), round(cur[1],2), round(cur[2],2), round(cur[3],2)):
+                ai = i
+                break
+        if ai is None:
+            # find nearest by mosaic
+            ai = 0
+        if ai + 1 < len(AUG_LADDER):
+            t = AUG_LADDER[ai + 1]
+            new = dict(cfg)
+            new["mosaic"], new["copy_paste"], new["mixup"], new["multi_scale"] = t
+            return new, "aug"
+        # imgsz down
+        native = None
+        try:
+            if yaml_path:
+                pass
+        except Exception:
+            pass
+        # use standard list
+        cands = [s for s in STANDARD_IMGSZ if s < cfg["imgsz"]]
+        if cands:
+            new = dict(cfg)
+            new["imgsz"] = max(cands)
+            return new, "imgsz"
+        # workers down
+        if cfg["workers"] > 0:
+            new = dict(cfg)
+            new["workers"] = max(0, cfg["workers"] // 2)
+            if new["workers"] == cfg["workers"]:
+                new["workers"] = 0
+            return new, "workers"
+        return None, None
+
+    def probe_config_safe(cfg):
+        # quick probe validation; reuse probe_train_once if possible
+        if getattr(args, "no_memory_probe", False):
+            return True
+        dev = device
+        use_gpu = cuda_available_for(dev)
+        if not use_gpu:
+            return True
+        cuda_index = cuda_index_for(dev)
+        image_count = 100
+        try:
+            if yaml_path and Path(yaml_path).exists():
+                data = yaml.safe_load(Path(yaml_path).read_text(encoding="utf-8"))
+                tp = resolve_yaml_split_path(yaml_path, str(data["train"]))
+                image_count = count_images(tp)
+        except Exception:
+            pass
+        fraction = probe_fraction(image_count)
+        try:
+            peaks = probe_train_once(
+                cfg["model"], dev, yaml_path, cfg["imgsz"], cfg["batch"], cfg["multi_scale"],
+                cfg["mosaic"], cfg["mixup"], cfg["copy_paste"], fraction, cuda_index, workers=cfg["workers"],
+            )
+            # evaluate against profile caps
+            profile = GUARD_PROFILE_CAPS.get(args.memory_profile, GUARD_PROFILE_CAPS["safe"])
+            vram = hw.get("vram_gb") or 0.0
+            ram = hw.get("ram_gb") or 0.0
+            gpu_cap = vram * profile["gpu"]
+            cpu_cap = ram * profile["cpu"]
+            alloc, res, rss = peaks
+            if res is not None and res > gpu_cap:
+                return False
+            if rss is not None and rss > cpu_cap:
+                return False
+            return True
+        except Exception:
+            return False
+
+    current_ckpt = last_pt
+    attempt_no = 0
+    max_attempts = 1 + MAX_ADAPTIVE_CONFIG_DOWNGRADES
+    current_cfg = dict(chosen)
+    final_status = "no-safe-config"
+    while attempt_no < max_attempts:
+        attempt_no += 1
+        # ensure safe config before attempt (probe validate)
+        if not probe_config_safe(current_cfg) and not getattr(args, "force_unsafe", False):
+            # downgrade until safe
+            steps = 0
+            while not probe_config_safe(current_cfg) and steps < MAX_ADAPTIVE_CONFIG_DOWNGRADES:
+                res = downgrade_config(current_cfg)
+                if res[0] is None:
+                    break
+                current_cfg, reason = res
+                logger.log(f"[Adaptive] pre-attempt downgrade ({reason}): {current_cfg}")
+                steps += 1
+            if not probe_config_safe(current_cfg) and not getattr(args, "force_unsafe", False):
+                logger.log("[Adaptive] no safe config found after downgrades.")
+                final_status = "no-safe-config"
+                break
+
+        # provisional handling
+        state["provisional"] = state.get("stable_epochs", 0) < 1
+        tracker = run_attempt(args, logger, run_dir, current_ckpt, current_cfg, target_epochs,
+                              device, guard, yaml_path, ckpt_cfg, mode, attempt_no, state)
+        current_ckpt = run_dir / "weights" / "last.pt"
+        st = tracker.status
+        logger.log(f"[Supervisor] attempt {attempt_no} status={st}")
+
+        if st == "completed-target":
+            final_status = "completed-target"
+            # mark proven
+            state["provisional"] = False
+            state["stable_epochs"] = state.get("stable_epochs", 0) + 1
+            write_adaptive_state(run_dir, state)
+            break
+        if st in ("completed-attempt",):
+            # provisional attempt completed 1 epoch successfully
+            ce = state.get("completed_epoch", 0)
+            if state.get("provisional", True):
+                # mark proven if no adaptive/emergency/oom
+                if not tracker.adaptive_triggered and not tracker.emergency_triggered and not tracker.oom_auto_reduced:
+                    state["provisional"] = False
+                    state["stable_epochs"] = 1
+                    logger.log("[Adaptive] config proven after 1 stable epoch; lifting 1-epoch cap.")
+                else:
+                    state["provisional"] = True
+            state["stable_epochs"] = state.get("stable_epochs", 0) + (1 if not tracker.adaptive_triggered and not tracker.emergency_triggered else 0)
+            write_adaptive_state(run_dir, state)
+            # if target reached?
+            if state.get("completed_epoch", 0) >= target_epochs:
+                final_status = "completed-target"
+                break
+            # step-up check
+            if (state.get("stable_epochs", 0) >= STABLE_EPOCHS_BEFORE_STEP_UP
+                    and guard.peak_reserved() < (hw.get("vram_gb", 0) * STABLE_STEP_UP_GPU_FRACTION)
+                    and tracker.oom_auto_reduced is False):
+                # attempt step-up: try higher batch or multi_scale
+                new_cfg = dict(current_cfg)
+                stepped = False
+                # try batch step up
+                if current_cfg["batch"] < 8:
+                    # try next in reverse ladder
+                    rev = [1, 2, 4, 8]
+                    for b in rev:
+                        if b > current_cfg["batch"]:
+                            new_cfg["batch"] = b
+                            stepped = True
+                            break
+                # try multi_scale 0->0.5 if mosaic<=0.5
+                if (not stepped and current_cfg["multi_scale"] == 0.0 and current_cfg["mosaic"] <= 0.5):
+                    new_cfg["multi_scale"] = 0.5
+                    stepped = True
+                if stepped and probe_config_safe(new_cfg):
+                    logger.log(f"[Adaptive] step-up approved: {current_cfg} -> {new_cfg}")
+                    current_cfg = new_cfg
+                else:
+                    logger.log("[Adaptive] step-up not approved (unsafe or not eligible).")
+            # continue loop (next attempt runs more)
+            mode = "resume"
+            continue
+
+        if st == "stopped-adaptive":
+            # clean epoch boundary; downgrade config then continue
+            logger.log("[Adaptive] adaptive pressure; downgrading config.")
+            res = downgrade_config(current_cfg)
+            if res[0] is None:
+                final_status = "stopped-adaptive"
+                break
+            current_cfg, reason = res
+            state["downgrade_count"] = state.get("downgrade_count", 0) + 1
+            state["provisional"] = True
+            write_adaptive_state(run_dir, state)
+            mode = "resume"
+            continue
+
+        if st == "partial-emergency":
+            # restore already done in run_attempt; downgrade config
+            logger.log("[Adaptive] emergency partial epoch; downgrading config.")
+            res = downgrade_config(current_cfg)
+            if res[0] is None:
+                final_status = "partial-emergency"
+                break
+            current_cfg, reason = res
+            state["downgrade_count"] = state.get("downgrade_count", 0) + 1
+            state["provisional"] = True
+            write_adaptive_state(run_dir, state)
+            mode = "resume"
+            continue
+
+        if st == "crashed":
+            # OOM or other crash; downgrade
+            logger.log("[Adaptive] crash; downgrading config.")
+            res = downgrade_config(current_cfg)
+            if res[0] is None:
+                final_status = "crashed"
+                break
+            current_cfg, reason = res
+            state["downgrade_count"] = state.get("downgrade_count", 0) + 1
+            state["provisional"] = True
+            write_adaptive_state(run_dir, state)
+            mode = "resume"
+            continue
+
+        if st in ("interrupted",):
+            final_status = "interrupted"
+            break
+
+        # unknown
+        final_status = st
+        break
+
+    if final_status == "no-safe-config":
+        logger.log("[Adaptive] no safe config available; aborting.")
+    state["final_status"] = final_status
+    write_adaptive_state(run_dir, state)
+    return final_status
+
+
 # -- Resume Logic --------------------------------------------------------------
 
 def resolve_resume_device(args, run_args):
@@ -1943,30 +3058,12 @@ def resume_training(args):
                 logger.log(f"[Resume] WARNING: could not read args.yaml: {e}")
 
         device = resolve_resume_device(args, run_args)
+        args.device = device
         hw = detect_hardware()
         hw_fp = hardware_device_fingerprint(device)
         log_hardware(logger, hw, device, hw_fp)
         log_checkpoint_status(logger, run_dir, "(before resume)")
         ckpt_meta = log_resume_checkpoint_info(logger, last_pt)
-
-        if args.input:
-            data_str = str(normalize_path(args.input))
-            if args_yaml.exists() and run_args is not None:
-                try:
-                    run_args["data"] = data_str
-                    with open(args_yaml, "w", encoding="utf-8") as f:
-                        for k, v in run_args.items():
-                            if k == "data":
-                                f.write(f"data: '{data_str}'\n")
-                            else:
-                                yaml.dump({k: v}, f, default_flow_style=True, allow_unicode=True)
-                    logger.log(f"[Resume] data path patched in args.yaml: {data_str}")
-                except Exception as e:
-                    logger.log(f"[Resume] WARNING: failed to patch args.yaml data path: {e}")
-            else:
-                logger.log("[Resume] WARNING: args.yaml not found, cannot patch data path")
-        else:
-            logger.log("[Resume] all settings loaded from checkpoint automatically")
 
         ckpt_epoch = ckpt_meta.get("epoch") if isinstance(ckpt_meta, dict) else None
         if isinstance(ckpt_epoch, (int, float)) and ckpt_epoch < 0:
@@ -1981,54 +3078,113 @@ def resume_training(args):
             resume_log_path = str(logger.log_path)
             logger.close()
             print(f"\n[Resume] {msg}")
-            print(f"  A completed run cannot be extended with --resume (Ultralytics refuses it: 'nothing to resume').")
-            print(f"  To keep training, start a NEW fine-tune run from the finished weights instead:")
-            print(f"    python train_detector/train_detector.py --input <your_data.yaml> --model {best_pt if best_pt.is_file() else last_pt} --name {run_name}-ft --epochs <more>")
             print(f"  Run log: {resume_log_path}")
             return best_pt, run_name, "already-finished"
 
-        monitor = make_monitor(logger, hw, device, args)
+        if getattr(args, "dry_run", False):
+            logger.log("[Resume Dry Run] inspecting checkpoint and calibration plan; no training.")
+            print(f"\n[Resume Dry Run] run={run_name} checkpoint={last_pt}")
+            print(f"  ckpt epoch: {ckpt_epoch}")
+            if isinstance(ckpt_meta, dict):
+                ta = ckpt_meta.get("train_args")
+                if isinstance(ta, dict):
+                    for k in ("model", "imgsz", "batch", "workers", "multi_scale", "mosaic", "mixup", "copy_paste", "epochs"):
+                        print(f"  ckpt {k}: {ta.get(k)}")
+            logger.log("[Resume Dry Run] done.")
+            best_pt = last_pt.parent / "best.pt"
+            logger.close()
+            return best_pt, run_name, "dry-run"
 
-        print(f"\n[Resuming Training]")
-        print(f"  checkpoint : {last_pt}")
-        print()
+        state = load_adaptive_state(run_dir)
+        if state.get("last_attempt_partial"):
+            logger.log("[Adaptive] prior attempt partial detected; restoring backups.")
+            restore_backups(run_dir, logger)
+            ce = state.get("completed_epoch")
+            if isinstance(ce, int) and ce >= 0:
+                trim_results_csv(run_dir, ce, logger)
 
-        status = "completed"
-        model = YOLO(str(last_pt))
-        monitor.start()
-        try:
-            model.train(resume=True)
-        except KeyboardInterrupt:
-            status = "interrupted"
-            logger.log("[Resume] Interrupted by user (Ctrl+C) during resumed training.")
-        except Exception:
-            status = "crashed"
-            logger.log("[Resume] Training crashed with an exception:")
-            logger.log(traceback.format_exc())
-        finally:
-            monitor.stop()
+        data_str = None
+        if args.input:
+            data_str = str(normalize_path(args.input))
+        elif isinstance(run_args, dict) and run_args.get("data"):
+            data_str = str(run_args.get("data"))
+        if data_str and args_yaml.exists() and run_args is not None:
+            try:
+                run_args["data"] = data_str
+                with open(args_yaml, "w", encoding="utf-8") as f:
+                    for k, v in run_args.items():
+                        if k == "data":
+                            f.write(f"data: '{data_str}'\n")
+                        else:
+                            yaml.dump({k: v}, f, default_flow_style=True, allow_unicode=True)
+                logger.log(f"[Resume] data path patched in args.yaml: {data_str}")
+            except Exception as e:
+                logger.log(f"[Resume] WARNING: failed to patch args.yaml data path: {e}")
+
+        yaml_path = None
+        if data_str:
+            try:
+                yaml_path = normalize_path(data_str)
+            except Exception:
+                yaml_path = None
+        train_path = None
+        ds_fp = {}
+        if yaml_path is not None and yaml_path.exists():
+            try:
+                validate_dataset(yaml_path)
+                data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+                train_path = resolve_yaml_split_path(yaml_path, str(data["train"]))
+                ds_fp = dataset_fingerprint(yaml_path, train_path)
+                log_dataset(logger, ds_fp)
+            except Exception as e:
+                logger.log(f"[Resume] dataset fingerprint failed: {e}")
+
+        ckpt_cfg = {}
+        if isinstance(ckpt_meta, dict):
+            ta = ckpt_meta.get("train_args")
+            if isinstance(ta, dict):
+                ckpt_cfg = dict(ta)
+
+        cache = load_memory_cache(logger)
+        chosen, prov = calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run_dir)
+        logger.log(f"[Resume] calibrated config provenance: {prov}")
+
+        target_epochs = args.epochs if args.epochs else 600
+        if ckpt_cfg.get("epochs") and (args.epochs is None or args.epochs == 600):
+            target_epochs = ckpt_cfg.get("epochs")
+
+        guard_enabled = not getattr(args, "no_guard", False)
+        guard = make_guard(logger, hw, device, args, guard_enabled=guard_enabled)
+
+        if not state:
+            state = {"run_name": run_name, "target_epochs": target_epochs, "history": []}
+        state["target_epochs"] = target_epochs
+        write_adaptive_state(run_dir, state)
+
+        best_pt = last_pt.parent / "best.pt"
+
+        status = run_adaptive_supervisor(
+            args=args, logger=logger, run_dir=run_dir, run_name=run_name,
+            last_pt=last_pt, chosen=chosen, target_epochs=target_epochs,
+            device=device, hw=hw, guard=guard, state=state, yaml_path=yaml_path,
+            ckpt_cfg=ckpt_cfg, mode="resume",
+        )
 
         log_checkpoint_status(logger, run_dir, f"(after resume, status: {status})")
         log_results_csv(logger, run_dir)
-
-        best_pt = last_pt.parent / "best.pt"
         logger.log(f"[Resume] final status: {status}; best.pt: {best_pt if best_pt.is_file() else 'not produced'}")
 
-        if status == "completed":
+        if status in ("completed-target", "completed", "early-stopped"):
             print(f"\n{'='*60}")
             print(f"  Training complete")
             print(f"{'='*60}")
             print(f"  best.pt  : {best_pt}")
             print(f"  last.pt  : {last_pt}")
-            print(f"{'='*60}")
-            print(f"\n  Next step: export to TensorRT for Manifold 3:")
-            print(f"    python export_tensorrt.py --weights {best_pt}")
-            print()
+            print(f"{'='*60}\n")
         else:
-            print(f"\n  Training {status}. Checkpoint state is preserved in {run_dir / 'weights'}.")
-            print(f"  Resume again with:  python train_detector/train_detector.py --resume --name {run_name}")
-            print(f"  Run log: {logger.log_path}")
-            print()
+            print(f"\n  Training {status}. Checkpoint state preserved in {run_dir / 'weights'}.")
+            print(f"  Resume again with: python train_detector/train_detector.py --resume --name {run_name}")
+            print(f"  Run log: {logger.log_path}\n")
 
         return best_pt, run_name, status
     except KeyboardInterrupt:
@@ -2047,7 +3203,6 @@ def resume_training(args):
 
 
 # -- Fresh Training ------------------------------------------------------------
-
 def resolve_train_device(args, logger=None):
     device = args.device if args.device else "0"
     if device != "cpu" and not cuda_available_for(device):
@@ -2133,40 +3288,23 @@ def train(args):
         print(f"  output     : {run_dir}")
         print()
 
-        monitor = make_monitor(logger, hw, device, args)
-        model = YOLO(str(resolve_pretrained_weights(chosen["model"])))
-        # Ultralytics 8.4 rejects unknown kwargs in model.train(); callbacks attach via Model.add_callback
-        model.add_callback("on_train_epoch_end", monitor.on_epoch_end)
-        monitor.start()
+        monitor = make_guard(logger, hw, device, args, guard_enabled=not getattr(args, "no_guard", False))
+        model = None
+        # fresh first attempt goes through supervisor with mode=fresh, no checkpoint
+        guard_enabled = not getattr(args, "no_guard", False)
+        guard = monitor
 
-        status = "completed"
-        try:
-            model.train(
-                data=str(yaml_path),
-                epochs=args.epochs,
-                imgsz=chosen["imgsz"],
-                batch=chosen["batch"],
-                workers=chosen["workers"],
-                device=device,
-                project=str(RUNS_DIR),
-                name=run_name,
-                exist_ok=True,
-                save_dir=str(run_dir),  # pin the exact run dir chosen above; no silent Ultralytics increment
-                patience=args.patience,
-                save=True,
-                plots=True,
-                verbose=True,
-                **chosen_augmentation(chosen),
-            )
-        except KeyboardInterrupt:
-            status = "interrupted"
-            logger.log("[Run] Interrupted by user (Ctrl+C) during training.")
-        except Exception:
-            status = "crashed"
-            logger.log("[Run] Training crashed with an exception:")
-            logger.log(traceback.format_exc())
-        finally:
-            monitor.stop()
+        state = {"run_name": run_name, "target_epochs": args.epochs, "completed_epoch": 0,
+                 "provisional": True, "stable_epochs": 0, "downgrade_count": 0, "history": []}
+        write_adaptive_state(run_dir, state)
+
+        chosen_cfg = chosen
+        status = run_adaptive_supervisor(
+            args=args, logger=logger, run_dir=run_dir, run_name=run_name,
+            last_pt=None, chosen=chosen_cfg, target_epochs=args.epochs,
+            device=device, hw=hw, guard=guard, state=state, yaml_path=yaml_path,
+            ckpt_cfg={}, mode="fresh",
+        )
 
         log_checkpoint_status(logger, run_dir, f"(after training, status: {status})")
         log_results_csv(logger, run_dir)
@@ -2174,15 +3312,13 @@ def train(args):
         best_pt = run_dir / "weights" / "best.pt"
         last_pt = run_dir / "weights" / "last.pt"
 
-        if status == "completed":
+        if status in ("completed-target", "completed", "early-stopped"):
             logger.log(f"[Run] Training completed successfully. best.pt: {best_pt}")
             print(f"\n{'='*60}")
             print(f"  Training complete")
             print(f"{'='*60}")
             print(f"  best.pt  : {best_pt}")
             print(f"  last.pt  : {last_pt}")
-            print(f"  results  : {run_dir}")
-            print(f"  run log  : {logger.log_path}")
             print(f"{'='*60}")
             print(f"\n  Next step: export to TensorRT for Manifold 3:")
             print(f"    python export_tensorrt.py --weights {best_pt}")
@@ -2326,7 +3462,7 @@ def main():
     if (
         outcome
         and outcome.get("mode") == "fresh"
-        and outcome.get("status") == "completed"
+        and outcome.get("status") in ("completed", "completed-target")
         and not args.dry_run
     ):
         validate(normalize_path(args.input), args, outcome["run_name"])
