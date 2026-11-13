@@ -260,5 +260,8 @@ exiftool/README.txt
 *_renamed/
 
 # Internal SDD scratch (briefs/reports/reviews) — never part of the public repo.
-# docs/superpowers/ (specs/plans) stays tracked; only the scratch working dir is ignored.
 .superpowers/sdd/
+# Spec/plan write-ups are workflow artifacts too. README carries the operative
+# behaviour (tile policy, overlap/NMS thresholds, VRAM probe); the locked-decision
+# rationale stays recoverable via `git log -- docs/superpowers`.
+docs/superpowers/
