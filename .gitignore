@@ -233,6 +233,9 @@ train_detector/runs/
 train_detector/weights/
 detect_images/detections/
 
+# Local safety copies (e.g. train_detector.py.bak kept beside the rewritten script)
+*.bak
+
 # Legacy repo-root training outputs (pre script-local layout)
 /runs/
 
