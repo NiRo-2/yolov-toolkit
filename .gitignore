@@ -236,8 +236,13 @@ detect_images/detections/
 # Legacy repo-root training outputs (pre script-local layout)
 /runs/
 
-# Local exiftool binaries + metadata dumps (exiftool/outputs/)
-exiftool/
+# Local exiftool binaries + metadata dumps. Narrowed on purpose: the documented
+# helper exiftool/_Run_exiftool.bat (README "Step 4") stays tracked, and narrowing
+# avoids gitignore's can't-re-include-inside-an-excluded-directory trap.
+exiftool/exiftool_files/
+exiftool/outputs/
+exiftool/*.exe
+exiftool/README.txt
 
 # Model weights / engines / ONNX — too large for git
 *.pt
