@@ -1,14 +1,21 @@
-r"""
+﻿r"""
 YOLO26 Object Detector Training Script
 Auto-detects hardware, dataset size and image resolution to calculate optimal training config.
+Every fresh or resumed training invocation writes a per-run text log under <run_dir>/Logs/.
+Memory/model/batch selection is dynamically calibrated with real-dataset probe runs for the
+selected hardware, device, dataset and augmentation config; static estimates are fallback only.
 
 Usage:
-    # Fresh training run (auto-configures everything)
+    # Fresh training run (auto-configures everything, runs dynamic memory calibration)
     python train_detector/train_detector.py --input /path/to/data.yaml --name my_detector_v1
 
-    # Override any auto-calculated value
+    # Override any auto-calculated value (overrides are safety-checked unless --force-unsafe)
     python train_detector/train_detector.py --input /path/to/data.yaml --name my_detector_v1 --model yolo26x.pt --batch 8
     python train_detector/train_detector.py --input /path/to/data.yaml --name my_detector_v1 --imgsz 1024
+
+    # Run-name collision control
+    python train_detector/train_detector.py --input /path/to/data.yaml --name my_detector_v1 --fresh
+    python train_detector/train_detector.py --input /path/to/data.yaml --name my_detector_v1 --resume
 
     # Resume a crashed/interrupted run
     python train_detector/train_detector.py --resume --name my_detector_v1
@@ -16,43 +23,127 @@ Usage:
     # Resume without --name: auto-finds the most recent run
     python train_detector/train_detector.py --resume
 
+    # Test run-name handling, dataset validation, fingerprinting and logging without training
+    python train_detector/train_detector.py --input /path/to/data.yaml --name DryRunTest --device cpu --dry-run
+
     --input   path to data.yaml file (required for fresh training)
               works with Windows paths: c:\Users\Ni\Desktop\project\data.yaml
-    --resume  resume from last checkpoint
+    --resume  resume from last checkpoint (fails clearly if no checkpoint exists)
+    --fresh   force a new auto-suffixed run even if the run name already exists
     --name    run name to resume, or name for new run (default: detector_v1)
-    --model   override auto-selected model (yolo26m/l/x)
+    --model   override auto-selected model (yolo26n/m/l/x)
     --batch   override auto-calculated batch size
     --workers override auto-calculated worker count
     --imgsz   override auto-calculated image size in pixels
     --epochs  number of training epochs (default: 600)
     --patience early stopping patience in epochs (default: 100)
-    --device  0 for GPU, cpu for CPU (default: 0)
+    --device  0 for GPU, cpu for CPU (default: 0; falls back to CPU when CUDA is unavailable)
+    --memory-profile safe|balanced|aggressive   dynamic memory safety profile (default: safe)
+    --no-memory-probe  skip dynamic probe calibration; conservative static caps only
+    --force-unsafe     proceed even when dynamic calibration marks the selected config unsafe
+    --dry-run          select run name, validate dataset, fingerprint, write log, exit before probes/training
+    --probe-vram       measure/refresh legacy per-model GB/image estimates
 
 Output:
-    train_detector/weights/<model>.pt          <- Ultralytics pretrained backbones (cached)
-    train_detector/runs/detect/<name>/weights/best.pt   <- use this for TensorRT export
+    train_detector/weights/<model>.pt                 <- Ultralytics pretrained backbones (cached)
+    train_detector/weights/memory_profiles.json       <- measured dynamic memory cache (schema v2)
+    train_detector/weights/vram_estimates.json        <- legacy fallback estimates only
+    train_detector/runs/detect/<name>/Logs/run-<localtime><offset>.log     <- fresh run log
+    train_detector/runs/detect/<name>/Logs/resume-<localtime><offset>.log  <- resume run log
+    train_detector/runs/detect/<name>/weights/best.pt <- use this for TensorRT export
     train_detector/runs/detect/<name>/weights/last.pt
     train_detector/runs/detect/<name>/results.png
     train_detector/runs/detect/<name>/confusion_matrix.png
 """
 
 import argparse
+import hashlib
 import json
 import os
+import platform
+import re
 import statistics
+import subprocess
 import sys
 import tempfile
+import threading
+import time
+import traceback
 import yaml
+from datetime import datetime
 from pathlib import Path
+
 import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
 
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except Exception:
+    PSUTIL_AVAILABLE = False
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RUNS_DIR = SCRIPT_DIR / "runs" / "detect"
 WEIGHTS_DIR = SCRIPT_DIR / "weights"
+
+LOGS_DIRNAME = "Logs"
+
+# ANSI escape / control sequence stripper for log-file output (terminal output stays raw).
+ANSI_RE = re.compile(
+    r"\x1b\[[0-9;?]*[a-zA-Z]"                 # CSI sequences: colors, cursor moves, erases
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"     # OSC sequences: window titles etc
+    r"|\x1b[()][AB012]"                        # charset designators
+    r"|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"      # remaining control chars (keeps \n and \t)
+)
+
+# Memory safety profiles: maximum allowed measured peak as a fraction of total memory.
+# safe @16GB VRAM -> ~10.9 GB peak reserved ceiling.
+MEMORY_PROFILES = {
+    "safe":       {"gpu": 0.68, "cpu": 0.38},
+    "balanced":   {"gpu": 0.75, "cpu": 0.45},
+    "aggressive": {"gpu": 0.85, "cpu": 0.55},
+}
+
+PREFERRED_AUTO_BATCH = 8   # auto batch target; nbs=64 gradient accumulation keeps effective batch at 64
+MIN_AUTO_BATCH = 4         # auto batch floor; batch 2 is only usable with an explicit --force-unsafe run
+BATCH_LADDER = [2, 4, 8, 16, 32, 64]
+STANDARD_IMGSZ = [320, 416, 512, 640, 768, 1024, 1280, 1536]
+MODEL_QUALITY_ORDER = ["yolo26n.pt", "yolo26m.pt", "yolo26l.pt", "yolo26x.pt"]
+
+MEMORY_CACHE_PATH = WEIGHTS_DIR / "memory_profiles.json"
+
+
+# -- Local Timestamps ------------------------------------------------------------
+
+def local_now() -> datetime:
+    """Local wall clock with timezone info (offset-aware)."""
+    return datetime.now().astimezone()
+
+
+def local_stamp(dt=None) -> str:
+    """20261113T135943+0200 style timestamp for log filenames."""
+    return (dt or local_now()).strftime("%Y%m%dT%H%M%S%z")
+
+
+def local_iso(dt=None) -> str:
+    """2026-11-13T13:59:43+0200 style timestamp for log content."""
+    return (dt or local_now()).strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub("", text)
+
+
+# -- Path Normalization ----------------------------------------------------------
+
+def normalize_path(raw: str) -> Path:
+    """Handle Windows and Unix paths on any OS."""
+    cleaned = raw.strip().strip('"').strip("'")
+    cleaned = cleaned.replace("\\", "/")
+    return Path(cleaned).resolve()
 
 
 def resolve_pretrained_weights(model: str) -> Path:
@@ -61,6 +152,12 @@ def resolve_pretrained_weights(model: str) -> Path:
 
     raw = model.strip().strip('"').strip("'")
     path = Path(raw.replace("\\", "/"))
+
+    # For bare model names, prefer the local weights cache regardless of the current directory
+    if len(path.parts) == 1:
+        cached = WEIGHTS_DIR / path.name
+        if cached.is_file():
+            return cached
 
     if path.is_file():
         return path.resolve()
@@ -97,16 +194,7 @@ def resolve_pretrained_weights(model: str) -> Path:
     return result_path
 
 
-# -- Path Normalization --------------------------------------------------------
-
-def normalize_path(raw: str) -> Path:
-    """Handle Windows and Unix paths on any OS."""
-    cleaned = raw.strip().strip('"').strip("'")
-    cleaned = cleaned.replace("\\", "/")
-    return Path(cleaned).resolve()
-
-
-# -- Hardware Detection --------------------------------------------------------
+# -- Hardware Detection ----------------------------------------------------------
 
 def detect_hardware():
     """Detect GPU VRAM, CPU cores and RAM."""
@@ -118,7 +206,6 @@ def detect_hardware():
     }
 
     try:
-        import torch
         if torch.cuda.is_available():
             props = torch.cuda.get_device_properties(0)
             info["vram_gb"] = props.total_memory / (1024 ** 3)
@@ -126,20 +213,48 @@ def detect_hardware():
     except Exception:
         pass
 
-    try:
-        import psutil
-        info["ram_gb"] = psutil.virtual_memory().total / (1024 ** 3)
-    except Exception:
-        pass
+    if PSUTIL_AVAILABLE:
+        try:
+            info["ram_gb"] = psutil.virtual_memory().total / (1024 ** 3)
+        except Exception:
+            pass
 
     return info
 
 
-# -- Dataset Detection ---------------------------------------------------------
+def cuda_available_for(device: str) -> bool:
+    if str(device).strip().lower() == "cpu":
+        return False
+    try:
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def canonical_device(device: str) -> str:
+    dev = str(device).strip().lower()
+    if dev in ("", "cpu"):
+        return "cpu"
+    m = re.search(r"\d+", dev)
+    return f"cuda:{m.group()}" if m else "cuda:0"
+
+
+def cuda_index_for(device: str):
+    """Return CUDA device index for a device string, or None for CPU."""
+    if str(device).strip().lower() == "cpu":
+        return None
+    m = re.search(r"\d+", str(device))
+    return int(m.group()) if m else 0
+
+
+# -- Dataset Detection -----------------------------------------------------------
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
+
 
 def get_train_images_path(yaml_path: Path) -> Path:
     """Resolve the train images directory from data.yaml."""
-    with open(yaml_path) as f:
+    with open(yaml_path, encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
     train_val = str(data.get("train", "")).replace("\\", "/")
@@ -159,59 +274,68 @@ def get_train_images_path(yaml_path: Path) -> Path:
     return train_path
 
 
+def image_files(directory: Path):
+    """List all image files under a directory."""
+    if directory is None:
+        return []
+    return [f for f in directory.rglob("*") if f.suffix.lower() in IMAGE_EXTENSIONS]
+
+
 def count_images(train_path: Path) -> int:
     """Count images in a directory."""
-    if train_path is None:
-        return 0
-    extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
-    return sum(1 for f in train_path.rglob("*") if f.suffix.lower() in extensions)
+    return len(image_files(train_path))
 
 
-def detect_image_size(train_path: Path) -> int:
+def sample_image_files(files, sample_fraction: float = 0.10, max_samples: int = 100):
+    """Evenly spread a sample across a file list for representative stats."""
+    total = len(files)
+    if total == 0:
+        return []
+    sample_count = min(max(1, int(total * sample_fraction)), max_samples)
+    step = max(1, total // sample_count)
+    return files[::step][:sample_count]
+
+
+def _read_image_max_dim(img_path: Path, use_pil: bool):
+    if use_pil:
+        from PIL import Image as PILImage
+        with PILImage.open(img_path) as img:
+            return max(img.size)
+    img = cv2.imread(str(img_path))
+    if img is not None:
+        h, w = img.shape[:2]
+        return max(h, w)
+    return None
+
+
+def detect_image_size(train_path: Path):
     """
     Sample images spread across the dataset to detect native resolution.
 
     Returns the median largest dimension across sampled images.
     Median is used as a representative native resolution for auto-config.
-
-    Samples up to 20 images evenly spread across the dataset for reliability
-    without reading every file.
     """
     if train_path is None:
         return None
 
-    extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
-    image_files = [f for f in train_path.rglob("*") if f.suffix.lower() in extensions]
-
-    if not image_files:
+    image_list = image_files(train_path)
+    if not image_list:
         return None
 
-    # Sample 10% of dataset evenly spread, capped at 100 images
-    total = len(image_files)
-    sample_count = min(max(1, int(total * 0.10)), 100)
-    step = max(1, total // sample_count)
-    sampled = image_files[::step][:sample_count]
+    sampled = sample_image_files(image_list)
 
-    sizes = []
-
-    # Try PIL first, fall back to OpenCV
     try:
-        from PIL import Image as PILImage
+        import PIL  # noqa: F401
         use_pil = True
     except ImportError:
         use_pil = False
 
+    sizes = []
     for img_path in sampled:
         try:
-            if use_pil:
-                with PILImage.open(img_path) as img:
-                    sizes.append(max(img.size))
-            else:
-                import cv2
-                img = cv2.imread(str(img_path))
-                if img is not None:
-                    h, w = img.shape[:2]
-                    sizes.append(max(h, w))
+            dim = _read_image_max_dim(img_path, use_pil)
+            if dim is not None:
+                sizes.append(dim)
         except Exception:
             continue
 
@@ -229,7 +353,515 @@ def detect_image_size(train_path: Path) -> int:
     return statistics.median(sizes)
 
 
-# -- Auto Config ---------------------------------------------------------------
+# -- Per-Run Logging ---------------------------------------------------------------
+
+class _TeeStream:
+    """File-like wrapper: raw text goes to the terminal, sanitized lines to the run log."""
+
+    def __init__(self, stream, logger):
+        self._stream = stream
+        self._logger = logger
+
+    def write(self, data):
+        try:
+            self._stream.write(data)
+        except Exception:
+            pass
+        try:
+            self._logger._feed(data)
+        except Exception:
+            pass
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        try:
+            return self._stream.isatty()
+        except Exception:
+            return False
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+class RunLogger:
+    """
+    Per-run text log under <run_dir>/Logs plus stdout/stderr tee.
+
+    Filenames use LOCAL time with UTC offset:
+        run-YYYYMMDDTHHMMSS+HHMM.log   (fresh)
+        resume-YYYYMMDDTHHMMSS+HHMM.log (resume)
+    A '-2', '-3', ... suffix is appended when the name already exists.
+
+    Terminal output stays raw; the log file strips ANSI codes, keeps only the
+    final tqdm carriage-return segment of each completed line, and flushes per line.
+    """
+
+    def __init__(self, run_dir: Path, resume: bool = False):
+        self.run_dir = Path(run_dir)
+        logs_dir = self.run_dir / LOGS_DIRNAME
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        prefix = "resume" if resume else "run"
+        base = f"{prefix}-{local_stamp()}"
+        name = f"{base}.log"
+        counter = 2
+        while (logs_dir / name).exists():
+            name = f"{base}-{counter}.log"
+            counter += 1
+        self.log_path = logs_dir / name
+        self._file = open(self.log_path, "a", encoding="utf-8", errors="replace")
+        self._lock = threading.Lock()
+        self._buffer = ""
+        self._orig_stdout = sys.stdout
+        self._orig_stderr = sys.stderr
+
+    def start_tee(self):
+        sys.stdout = _TeeStream(self._orig_stdout, self)
+        sys.stderr = _TeeStream(self._orig_stderr, self)
+
+    def close(self):
+        sys.stdout = self._orig_stdout
+        sys.stderr = self._orig_stderr
+        with self._lock:
+            self._flush_buffer(discard=True)
+        try:
+            self._write_line(f"[LOG CLOSE] {local_iso()}")
+        except Exception:
+            pass
+        try:
+            self._file.close()
+        except Exception:
+            pass
+
+    def log(self, text=""):
+        text = str(text)
+        if not text:
+            self._write_line("")
+            return
+        for line in text.rstrip("\n").split("\n"):
+            self._write_line(line)
+
+    def log_run_startup(self, args, requested_name, run_name, run_dir, mode):
+        self.log("=" * 72)
+        self.log(f"TRAIN DETECTOR RUN LOG ({mode})")
+        self.log(f"local start time : {local_iso()}")
+        self.log(f"command line     : {subprocess.list2cmdline(sys.argv)}")
+        self.log(f"working dir      : {os.getcwd()}")
+        self.log(f"python           : {platform.python_version()} on {platform.system()} {platform.release()}")
+        self.log(f"requested name   : {requested_name}")
+        self.log(f"resolved run name: {run_name}")
+        self.log(f"resolved run dir : {run_dir}")
+        self.log(f"device requested : {args.device if args.device else '0'}")
+        prof = MEMORY_PROFILES[args.memory_profile]
+        self.log(f"memory profile   : {args.memory_profile} (gpu frac {prof['gpu']}, cpu frac {prof['cpu']})")
+        self.log(f"force unsafe     : {args.force_unsafe}")
+        self.log(f"memory probe     : {'off (--no-memory-probe)' if args.no_memory_probe else 'on'}")
+        self.log("=" * 72)
+
+    def _write_line(self, line: str):
+        line = strip_ansi(str(line)).replace("\r", " ")
+        with self._lock:
+            self._file.write(line + "\n")
+            self._file.flush()
+
+    def _feed(self, data: str):
+        with self._lock:
+            self._buffer += str(data)
+            self._flush_buffer(discard=False)
+
+    def _flush_buffer(self, discard: bool):
+        # Process newline-terminated chunks. For tqdm-style carriage-return
+        # streams, only the segment after the LAST \r (the complete progress
+        # line) is logged; intermediate updates are skipped.
+        while True:
+            if discard:
+                if not self._buffer:
+                    return
+                line, self._buffer = self._buffer, ""
+            elif "\n" in self._buffer:
+                line, self._buffer = self._buffer.split("\n", 1)
+            else:
+                return
+            clean = strip_ansi(line)
+            if "\r" in clean:
+                clean = clean.rsplit("\r", 1)[-1]
+            if clean:
+                self._file.write(clean + "\n")
+                self._file.flush()
+
+
+# -- Runtime Memory Monitoring ----------------------------------------------------
+
+def process_rss_bytes():
+    """Recursive process RSS in bytes, or None when psutil is unavailable/fails."""
+    if not PSUTIL_AVAILABLE:
+        return None
+    try:
+        proc = psutil.Process()
+        total = proc.memory_info().rss
+        try:
+            children = proc.children(recursive=True)
+        except (psutil.AccessDenied, psutil.Error):
+            children = []
+        for child in children:
+            try:
+                total += child.memory_info().rss
+            except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ProcessLookupError):
+                continue
+        return total
+    except Exception:
+        return None
+
+
+class MemoryMonitor:
+    """
+    Optional background sampling thread. Peak stats are measured, never
+    enforced: the monitor logs periodic summaries and threshold warnings but
+    does not restart training or change batch/workers/imgsz mid-run.
+    """
+
+    SAMPLE_INTERVAL = 5.0
+    SUMMARY_INTERVAL = 60.0
+
+    def __init__(self, logger, cuda_index, gpu_limit_gb, cpu_limit_gb, profile_name):
+        self.logger = logger
+        self.cuda_index = cuda_index
+        self.gpu_limit_gb = gpu_limit_gb
+        self.cpu_limit_gb = cpu_limit_gb
+        self.profile_name = profile_name
+        self._stop = threading.Event()
+        self._thread = None
+        self._peak_alloc = 0.0
+        self._peak_reserved = 0.0
+        self._peak_rss = 0.0
+        self._warned_gpu = False
+        self._warned_cpu = False
+
+    def cuda_active(self):
+        return self.cuda_index is not None
+
+    def reset(self):
+        """Reset CUDA peak stats just before full training starts."""
+        if self.cuda_active():
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats(self.cuda_index)
+            except Exception as e:
+                self.logger.log(f"[MEM] Could not reset CUDA peak stats: {e}")
+        self._peak_alloc = 0.0
+        self._peak_reserved = 0.0
+        self._peak_rss = 0.0
+
+    def sample(self):
+        if self.cuda_active():
+            try:
+                self._peak_alloc = max(self._peak_alloc, torch.cuda.max_memory_allocated(self.cuda_index) / 2**30)
+                self._peak_reserved = max(self._peak_reserved, torch.cuda.max_memory_reserved(self.cuda_index) / 2**30)
+            except Exception:
+                pass
+        rss_bytes = process_rss_bytes()
+        if rss_bytes is not None:
+            self._peak_rss = max(self._peak_rss, rss_bytes / 2**30)
+        self._check_thresholds()
+
+    def _check_thresholds(self):
+        if self.gpu_limit_gb and self._peak_reserved > self.gpu_limit_gb and not self._warned_gpu:
+            self._warned_gpu = True
+            self.logger.log(
+                f"[MEM WARNING] GPU peak reserved {self._peak_reserved:.2f} GB exceeds the "
+                f"'{self.profile_name}' limit {self.gpu_limit_gb:.2f} GB. Training continues; watch for OOM."
+            )
+        if self.cpu_limit_gb and self._peak_rss > self.cpu_limit_gb and not self._warned_cpu:
+            self._warned_cpu = True
+            self.logger.log(
+                f"[MEM WARNING] CPU peak RSS {self._peak_rss:.2f} GB exceeds the "
+                f"'{self.profile_name}' limit {self.cpu_limit_gb:.2f} GB."
+            )
+
+    def summary_line(self, tag=""):
+        parts = []
+        if self.cuda_active():
+            limit = f" (limit {self.gpu_limit_gb:.2f})" if self.gpu_limit_gb else ""
+            parts.append(f"GPU alloc peak {self._peak_alloc:.2f} GB | GPU reserved peak {self._peak_reserved:.2f} GB{limit}")
+        if PSUTIL_AVAILABLE:
+            limit = f" (limit {self.cpu_limit_gb:.2f})" if self.cpu_limit_gb else ""
+            parts.append(f"CPU RSS peak {self._peak_rss:.2f} GB{limit}")
+        else:
+            parts.append("CPU RSS sampling unavailable (psutil not installed)")
+        if not parts:
+            parts.append("no memory sampling available")
+        return f"[MEM {local_now().strftime('%H:%M:%S')}] {tag + ' ' if tag else ''}" + " | ".join(parts)
+
+    def log_summary(self, tag=""):
+        self.sample()
+        self.logger.log(self.summary_line(tag))
+
+    def on_epoch_end(self, trainer=None):
+        try:
+            epoch = getattr(trainer, "epoch", None)
+            self.log_summary(f"epoch {epoch + 1}:" if isinstance(epoch, int) else "epoch:")
+        except Exception:
+            pass
+
+    def start(self):
+        self.reset()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="memory-monitor")
+        self._thread.start()
+
+    def _run(self):
+        next_summary = time.monotonic() + self.SUMMARY_INTERVAL
+        while not self._stop.wait(self.SAMPLE_INTERVAL):
+            try:
+                self.sample()
+                if time.monotonic() >= next_summary:
+                    self.logger.log(self.summary_line("60s:"))
+                    next_summary = time.monotonic() + self.SUMMARY_INTERVAL
+            except Exception:
+                pass
+
+    def stop(self):
+        if self._thread is not None:
+            self._stop.set()
+            try:
+                self._thread.join(timeout=15)
+            except RuntimeError:
+                pass
+            self._thread = None
+        self.log_summary("final:")
+
+
+def make_monitor(logger, hw, device, args) -> MemoryMonitor:
+    profile = MEMORY_PROFILES[args.memory_profile]
+    cuda_index = cuda_index_for(device) if cuda_available_for(device) else None
+    gpu_limit = hw["vram_gb"] * profile["gpu"] if (cuda_index is not None and hw.get("vram_gb")) else None
+    cpu_limit = hw["ram_gb"] * profile["cpu"] if hw.get("ram_gb") else None
+    logger.log(
+        f"[Memory Monitor] profile '{args.memory_profile}': "
+        + (f"GPU peak-reserved limit {gpu_limit:.2f} GB of {hw['vram_gb']:.1f} GB | " if gpu_limit else "GPU monitoring off (no CUDA) | ")
+        + (f"CPU peak-RSS limit {cpu_limit:.2f} GB of {hw['ram_gb']:.1f} GB" if cpu_limit else "CPU RSS limit unknown")
+    )
+    return MemoryMonitor(logger, cuda_index, gpu_limit, cpu_limit, args.memory_profile)
+
+
+# -- Fingerprints ------------------------------------------------------------------
+
+def hardware_device_fingerprint(device: str) -> dict:
+    """Identify the exact hardware+device+library combo calibration data belongs to."""
+    fp = {
+        "os": platform.system(),
+        "device": canonical_device(device),
+        "cpu_cores": os.cpu_count() or 4,
+        "ram_gb": None,
+        "torch": torch.__version__,
+        "torch_cuda": torch.version.cuda or None,
+        "ultralytics": "unknown",
+    }
+    try:
+        import ultralytics
+        fp["ultralytics"] = getattr(ultralytics, "__version__", "unknown")
+    except Exception:
+        pass
+    if PSUTIL_AVAILABLE:
+        try:
+            fp["ram_gb"] = round(psutil.virtual_memory().total / 2**30, 2)
+        except Exception:
+            pass
+    idx = cuda_index_for(device)
+    if idx is not None:
+        try:
+            props = torch.cuda.get_device_properties(idx)
+            fp["gpu_name"] = props.name
+            fp["vram_gb"] = round(props.total_memory / 2**30, 2)
+        except Exception:
+            pass
+    return fp
+
+
+def dataset_fingerprint(yaml_path: Path, train_path: Path) -> dict:
+    """Content stats of the dataset used for calibration and cache validity."""
+    with open(yaml_path, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    files = image_files(train_path)
+    sampled = sample_image_files(files)
+
+    try:
+        import PIL  # noqa: F401
+        use_pil = True
+    except ImportError:
+        use_pil = False
+
+    labels_dir = None
+    if train_path is not None:
+        candidate = train_path.parent / "labels"
+        labels_dir = candidate if candidate.is_dir() else train_path
+
+    sizes = []
+    label_counts = []
+    for img_path in sampled:
+        try:
+            dim = _read_image_max_dim(img_path, use_pil)
+            if dim is not None:
+                sizes.append(dim)
+                label_path = labels_dir / (img_path.stem + ".txt")
+                count = 0
+                try:
+                    if label_path.is_file():
+                        count = sum(1 for ln in label_path.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip())
+                except OSError:
+                    count = 0
+                label_counts.append(count)
+        except Exception:
+            continue
+
+    return {
+        "data_yaml": str(yaml_path).replace("\\", "/"),
+        "image_count": len(files),
+        "nc": int(data.get("nc") or 0),
+        "median_img_size": int(statistics.median(sizes)) if sizes else None,
+        "max_sampled_img_size": int(max(sizes)) if sizes else None,
+        "avg_labels_per_sampled_image": round(sum(label_counts) / len(label_counts), 2) if label_counts else None,
+    }
+
+
+def fingerprint_hash(fp: dict) -> str:
+    payload = json.dumps(fp, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+# -- Dynamic Memory Cache (memory_profiles.json, schema v2) ------------------------
+# Legacy vram_estimates.json is a model-only fallback heuristic; it is NOT final
+# safety truth. Only measured, fingerprint-matched entries in this cache can
+# skip recalibration.
+
+def load_memory_cache(logger=None) -> dict:
+    if not MEMORY_CACHE_PATH.exists():
+        return {"version": 2, "hardware_profiles": {}}
+    try:
+        with open(MEMORY_CACHE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or data.get("version") != 2:
+            if logger:
+                logger.log(f"[Cache] {MEMORY_CACHE_PATH} is not schema version 2; starting fresh.")
+            return {"version": 2, "hardware_profiles": {}}
+        data.setdefault("hardware_profiles", {})
+        return data
+    except (OSError, json.JSONDecodeError) as e:
+        if logger:
+            logger.log(f"[Cache] Ignoring corrupt memory cache {MEMORY_CACHE_PATH}: {e}")
+        return {"version": 2, "hardware_profiles": {}}
+
+
+def save_memory_cache(cache: dict, logger) -> bool:
+    try:
+        WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+        with open(MEMORY_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2)
+            f.write("\n")
+        return True
+    except OSError as e:
+        logger.log(f"[Cache WARNING] Could not write {MEMORY_CACHE_PATH}: {e}; keeping in-memory calibration result.")
+        return False
+
+
+def sig_num(v) -> str:
+    if isinstance(v, float):
+        return f"{v:g}"
+    return str(v)
+
+
+def config_signature(model, imgsz, batch, workers, multi_scale, mosaic=1.0, mixup=0.15, copy_paste=0.3) -> str:
+    """Cache config key: model|imgsz|batch|workers|ms|mosaic|mixup|copy_paste."""
+    return "|".join([
+        str(model), str(imgsz), str(batch), str(workers),
+        f"ms{sig_num(multi_scale)}",
+        f"mosaic{sig_num(mosaic)}",
+        f"mixup{sig_num(mixup)}",
+        f"copy{sig_num(copy_paste)}",
+    ])
+
+
+def selection_signature(args, ds_fp: dict) -> str:
+    """Which calibration request a cached selection answers."""
+    explicit = {k: v for k, v in {
+        "model": args.model, "imgsz": args.imgsz, "batch": args.batch, "workers": args.workers,
+    }.items() if v is not None}
+    sig = json.dumps(explicit, sort_keys=True, separators=(",", ":")) if explicit else "auto"
+    return f"ds:{fingerprint_hash(ds_fp)}|profile:{args.memory_profile}|{sig}"
+
+
+def get_hw_profile(cache: dict, hw_fp: dict):
+    pid = fingerprint_hash(hw_fp)
+    profile = cache["hardware_profiles"].get(pid)
+    if profile is None:
+        profile = {"fingerprint": hw_fp, "selections": {}, "configs": {}}
+        cache["hardware_profiles"][pid] = profile
+    return pid, profile
+
+
+def lookup_cached_selection(cache: dict, hw_fp: dict, ds_fp: dict, sel_key: str, logger):
+    """Return (selection, config entry) only when every fingerprint matches a measured-safe entry."""
+    pid = fingerprint_hash(hw_fp)
+    profile = cache["hardware_profiles"].get(pid)
+    if not profile:
+        logger.log("[Cache] No hardware/device profile for this machine yet; full calibration needed.")
+        return None
+    sel = profile.get("selections", {}).get(sel_key)
+    if not sel:
+        logger.log("[Cache] No selection for this dataset/profile/explicit-flag combination; calibration required.")
+        return None
+    entry = profile.get("configs", {}).get(sel.get("config_key"))
+    if not entry:
+        logger.log("[Cache] Selection points at a missing config entry; calibration required.")
+        return None
+    if fingerprint_hash(entry.get("dataset_fingerprint", {})) != fingerprint_hash(ds_fp):
+        logger.log("[Cache] Dataset fingerprint changed since calibration; re-calibration required.")
+        return None
+    if not entry.get("measured") or not entry.get("safe"):
+        logger.log("[Cache] Selection entry is not measured-safe; re-calibration required.")
+        return None
+    return sel, entry
+
+
+def record_calibration(cache: dict, logger, hw_fp: dict, ds_fp: dict, sel_key: str,
+                       chosen: dict, peaks, safe: bool, measured: bool, make_selection: bool = True):
+    """Store a measured (or unsafe-forced) probe result in the memory cache."""
+    _pid, profile = get_hw_profile(cache, hw_fp)
+    key = config_signature(**chosen)
+    alloc, res, rss = peaks
+    entry = {
+        "dataset_fingerprint": ds_fp,
+        "peak_gpu_allocated_gb": round(alloc, 3) if alloc is not None else None,
+        "peak_gpu_reserved_gb": round(res, 3) if res is not None else None,
+        "peak_cpu_rss_gb": round(rss, 3) if rss is not None else None,
+        "safe": bool(safe),
+        "measured": bool(measured),
+        "updated_at": local_iso(),
+    }
+    profile["configs"][key] = entry
+    if make_selection:
+        profile["selections"][sel_key] = {
+            "config_key": key,
+            "config": dict(chosen),
+            "updated_at": local_iso(),
+        }
+    cache["updated_at"] = local_iso()
+    saved = save_memory_cache(cache, logger)
+    if saved and measured:
+        logger.log(f"[Cache] Recorded measured config {key} (peak GPU reserved {sig_num(entry['peak_gpu_reserved_gb'])} GB).")
+    return entry
+
+
+# -- Legacy VRAM estimates (fallback heuristic only) --------------------------------
 
 # VRAM usage estimates per image at 1024px (GB).
 # FLOPs-scaled from prior YOLOv8 measurements using Ultralytics published
@@ -244,13 +876,13 @@ VRAM_PER_IMAGE = {
 ESTIMATES_PATH = WEIGHTS_DIR / "vram_estimates.json"
 
 
-def load_vram_estimates() -> dict[str, float]:
+def load_vram_estimates():
     if not ESTIMATES_PATH.exists():
         return {}
     try:
         with open(ESTIMATES_PATH, encoding="utf-8") as f:
             data = json.load(f)
-        out: dict[str, float] = {}
+        out = {}
         for name, meta in (data.get("estimates") or {}).items():
             val = meta.get("gb_per_image_1024") if isinstance(meta, dict) else None
             if isinstance(val, (int, float)) and val > 0:
@@ -261,7 +893,7 @@ def load_vram_estimates() -> dict[str, float]:
         return {}
 
 
-def save_vram_estimates(estimates: dict[str, float], device_name: str) -> None:
+def save_vram_estimates(estimates: dict, device_name: str) -> None:
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
     merged = load_vram_estimates()
     merged.update(estimates)
@@ -270,12 +902,11 @@ def save_vram_estimates(estimates: dict[str, float], device_name: str) -> None:
         ultra_ver = getattr(ultralytics, "__version__", "unknown")
     except Exception:
         ultra_ver = "unknown"
-    from datetime import datetime, timezone
     payload = {
         "version": 1,
         "ultralytics": ultra_ver,
         "device_name": device_name,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": local_iso(),
         "estimates": {
             k: {"gb_per_image_1024": round(v, 4)} for k, v in sorted(merged.items())
         },
@@ -316,7 +947,7 @@ def probe_model_vram(model_name: str, device: str = "0") -> float:
     with tempfile.TemporaryDirectory(prefix="yolo_vram_probe_") as tmp:
         tmp_path = Path(tmp)
         data_yaml = _write_probe_dataset(tmp_path, imgsz=640)
-        last_err: Exception | None = None
+        last_err = None
         for batch in (2, 1):
             try:
                 torch.cuda.empty_cache()
@@ -349,25 +980,16 @@ def probe_model_vram(model_name: str, device: str = "0") -> float:
     return gb_per_img_640 * ((1024 / 640) ** 2)
 
 
-def cuda_available_for(device: str) -> bool:
-    if str(device).lower() == "cpu":
-        return False
-    try:
-        return bool(torch.cuda.is_available())
-    except Exception:
-        return False
-
-
-def ensure_vram_estimates(models: list[str], device: str, force: bool = False) -> dict[str, float]:
+def ensure_vram_estimates(models: list, device: str, force: bool = False) -> dict:
     if not cuda_available_for(device):
-        print("[VRAM Probe] CUDA unavailable — using built-in FLOPs-scaled estimates")
+        print("[VRAM Probe] CUDA unavailable - using built-in FLOPs-scaled estimates")
         return {m: get_vram_per_image(m) for m in models}
     cached = load_vram_estimates()
     need = [m for m in models if force or m not in cached]
     if not need:
         return {m: get_vram_per_image(m) for m in models}
     print(f"[VRAM Probe] Measuring: {', '.join(need)}")
-    measured: dict[str, float] = {}
+    measured = {}
     try:
         device_name = torch.cuda.get_device_name(0)
     except Exception:
@@ -377,230 +999,467 @@ def ensure_vram_estimates(models: list[str], device: str, force: bool = False) -
             measured[m] = probe_model_vram(m, device=device)
             print(f"  {m}: {measured[m]:.3f} GB/img @1024")
         except Exception as e:
-            print(f"[WARNING] Probe failed for {m}: {e} — using built-in fallback")
+            print(f"[WARNING] Probe failed for {m}: {e} - using built-in fallback")
     if measured:
         save_vram_estimates(measured, device_name)
     return {m: get_vram_per_image(m) for m in models}
 
 
-MIN_BATCH = 8  # minimum viable batch size for stable training
-
+# -- Static Estimate Helpers (starting heuristics / CPU and --no-memory-probe caps) -
 
 def snap_to_standard(size: int) -> int:
     """Snap a raw pixel size to the nearest standard YOLO imgsz."""
-    standards = [320, 416, 512, 640, 768, 1024, 1280, 1536]
-    return min(standards, key=lambda s: abs(s - size))
+    return min(STANDARD_IMGSZ, key=lambda s: abs(s - size))
 
 
-def calc_max_batch_for_imgsz(vram_gb: float, model: str, imgsz: int) -> int:
-    """Calculate what batch size we'd get at a given imgsz."""
-    scale = (imgsz / 1024) ** 2
-    vram_per_img = get_vram_per_image(model) * scale
-    usable_vram = vram_gb * 0.85
-    batch = int(usable_vram / vram_per_img)
-    for b in [64, 32, 16, 8, 4]:
-        if batch >= b:
-            return b
-    return 4
+def native_capped_imgsz(native_size):
+    """Largest standard imgsz that does NOT upscale beyond native dataset resolution."""
+    if not native_size:
+        return None
+    cap = snap_to_standard(int(native_size))
+    if cap > native_size:
+        lower = [s for s in STANDARD_IMGSZ if s <= native_size]
+        cap = max(lower) if lower else 320
+    return cap
 
 
-def select_model_and_imgsz(image_count: int, vram_gb: float) -> tuple:
+def imgsz_candidates(native_size):
+    """Auto imgsz ladder: native-capped value first, then lower standards."""
+    cap = native_capped_imgsz(native_size) or 640
+    out = [cap] + [s for s in reversed(STANDARD_IMGSZ) if s < cap]
+    return out[:4]
+
+
+def calc_batch(vram_gb, model: str, imgsz: int, multi_scale: float = 0.0, vram_frac: float = 0.68) -> int:
     """
-    Select best model and image size based on dataset size, VRAM and native image resolution.
-    Priority: best quality within hardware limits.
+    Conservative static estimate of the largest ladder batch that fits.
 
-    Key constraints:
-    1. imgsz never exceeds native image resolution — upscaling adds no detail
-    2. imgsz is only raised if batch stays >= 4 (acceptable when nbs=64 gradient
-       accumulation is active; effective batch remains 64 regardless of per-step batch)
-
-    Decision table (before native resolution cap):
-    ┌─────────────┬──────────┬────────────┬────────┬──────────────────────────────────────────┐
-    │ Train imgs  │ VRAM     │ Model      │ imgsz  │ Reason                                   │
-    ├─────────────┼──────────┼────────────┼────────┼──────────────────────────────────────────┤
-    │ < 1,000     │ >= 16GB  │ yolo26m    │ 1280   │ m is light, 1280 fits, avoids overfit    │
-    │ 1,000-5,000 │ >= 16GB  │ yolo26l    │ 1024   │ l+1280 fits batch 8; 1024 kept for balance │
-    │ > 5,000     │ >= 16GB  │ yolo26x    │ 1280†  │ x+1280 needs batch>=8 (~17.6GB+); else 1024│
-    ├─────────────┼──────────┼────────────┼────────┼──────────────────────────────────────────┤
-    │ < 1,000     │ >= 12GB  │ yolo26m    │ 1024   │ small dataset, safe imgsz                │
-    │ 1,000-5,000 │ >= 12GB  │ yolo26l    │ 1024   │ VRAM limit, keep imgsz safe              │
-    │ > 5,000     │ >= 12GB  │ yolo26l    │ 1024   │ l is safe ceiling at 12GB                │
-    ├─────────────┼──────────┼────────────┼────────┼──────────────────────────────────────────┤
-    │ < 1,000     │ >= 8GB   │ yolo26m    │ 640    │ low VRAM, keep it safe                   │
-    │ 1,000-5,000 │ >= 8GB   │ yolo26m    │ 1024   │ m is safe at 8GB + 1024                  │
-    │ > 5,000     │ >= 8GB   │ yolo26l    │ 1024   │ dataset justifies l at safe imgsz        │
-    ├─────────────┼──────────┼────────────┼────────┼──────────────────────────────────────────┤
-    │ any         │ < 8GB    │ yolo26m    │ 640    │ low VRAM, minimal safe config            │
-    │ any         │ None/CPU │ yolo26m    │ 640    │ CPU fallback                             │
-    └─────────────┴──────────┴────────────┴────────┴──────────────────────────────────────────┘
-
-    † yolo26x@1280 only ships when it reaches MIN_BATCH (8) — that needs ~17.6GB+
-      (calc_max_batch_for_imgsz(vram_gb, "yolo26x.pt", 1280) >= 8). At the 16GB
-      threshold itself this yields batch 4, so imgsz falls back to 1024 (see the
-      "Final safety check" below, which enforces the same floor generically).
-
-    Any value can be overridden via --model, --imgsz, --batch, --workers flags.
-
-    Returns: (model, imgsz)
+    Sizing against the PEAK multi_scale frame (imgsz * (1 + multi_scale)) so
+    peak-size augmentation bursts do not OOM. Returns 0 when even batch 2 is
+    not estimated safe. Static estimates are starting heuristics only; dynamic
+    probe measurements are authoritative for safety.
     """
-    if vram_gb is None:
-        model, imgsz = "yolo26m.pt", 640
-    elif vram_gb >= 16:
-        if image_count < 1000:
-            model, imgsz = "yolo26m.pt", 1280
-        elif image_count < 5000:
-            model, imgsz = "yolo26l.pt", 1024
-        else:
-            if calc_max_batch_for_imgsz(vram_gb, "yolo26x.pt", 1280) >= MIN_BATCH:
-                model, imgsz = "yolo26x.pt", 1280
-            else:
-                model, imgsz = "yolo26x.pt", 1024
-    elif vram_gb >= 12:
-        if image_count < 1000:
-            model, imgsz = "yolo26m.pt", 1024
-        elif image_count < 5000:
-            model, imgsz = "yolo26l.pt", 1024
-        else:
-            model, imgsz = "yolo26l.pt", 1024
-    elif vram_gb >= 8:
-        if image_count < 1000:
-            model, imgsz = "yolo26m.pt", 640
-        elif image_count < 5000:
-            model, imgsz = "yolo26m.pt", 1024
-        else:
-            model, imgsz = "yolo26l.pt", 1024
-    else:
-        model, imgsz = "yolo26m.pt", 640
-
-    # Final safety check: if chosen imgsz causes batch < MIN_BATCH, drop imgsz
-    if vram_gb and calc_max_batch_for_imgsz(vram_gb, model, imgsz) < MIN_BATCH:
-        imgsz = 1024
-        if calc_max_batch_for_imgsz(vram_gb, model, imgsz) < MIN_BATCH:
-            imgsz = 640
-
-    return model, imgsz
-
-
-def calc_batch(vram_gb: float, model: str, imgsz: int, multi_scale: float = 0.0) -> int:
-    """Calculate max safe batch size for given VRAM and model."""
-    if vram_gb is None:
-        return 4
-
-    # Size against peak multi_scale batches to avoid OOM (imgsz * (1 + multi_scale))
+    if not vram_gb:
+        return 0
     effective_imgsz = imgsz * (1 + multi_scale) if multi_scale > 0 else imgsz
     scale = (effective_imgsz / 1024) ** 2
     vram_per_img = get_vram_per_image(model) * scale
-    usable_vram = vram_gb * 0.85
-    batch = int(usable_vram / vram_per_img)
-
-    for b in [64, 32, 16, 8, 4]:
+    batch = int((vram_gb * vram_frac) / vram_per_img)
+    for b in reversed(BATCH_LADDER):
         if batch >= b:
             return b
-    return 4
-
-
-def calc_augmentation_config(vram_gb: float, model: str, imgsz: int) -> dict:
-    """Quality-first augmentation: enable multi_scale whenever VRAM sustains batch >= 4.
-
-    nbs=64 keeps gradient accumulation explicit so optimization stays stable regardless
-    of the actual per-step batch size (effective batch remains 64).
-    """
-    # batch >= 4 is enough for multi_scale; nbs=64 gradient accumulation
-    # compensates for smaller per-step batches (effective batch stays 64).
-    multi_scale = 0.5 if calc_batch(vram_gb, model, imgsz, multi_scale=0.5) >= 4 else 0.0
-    return {
-        "degrees": 180,
-        "flipud": 0.5,
-        "copy_paste": 0.3,
-        "mixup": 0.15,
-        "multi_scale": multi_scale,
-        "close_mosaic": 60,
-        "cos_lr": True,
-        "nbs": 64,
-    }
+    return 0
 
 
 def calc_workers(cpu_cores: int, ram_gb: float) -> int:
-    """Calculate optimal dataloader workers."""
+    """Calculate optimal dataloader workers (capped at 8 for Windows stability)."""
     max_by_cpu = max(1, cpu_cores - 2)
     max_by_ram = int(ram_gb / 2) if ram_gb else 4
-    workers = min(max_by_cpu, max_by_ram, 8)  # cap at 8 for Windows stability
+    workers = min(max_by_cpu, max_by_ram, 8)
     return max(1, workers)
 
 
-def auto_config(yaml_path: Path, args) -> dict:
-    """Build full training config from hardware + dataset + native image resolution."""
-    hw          = detect_hardware()
-    train_path  = get_train_images_path(yaml_path)
-    image_count = count_images(train_path)
-    native_size = detect_image_size(train_path)
+def auto_workers_limit():
+    """Auto-config worker ceiling without CPU RSS proof (plan: 4 or lower)."""
+    return 4
 
-    # Select model + imgsz together
-    auto_model, auto_imgsz = select_model_and_imgsz(image_count, hw["vram_gb"])
-    model  = args.model if args.model else auto_model
-    imgsz  = args.imgsz if args.imgsz else auto_imgsz
-    if cuda_available_for(args.device):
-        ensure_vram_estimates([model], device=args.device, force=False)
-    augmentation = calc_augmentation_config(hw["vram_gb"], model, imgsz)
-    batch   = args.batch   if args.batch   else calc_batch(
-        hw["vram_gb"], model, imgsz, multi_scale=augmentation["multi_scale"]
-    )
-    workers = args.workers if args.workers else calc_workers(hw["cpu_cores"], hw["ram_gb"])
 
+def model_candidates(image_count: int, vram_gb, for_cpu: bool) -> list:
+    """Quality-first model chain; smaller models appended as hardware fallbacks."""
+    if image_count < 1000:
+        choice = "yolo26m.pt"
+    elif image_count < 5000:
+        choice = "yolo26l.pt"
+    else:
+        choice = "yolo26x.pt" if (vram_gb or 0) >= 16 else "yolo26l.pt"
+    idx = MODEL_QUALITY_ORDER.index(choice)
+    cands = [choice] + [m for m in reversed(MODEL_QUALITY_ORDER[:idx])]
+    if for_cpu:
+        cands = [m for m in cands if m != "yolo26x.pt"]
+        if "yolo26m.pt" not in cands:
+            cands.append("yolo26m.pt")
+        if "yolo26n.pt" not in cands:
+            cands.append("yolo26n.pt")
+    return cands
+
+
+# -- Dynamic Memory Calibration ----------------------------------------------------
+
+class CalibrateFail(Exception):
+    """No safe configuration exists (or an explicit override is unsafe without --force-unsafe)."""
+
+
+class ProbeOOMError(Exception):
+    """Probe run failed with an out-of-memory style error."""
+
+
+class ProbeUnverifiedError(Exception):
+    """Probe run failed for a non-OOM reason; candidate safety is unverified."""
+
+
+def looks_like_oom(exc: Exception) -> bool:
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    text = str(exc).lower()
+    return "out of memory" in text or "cannot allocate" in text or "cannot allocate memory" in text
+
+
+def probe_fraction(image_count: int) -> float:
+    """Representative probe subset size (16-128 train images); all images for small datasets."""
+    if image_count <= 128:
+        return 1.0
+    return 64.0 / float(image_count)
+
+
+def probe_train_once(model_name, device, data_yaml, imgsz, batch, multi_scale, mosaic, mixup,
+                     copy_paste, fraction, cuda_index, workers=0):
+    """
+    One 1-epoch real-dataset probe run on a representative subset (never a
+    synthetic blank image probe). Returns (peak_gpu_allocated_gb,
+    peak_gpu_reserved_gb, peak_cpu_rss_gb). Safety is judged on RESERVED
+    memory, not only allocated memory.
+    """
+    weights = resolve_pretrained_weights(model_name)
+    model = YOLO(str(weights))
+
+    peak_rss = [0.0]
+    stop_event = threading.Event()
+
+    def rss_loop():
+        while not stop_event.wait(2.0):
+            rss = process_rss_bytes()
+            if rss is not None:
+                peak_rss[0] = max(peak_rss[0], rss / 2**30)
+
+    rss_thread = threading.Thread(target=rss_loop, daemon=True) if PSUTIL_AVAILABLE else None
+    if rss_thread:
+        rss_thread.start()
+
+    try:
+        if cuda_index is not None:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(cuda_index)
+        with tempfile.TemporaryDirectory(prefix="yolo_mem_probe_") as tmp:
+            model.train(
+                data=str(data_yaml),
+                epochs=1,
+                fraction=fraction,
+                imgsz=int(imgsz),
+                batch=int(batch),
+                multi_scale=float(multi_scale),
+                mosaic=float(mosaic),
+                mixup=float(mixup),
+                copy_paste=float(copy_paste),
+                degrees=180,
+                flipud=0.5,
+                close_mosaic=0,   # keep mosaic ACTIVE during 1-epoch probes
+                workers=int(workers),
+                val=False,
+                save=False,
+                plots=False,
+                verbose=False,
+                cache=False,
+                device=device,
+                project=str(Path(tmp) / "runs"),
+                name="memory_probe",
+                exist_ok=True,
+                save_dir=str(Path(tmp) / "runs" / "memory_probe"),
+            )
+    except Exception as e:
+        if cuda_index is not None:
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        raise (ProbeOOMError(str(e)) if looks_like_oom(e) else ProbeUnverifiedError(str(e))) from e
+    finally:
+        stop_event.set()
+        if rss_thread is not None:
+                rss_thread.join(timeout=10)
+
+    alloc_gb = None
+    reserved_gb = None
+    if cuda_index is not None:
+        alloc_gb = torch.cuda.max_memory_allocated(cuda_index) / 2**30
+        reserved_gb = torch.cuda.max_memory_reserved(cuda_index) / 2**30
+        torch.cuda.empty_cache()
+
+    return alloc_gb, reserved_gb, peak_rss[0]
+
+
+def static_candidate_config(args, hw, image_count, native_size, use_gpu):
+    """
+    Static starting config (dry-run display, CPU paths, and --no-memory-probe
+    fallback). Static estimates are heuristics; only probe measurements prove
+    safety.
+    """
+    profile = MEMORY_PROFILES[args.memory_profile]
+    notes = []
+    model_list = [args.model] if args.model else model_candidates(image_count, hw.get("vram_gb"), for_cpu=not use_gpu)
+    if args.imgsz is not None:
+        imgsz_list = [int(args.imgsz)]
+        if native_size and int(args.imgsz) > int(native_size):
+            notes.append(f"explicit --imgsz {int(args.imgsz)} exceeds native dataset resolution {int(native_size)}px (override honored)")
+    else:
+        imgsz_list = imgsz_candidates(native_size)
+    workers = int(args.workers) if args.workers is not None else min(
+        calc_workers(hw.get("cpu_cores") or 4, hw.get("ram_gb")), auto_workers_limit())
+
+    for model in model_list:
+        for imgsz in imgsz_list:
+            if use_gpu:
+                est0 = calc_batch(hw["vram_gb"], model, imgsz, 0.0, profile["gpu"])
+                est_ms = calc_batch(hw["vram_gb"], model, imgsz, 0.5, profile["gpu"])
+                explicit_unsafe = False
+                if args.batch is not None:
+                    batch = int(args.batch)
+                    multi_scale = 0.5 if est_ms >= batch else 0.0
+                    if est0 < batch:
+                        explicit_unsafe = True
+                        notes.append(f"explicit batch {batch} exceeds conservative static ceiling {est0} for {model}@{imgsz}px")
+                else:
+                    multi_scale = 0.5 if est_ms >= PREFERRED_AUTO_BATCH else 0.0
+                    batch = min(calc_batch(hw["vram_gb"], model, imgsz, multi_scale, profile["gpu"]), PREFERRED_AUTO_BATCH)
+                    if batch < MIN_AUTO_BATCH:
+                        continue
+            else:
+                multi_scale = 0.0
+                explicit_unsafe = False
+                batch = int(args.batch) if args.batch is not None else 4
+                if args.batch is not None and args.batch > 16:
+                    notes.append(f"CPU batch {args.batch} is unverified and likely slow")
+            return {
+                "model": model, "imgsz": imgsz, "batch": batch, "workers": workers,
+                "multi_scale": multi_scale, "explicit_unsafe": explicit_unsafe, "notes": notes,
+            }
+
+    if args.model or args.imgsz is not None or args.batch is not None:
+        return {
+            "model": model_list[0], "imgsz": imgsz_list[0], "batch": int(args.batch or 1),
+            "workers": workers, "multi_scale": 0.0, "explicit_unsafe": True,
+            "notes": notes + ["explicit config does not fit within conservative static caps"],
+        }
+    return None
+
+
+def _short(s: str) -> str:
+    s = " ".join(str(s).split())
+    return s if len(s) <= 300 else s[:300] + " ..."
+
+
+def build_chosen(model, imgsz, batch, workers, multi_scale, mosaic):
+    """Canonical chosen-config dict used for cache keys and training kwargs."""
     return {
-        "model":       model,
-        "imgsz":       imgsz,
-        "batch":       batch,
-        "workers":     workers,
-        "augmentation": augmentation,
-        "image_count": image_count,
-        "native_size": native_size,
-        "hw":          hw,
+        "model": model, "imgsz": int(imgsz), "batch": int(batch), "workers": int(workers),
+        "multi_scale": float(multi_scale), "mosaic": float(mosaic),
+        "mixup": 0.15, "copy_paste": 0.3,
     }
 
 
-def print_auto_config(config: dict, args):
-    """Print hardware detection results and final config."""
-    hw = config["hw"]
+def calibrate_training_config(args, logger, cache, hw_fp, hw, device, data_yaml, train_path, ds_fp):
+    """
+    Select the training config via cached measured-safe selection, static-only
+    mode, or dynamic 1-epoch real-dataset probe calibration.
 
-    print(f"\n[Hardware Detected]")
-    print(f"  GPU        : {hw['gpu_name']}")
-    vram_str = f"{hw['vram_gb']:.1f} GB" if hw['vram_gb'] else "N/A (CPU)"
-    print(f"  VRAM       : {vram_str}")
-    print(f"  CPU cores  : {hw['cpu_cores']}")
-    ram_str = f"{hw['ram_gb']:.1f} GB" if hw['ram_gb'] else "Unknown"
-    print(f"  RAM        : {ram_str}")
+    Returns (chosen_config, provenance) where provenance is one of
+    'cache', 'static', 'measured', 'force-unsafe'. Raises CalibrateFail.
+    """
+    use_gpu = cuda_available_for(device)
+    profile_name = args.memory_profile
+    profile = MEMORY_PROFILES[profile_name]
+    image_count = ds_fp.get("image_count") or count_images(train_path)
+    native_size = ds_fp.get("median_img_size")
+    cuda_index = cuda_index_for(device) if use_gpu else None
+    fraction = probe_fraction(image_count)
+    sel_key = selection_signature(args, ds_fp)
 
-    print(f"\n[Dataset]")
-    print(f"  train imgs : {config['image_count']}")
-    native = config['native_size']
-    print(f"  native res : {native}px" if native else "  native res : unknown")
+    cached = lookup_cached_selection(cache, hw_fp, ds_fp, sel_key, logger)
+    if cached:
+        sel, entry = cached
+        chosen = dict(sel["config"])
+        logger.log("[Calibrate] Cached MEASURED-SAFE selection matches this hardware+device+dataset+profile; probes skipped.")
+        logger.log(f"[Calibrate] Cached config: {sel.get('config_key')}")
+        logger.log(
+            "[Calibrate] Recorded peaks: GPU alloc "
+            f"{entry.get('peak_gpu_allocated_gb')} GB | GPU reserved {entry.get('peak_gpu_reserved_gb')} GB | "
+            f"CPU RSS {entry.get('peak_cpu_rss_gb')} GB (measured {entry.get('updated_at')})"
+        )
+        print("[Calibration] Reusing measured-safe config from weights/memory_profiles.json (delete the file or pass --no-memory-probe to recalibrate).")
+        return chosen, "cache"
 
-    print(f"\n[Auto Config]")
-    model_src  = "override" if args.model   else "auto"
-    imgsz_src  = "override" if args.imgsz   else "auto"
-    batch_src  = "override" if args.batch   else "auto"
-    worker_src = "override" if args.workers else "auto"
-    print(f"  model      : {config['model']}  ({model_src})")
-    print(f"  imgsz      : {config['imgsz']}px  ({imgsz_src})")
-    print(f"  batch      : {config['batch']}  ({batch_src})")
-    batch = config["batch"]
-    nbs = config["augmentation"]["nbs"]
-    if batch < 64:
-        effective = batch * ((nbs + batch - 1) // batch)  # ceil(nbs / batch)
-        print(f"  effective batch : {effective}  (gradient accumulation)")
-    print(f"  workers    : {config['workers']}  ({worker_src})")
+    if args.no_memory_probe:
+        cfg = static_candidate_config(args, hw, image_count, native_size, use_gpu)
+        if cfg is None:
+            raise CalibrateFail(
+                "No config fits the conservative static caps and probes are disabled (--no-memory-probe). "
+                "Drop --no-memory-probe for dynamic probe calibration."
+            )
+        if cfg["explicit_unsafe"] and not args.force_unsafe:
+            raise CalibrateFail(
+                "Static estimate marks the explicit override unsafe: " + "; ".join(cfg["notes"]) +
+                ". Let dynamic probes calibrate instead, or pass --force-unsafe."
+            )
+        chosen = build_chosen(cfg["model"], cfg["imgsz"], cfg["batch"], cfg["workers"], cfg["multi_scale"], 1.0)
+        for note in cfg["notes"]:
+            logger.log(f"[Calibrate static] {note}")
+        logger.log("[Calibrate] Probes skipped (--no-memory-probe): static conservative config; NOT measured-safe.")
+        print(f"[Calibration] Static-only config (--no-memory-probe): {chosen['model']} @ {chosen['imgsz']}px "
+              f"batch {chosen['batch']} workers {chosen['workers']}")
+        record_calibration(cache, logger, hw_fp, ds_fp, sel_key, chosen, (None, None, None),
+                           safe=not cfg["explicit_unsafe"], measured=False, make_selection=not cfg["explicit_unsafe"])
+        return chosen, "static"
 
-    aug = config["augmentation"]
-    ms_status = "(enabled - VRAM ok)" if aug["multi_scale"] > 0 else "(disabled - insufficient VRAM)"
-    print(f"\n[Augmentation Config]")
-    print(f"  degrees      : {aug['degrees']}")
-    print(f"  flipud       : {aug['flipud']}")
-    print(f"  copy_paste   : {aug['copy_paste']}")
-    print(f"  mixup        : {aug['mixup']}")
-    print(f"  multi_scale  : {aug['multi_scale']}  {ms_status}")
-    print(f"  close_mosaic : {aug['close_mosaic']}")
-    print(f"  cos_lr       : {aug['cos_lr']}")
+    # ---- dynamic probe calibration --------------------------------------------
+    gpu_cap = hw["vram_gb"] * profile["gpu"] if (use_gpu and hw.get("vram_gb")) else None
+    cpu_cap = hw["ram_gb"] * profile["cpu"] if hw.get("ram_gb") else None
+    cap_str = (f"GPU cap {gpu_cap:.2f} GB" if gpu_cap else "GPU cap n/a") + \
+              (f", CPU cap {cpu_cap:.2f} GB" if cpu_cap else ", CPU cap n/a")
+    logger.log(f"[Calibrate] Dynamic probes on device '{device}', profile '{profile_name}' ({cap_str}); "
+               f"probe fraction {fraction:.3f} of {image_count} train images, 1 epoch, save off.")
+    print("[Calibration] Running 1-epoch probe runs on a representative dataset subset to find a measured-safe config (probe weights are discarded)...")
+
+    models = [args.model] if args.model else model_candidates(image_count, hw.get("vram_gb"), for_cpu=not use_gpu)
+    if args.imgsz is not None:
+        imgszs = [int(args.imgsz)]
+        if native_size and int(args.imgsz) > int(native_size):
+            logger.log(f"[Calibrate] Note: explicit --imgsz {int(args.imgsz)} exceeds native dataset resolution {int(native_size)}px (override honored).")
+    else:
+        imgszs = imgsz_candidates(native_size)
+
+    base_workers = int(args.workers) if args.workers is not None else min(
+        calc_workers(hw.get("cpu_cores") or 4, hw.get("ram_gb")), auto_workers_limit())
+    pinned = bool(args.model or args.imgsz is not None or args.batch is not None or args.workers is not None)
+
+    probe_memo = {}
+
+    def evaluate_peaks(peaks, label):
+        alloc, res, rss = peaks
+        safe = True
+        reasons = []
+        if gpu_cap is not None and res is not None and res > gpu_cap:
+            safe = False
+            reasons.append(f"GPU peak reserved {res:.2f} GB > {profile_name} cap {gpu_cap:.2f} GB")
+        if cpu_cap is not None and rss is not None and rss > cpu_cap:
+            safe = False
+            reasons.append(f"CPU peak RSS {rss:.2f} GB > {profile_name} cap {cpu_cap:.2f} GB")
+        peak_str = (f"GPU alloc {alloc:.2f}/reserved {res:.2f} GB, " if res is not None else "") + \
+                   (f"CPU RSS {rss:.2f} GB" if rss else "CPU RSS n/a")
+        logger.log(f"[Calibrate] {label}: {'SAFE' if safe else 'UNSAFE'} ({'; '.join(reasons) if reasons else peak_str})")
+        return safe
+
+    def run_probe(chosen_cfg, label):
+        key = config_signature(**chosen_cfg)
+        if key in probe_memo:
+            safe = probe_memo[key][1]
+            logger.log(f"[Calibrate] {label}: reusing earlier probe result for {key} ({'SAFE' if safe else 'UNSAFE'})")
+            return probe_memo[key]
+        try:
+            peaks = probe_train_once(
+                chosen_cfg["model"], device, data_yaml, chosen_cfg["imgsz"], chosen_cfg["batch"],
+                chosen_cfg["multi_scale"], chosen_cfg["mosaic"], chosen_cfg["mixup"], chosen_cfg["copy_paste"],
+                fraction, cuda_index, workers=chosen_cfg["workers"],
+            )
+        except ProbeOOMError as e:
+            logger.log(f"[Calibrate] {label}: OOM ({_short(str(e))})")
+            probe_memo[key] = ((None, None, None), False)
+            return probe_memo[key]
+        except ProbeUnverifiedError as e:
+            raise CalibrateFail(
+                f"Probe for {chosen_cfg['model']} @ {chosen_cfg['imgsz']}px batch {chosen_cfg['batch']} failed for a "
+                f"non-memory reason, so its safety cannot be verified: {_short(str(e))}"
+            ) from e
+        safe = evaluate_peaks(peaks, label)
+        record_calibration(cache, logger, hw_fp, ds_fp, sel_key, chosen_cfg, peaks, safe, measured=True, make_selection=False)
+        probe_memo[key] = (peaks, safe)
+        return probe_memo[key]
+
+    tried = []
+    for model in models:
+        for imgsz in imgszs:
+            tried.append(f"{model}@{imgsz}px")
+            est0 = calc_batch(hw.get("vram_gb"), model, imgsz, 0.0, profile["gpu"]) if use_gpu else None
+
+            if args.batch is not None:
+                probe_batches = [int(args.batch)]
+            else:
+                allowed = [b for b in (PREFERRED_AUTO_BATCH, MIN_AUTO_BATCH)
+                           if est0 is None or est0 == 0 or b <= est0]
+                probe_batches = allowed or [MIN_AUTO_BATCH]
+
+            safe_batch = None
+            for b in probe_batches:
+                _, safe = run_probe(build_chosen(model, imgsz, b, 0, 0.0, 1.0),
+                                    f"{model} @ {imgsz}px batch {b} workers 0 full aug")
+                if safe:
+                    safe_batch = b
+                    break
+            if safe_batch is None:
+                if args.batch is not None and args.force_unsafe:
+                    safe_batch = int(args.batch)
+                    logger.log(f"[Calibrate] --force-unsafe: accepting explicit batch {safe_batch} at {model}@{imgsz}px despite failed probe.")
+                else:
+                    logger.log(f"[Calibrate] {model}@{imgsz}px: no probe-safe batch; trying next candidate.")
+                    continue
+
+            # Augmentation ladder (probe workers 0 so comparison with the base
+            # probe is batch/memory apples-to-apples).
+            multi_scale, mosaic = 0.0, 1.0
+            _, ms_safe = run_probe(build_chosen(model, imgsz, safe_batch, 0, 0.5, 0.5),
+                                   "multi-scale upgrade (ms 0.5, mosaic 0.5)")
+            if ms_safe:
+                multi_scale, mosaic = 0.5, 0.5
+
+            # Final verification probe with the REAL dataloader worker count
+            # (dataloader subprocesses count toward measured CPU RSS).
+            chosen_cfg = None
+            if args.workers is not None:
+                cfg = build_chosen(model, imgsz, safe_batch, base_workers, multi_scale, mosaic)
+                _, safe = run_probe(cfg, f"final verify: workers {base_workers} (explicit)")
+                if safe:
+                    chosen_cfg = cfg
+                elif args.force_unsafe:
+                    logger.log("[Calibrate] --force-unsafe: accepting explicit workers despite unsafe final probe.")
+                    chosen_cfg = cfg
+                else:
+                    raise CalibrateFail(
+                        f"Explicit --workers {base_workers} is unsafe on the final verification probe. "
+                        "Lower --workers or pass --force-unsafe."
+                    )
+            else:
+                for w in sorted({base_workers, 2, 0}, reverse=True):
+                    if w > base_workers:
+                        continue
+                    cfg = build_chosen(model, imgsz, safe_batch, w, multi_scale, mosaic)
+                    _, safe = run_probe(cfg, f"final verify: workers {w}")
+                    if safe:
+                        chosen_cfg = cfg
+                        break
+            if chosen_cfg is None:
+                logger.log(f"[Calibrate] {model}@{imgsz}px batch {safe_batch}: dataloader workers unsafe at every level; trying next candidate.")
+                continue
+
+            key = config_signature(**chosen_cfg)
+            peaks = probe_memo[key][0]
+            record_calibration(cache, logger, hw_fp, ds_fp, sel_key, chosen_cfg, peaks, safe=True, measured=True, make_selection=True)
+            logger.log(f"[Calibrate] SELECTED measured-safe config: {key}")
+            print(f"[Calibration] Safe config: {chosen_cfg['model']} @ {chosen_cfg['imgsz']}px batch {chosen_cfg['batch']} workers {chosen_cfg['workers']} multi_scale {chosen_cfg['multi_scale']} mosaic {chosen_cfg['mosaic']}")
+            return chosen_cfg, "measured"
+
+    if args.force_unsafe:
+        model0 = args.model or models[0]
+        imgsz0 = int(args.imgsz) if args.imgsz is not None else imgszs[0]
+        batch0 = int(args.batch) if args.batch is not None else MIN_AUTO_BATCH
+        workers0 = int(args.workers) if args.workers is not None else 0
+        chosen = build_chosen(model0, imgsz0, batch0, workers0, 0.0, 1.0)
+        logger.log("[Calibrate] --force-unsafe: NO probe-safe config found; proceeding with an explicitly UNSAFE config anyway.")
+        record_calibration(cache, logger, hw_fp, ds_fp, sel_key, chosen, (None, None, None), safe=False, measured=False, make_selection=True)
+        return chosen, "force-unsafe"
+
+    raise CalibrateFail(
+        "No probe-safe configuration found. Tried: " + ", ".join(tried) + ".\n"
+        "Suggestions: lower --imgsz (e.g. 416 or 320), a smaller model (--model yolo26m.pt), "
+        "--memory-profile balanced/aggressive, more free RAM, or --force-unsafe to train anyway (not recommended)."
+    )
 
 
 # -- Argument Parsing ----------------------------------------------------------
@@ -610,53 +1469,178 @@ def parse_args():
 
     parser.add_argument(
         "--input", type=str, default=None,
-        help="Path to data.yaml file (required for fresh training)"
+        help="Path to data.yaml file (required for fresh training)",
     )
     parser.add_argument(
         "--resume", action="store_true",
-        help="Resume from last checkpoint. Use --name to specify which run."
+        help="Resume from last checkpoint. Use --name to specify which run.",
+    )
+    parser.add_argument(
+        "--fresh", action="store_true",
+        help="Force a new auto-suffixed run even if the requested run name already exists.",
     )
     parser.add_argument(
         "--model", type=str, default=None,
-        help="Override auto-selected model (e.g. yolo26x.pt)"
+        help="Override auto-selected model (e.g. yolo26x.pt)",
     )
     parser.add_argument(
         "--epochs", type=int, default=600,
-        help="Number of training epochs (default: 600)"
+        help="Number of training epochs (default: 600)",
     )
     parser.add_argument(
         "--imgsz", type=int, default=None,
-        help="Override auto-calculated image size in pixels"
+        help="Override auto-calculated image size in pixels",
     )
     parser.add_argument(
         "--batch", type=int, default=None,
-        help="Override auto-calculated batch size"
+        help="Override auto-calculated batch size (safety-probed unless --force-unsafe)",
     )
     parser.add_argument(
         "--workers", type=int, default=None,
-        help="Override auto-calculated worker count"
+        help="Override auto-calculated worker count (safety-probed unless --force-unsafe)",
     )
     parser.add_argument(
-        "--device", type=str, default="0",
-        help="Device to train on: 0 for GPU, cpu for CPU (default: 0)"
+        "--device", type=str, default=None,
+        help="Device to train on: 0 for GPU, cpu for CPU (default: 0; CPU fallback when CUDA unavailable)",
     )
     parser.add_argument(
         "--name", type=str, default=None,
-        help="Run name to resume, or name for a new run (default: detector_v1)"
+        help="Run name to resume, or name for a new run (default: detector_v1)",
     )
     parser.add_argument(
         "--patience", type=int, default=100,
-        help="Early stopping patience in epochs (default: 100)"
+        help="Early stopping patience in epochs (default: 100)",
+    )
+    parser.add_argument(
+        "--memory-profile", choices=["safe", "balanced", "aggressive"], default="safe",
+        help="Dynamic memory safety profile (default: safe)",
+    )
+    parser.add_argument(
+        "--no-memory-probe", action="store_true",
+        help="Skip dynamic probe calibration; conservative static caps only.",
+    )
+    parser.add_argument(
+        "--force-unsafe", action="store_true",
+        help="Proceed even when dynamic calibration marks the selected config unsafe.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Resolve run name, validate dataset, fingerprint, write log, print config decision - then exit before probes/training.",
     )
     parser.add_argument(
         "--probe-vram", action="store_true",
-        help="Measure/refresh local VRAM estimates (yolo26m/l/x or --model); exit if --input omitted",
+        help="Measure/refresh legacy per-model GB/image estimates (yolo26m/l/x or --model); exit if --input omitted",
     )
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(1)
 
     return parser.parse_args()
 
 
-# -- Resume Logic --------------------------------------------------------------
+# -- Run-Name Resolution (collision-aware, crash-safe) ----------------------------
+
+def interactive_stdin() -> bool:
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def prompt_choice(logfn, question: str, options, default_hint=None) -> str:
+    """Terminal prompt whose question and answer are also recorded via logfn."""
+    logfn(f"[PROMPT] {question} Options: {' / '.join(options)}")
+    while True:
+        try:
+            answer = input(f"  {question} [{'/'.join(options)}]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            logfn("[PROMPT] No answer received (stdin closed); treating as quit.")
+            return options[-1]
+        if not answer and default_hint:
+            answer = default_hint.strip().lower()
+        for label in options:
+            if answer == label.lower() or answer == label[0].lower():
+                logfn(f"[PROMPT] answer: {label}")
+                return label
+        print(f"  Please answer one of: {', '.join(options)}")
+
+
+def ultralytics_increment_name(name: str) -> str:
+    """Mirror Ultralytics increment_path: Corrosion -> Corrosion2, v3 -> v32 (appends 2, 3, ...)."""
+    n = 2
+    while n < 9999:
+        candidate = f"{name}{n}"
+        if not (RUNS_DIR / candidate).exists():
+            return candidate
+        n += 1
+    raise RuntimeError(f"Too many runs starting with '{name}' under {RUNS_DIR}")
+
+
+def resolve_fresh_attempt(args):
+    """
+    Decide the final run name/mode for a fresh invocation.
+
+    Returns (run_name, run_dir, mode, messages). mode: 'fresh' or 'resume'
+    (user chose to resume an existing colliding run). --resume on the command
+    line is dispatched earlier and never reaches this function.
+
+    - No collision: requested name (default detector_v1).
+    - --fresh: auto-suffix, never resume.
+    - Colliding OMITTED --name: silent auto-suffix.
+    - Colliding explicit --name: interactive Resume/New/Quit prompt; a
+      non-interactive terminal fails with a clear error instead.
+    """
+    requested = args.name if args.name else "detector_v1"
+    explicit = args.name is not None
+    run_dir = RUNS_DIR / requested
+    messages = []
+    logfn = messages.append
+
+    def say(msg):
+        messages.append(msg)
+        print(f"  {msg}")
+
+    if not run_dir.exists():
+        return requested, run_dir, "fresh", messages
+
+    if args.fresh:
+        new_name = ultralytics_increment_name(requested)
+        say(f"[Run] '{requested}' already exists; --fresh: auto-suffixed to '{new_name}'.")
+        return new_name, RUNS_DIR / new_name, "fresh", messages
+
+    if not explicit:
+        new_name = ultralytics_increment_name(requested)
+        say(f"[Run] Default run name '{requested}' already exists; auto-suffixed to '{new_name}' (pass --name to control it).")
+        return new_name, RUNS_DIR / new_name, "fresh", messages
+
+    checkpoint = run_dir / "weights" / "last.pt"
+    say(f"[Run] Run '{requested}' already exists at: {run_dir}")
+
+    if not interactive_stdin():
+        say("[Run] stdin is not interactive: refusing to overwrite or silently resume a colliding run name.")
+        say(f"[Run] Options: --resume --name {requested} (continue it) | --fresh --name {requested} (new suffixed run) | a different --name.")
+        sys.exit(1)
+
+    has_ckpt = checkpoint.is_file()
+    options = ["Resume", "New", "Quit"] if has_ckpt else ["New", "Quit"]
+    question = (f"Run '{requested}' already exists at {run_dir}."
+                + (" Its weights/last.pt checkpoint exists." if has_ckpt
+                   else " It has NO weights/last.pt checkpoint, so it cannot be resumed."))
+    answer = prompt_choice(logfn, question, options)
+
+    if answer == "Resume":
+        say(f"[Run] Chose RESUME for existing run '{requested}'.")
+        return requested, run_dir, "resume", messages
+    if answer == "New":
+        new_name = ultralytics_increment_name(requested)
+        say(f"[Run] Chose NEW run: auto-suffixed to '{new_name}'.")
+        return new_name, RUNS_DIR / new_name, "fresh", messages
+    say("[Run] Chose QUIT.")
+    sys.exit(0)
+
+
+# -- Resume Checkpoint Lookup -----------------------------------------------------
 
 def find_last_checkpoint(name: str = None) -> Path:
     """
@@ -675,6 +1659,7 @@ def find_last_checkpoint(name: str = None) -> Path:
         if not last_pt.exists():
             print(f"[ERROR] No checkpoint found for run '{name}'")
             print(f"        Expected: {last_pt}")
+            print(f"        (A run folder without weights/last.pt cannot be resumed; use --fresh for a new run.)")
             sys.exit(1)
         return last_pt
     else:
@@ -691,55 +1676,11 @@ def find_last_checkpoint(name: str = None) -> Path:
                 return last_pt
 
         print(f"[ERROR] No last.pt checkpoint found in any run under: {runs_dir}")
+        print(f"        Crashed runs without weights/last.pt cannot be resumed; use --fresh for a new run.")
         sys.exit(1)
 
 
-def resume_training(args):
-    last_pt   = find_last_checkpoint(args.name)
-    args_yaml = last_pt.parent.parent / "args.yaml"
-
-    print(f"\n[Resuming Training]")
-    print(f"  checkpoint : {last_pt}")
-
-    if args.input:
-        data_str = args.input.strip().strip('"').strip("'")
-
-        if args_yaml.exists():
-            with open(args_yaml) as f:
-                run_args = yaml.safe_load(f)
-            run_args["data"] = data_str
-            with open(args_yaml, "w") as f:
-                for k, v in run_args.items():
-                    if k == "data":
-                        f.write(f"data: '{data_str}'\n")
-                    else:
-                        yaml.dump({k: v}, f, default_flow_style=True, allow_unicode=True)
-            print(f"  data path  : {data_str}  (patched in args.yaml)")
-        else:
-            print(f"  [WARNING] args.yaml not found, cannot patch data path")
-    else:
-        print(f"  (all settings loaded from checkpoint automatically)")
-    print()
-
-    model = YOLO(str(last_pt))
-    model.train(resume=True)
-
-    best_pt = last_pt.parent / "best.pt"
-
-    print(f"\n{'='*60}")
-    print(f"  Training complete")
-    print(f"{'='*60}")
-    print(f"  best.pt  : {best_pt}")
-    print(f"  last.pt  : {last_pt}")
-    print(f"{'='*60}")
-    print(f"\n  Next step: export to TensorRT for Manifold 3:")
-    print(f"    python export_tensorrt.py --weights {best_pt}")
-    print()
-
-    return best_pt
-
-
-# -- Dataset Validation --------------------------------------------------------
+# -- Dataset Validation -----------------------------------------------------------
 
 def resolve_yaml_split_path(yaml_path: Path, split_val: str) -> Path:
     """Resolve a train/val/test path from data.yaml relative to the yaml file."""
@@ -772,7 +1713,7 @@ def validate_dataset(yaml_path: Path) -> None:
     if yaml_path.name != "data.yaml":
         print(f"[WARNING] Expected data.yaml, got: {yaml_path.name}")
 
-    with open(yaml_path) as f:
+    with open(yaml_path, encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
     required_keys = ["train", "val", "nc", "names"]
@@ -828,7 +1769,296 @@ def validate_dataset(yaml_path: Path) -> None:
         print(f"  test     : {data['test']}")
 
 
+# -- Log Reporting Helpers ---------------------------------------------------------
+
+def log_hardware(logger, hw, device, hw_fp):
+    logger.log("[Hardware]")
+    logger.log(f"  resolved device : {device}")
+    logger.log(f"  GPU             : {hw['gpu_name']}")
+    logger.log(f"  VRAM            : {hw['vram_gb']:.1f} GB" if hw['vram_gb'] else "  VRAM            : N/A (CPU)")
+    logger.log(f"  CPU cores       : {hw['cpu_cores']}")
+    logger.log(f"  RAM             : {hw['ram_gb']:.1f} GB" if hw['ram_gb'] else "  RAM             : Unknown")
+    logger.log(f"  fingerprint id  : {fingerprint_hash(hw_fp)}")
+    logger.log(f"  fingerprint     : {json.dumps(hw_fp, sort_keys=True, default=str)}")
+
+
+def log_dataset(logger, ds_fp):
+    logger.log("[Dataset fingerprint]")
+    for key, val in ds_fp.items():
+        logger.log(f"  {key}: {val}")
+    logger.log(f"  fingerprint id  : {fingerprint_hash(ds_fp)}")
+
+
+def log_checkpoint_status(logger, run_dir, tag=""):
+    weights_dir = run_dir / "weights"
+    logger.log(f"[Checkpoints]{(' ' + tag) if tag else ''} in {run_dir / 'weights'}")
+    if not weights_dir.is_dir():
+        logger.log("  no weights/ directory exists yet")
+        return
+    for fname in ("last.pt", "best.pt"):
+        weight = weights_dir / fname
+        if weight.is_file():
+            stat = weight.stat()
+            modified = local_iso(datetime.fromtimestamp(stat.st_mtime).astimezone())
+            logger.log(f"  {fname}: {stat.st_size / 1e6:.1f} MB, modified {modified}")
+        else:
+            logger.log(f"  {fname}: MISSING")
+
+
+def log_results_csv(logger, run_dir):
+    csv_path = run_dir / "results.csv"
+    if not csv_path.is_file():
+        logger.log("[Results] no results.csv in run directory")
+        return
+    try:
+        lines = csv_path.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+    except OSError as e:
+        logger.log(f"[Results] could not read results.csv: {e}")
+        return
+    if len(lines) < 2:
+        logger.log("[Results] results.csv empty (no completed epochs)")
+        return
+    header = [h.strip() for h in lines[0].split(",")]
+    last = [v.strip() for v in lines[-1].split(",")]
+    logger.log(f"[Results] {len(lines) - 1} epoch row(s); final row: {', '.join(lines[-1].split(','))}")
+    for name, value in zip(header, last):
+        if "map" in name.lower() or "precision" in name.lower() or "recall" in name.lower():
+            logger.log(f"[Results] {name} = {value}")
+
+
+def log_resume_checkpoint_info(logger, last_pt: Path):
+    """Log checkpoint metadata; returns the checkpoint dict (or None) for further checks."""
+    try:
+        ckpt = torch.load(str(last_pt), map_location="cpu", weights_only=False)
+    except Exception as e:
+        logger.log(f"[Resume] could not read checkpoint metadata: {e}")
+        return None
+    if not isinstance(ckpt, dict):
+        logger.log("[Resume] checkpoint is not a Ultralytics dict; skipping metadata report")
+        return None
+    logger.log(f"[Resume] checkpoint epoch  : {ckpt.get('epoch')}")
+    logger.log(f"[Resume] best fitness      : {ckpt.get('best_fitness')}")
+    train_args = ckpt.get("train_args")
+    if isinstance(train_args, dict):
+        for key in ("model", "imgsz", "batch", "workers", "device", "epochs", "patience", "multi_scale", "mosaic"):
+            logger.log(f"[Resume] ckpt {key:<12}: {train_args.get(key)}")
+    return ckpt
+
+
+# -- Config Display ------------------------------------------------------------------
+
+def chosen_augmentation(chosen: dict) -> dict:
+    """Full Ultralytics augmentation kwargs built from a calibrated selection."""
+    aug = {
+        "degrees": 180,
+        "flipud": 0.5,
+        "copy_paste": chosen["copy_paste"],
+        "mixup": chosen["mixup"],
+        "mosaic": chosen["mosaic"],
+        "multi_scale": chosen["multi_scale"],
+        "close_mosaic": 60,
+        "cos_lr": True,
+        "nbs": 64,
+    }
+    return aug
+
+
+def print_auto_config(logger, chosen, provenance, args, hw, ds_fp, device):
+    aug = chosen_augmentation(chosen)
+
+    logger.log("[Hardware Detected]")
+    logger.log(f"  GPU        : {hw['gpu_name']}")
+    logger.log(f"  VRAM       : {hw['vram_gb']:.1f} GB" if hw['vram_gb'] else "  VRAM       : N/A (CPU)")
+    logger.log(f"  CPU cores  : {hw['cpu_cores']}")
+    logger.log(f"  RAM        : {hw['ram_gb']:.1f} GB" if hw['ram_gb'] else "  RAM        : Unknown")
+
+    logger.log(f"\n[Dataset]")
+    logger.log(f"  train imgs : {ds_fp.get('image_count')}")
+    native = ds_fp.get("median_img_size")
+    logger.log(f"  native res : {native}px" if native else "  native res : unknown")
+
+    logger.log(f"\n[Selected Config] (source: {provenance})")
+    logger.log(f"  model      : {chosen['model']}")
+    logger.log(f"  imgsz      : {chosen['imgsz']}px")
+    logger.log(f"  batch      : {chosen['batch']}")
+    if chosen["batch"] < 64:
+        effective = chosen["batch"] * ((64 + chosen["batch"] - 1) // chosen["batch"])
+        logger.log(f"  effective batch : {effective}  (nbs=64 gradient accumulation)")
+    logger.log(f"  workers    : {chosen['workers']}")
+    if args.batch is not None or args.workers is not None or provenance == "force-unsafe":
+        logger.log("  NOTE: config was pinned/forced by user flags; dynamic safety may have been overridden (--force-unsafe).")
+
+    logger.log(f"\n[Augmentation Config]")
+    logger.log(f"  degrees      : {aug['degrees']}")
+    logger.log(f"  flipud       : {aug['flipud']}")
+    logger.log(f"  copy_paste   : {aug['copy_paste']}")
+    logger.log(f"  mixup        : {aug['mixup']}")
+    logger.log(f"  mosaic       : {aug['mosaic']}")
+    ms_status = "(enabled)" if aug["multi_scale"] > 0 else "(disabled - memory probe/static said unsafe)"
+    logger.log(f"  multi_scale  : {aug['multi_scale']}  {ms_status}")
+    logger.log(f"  close_mosaic : {aug['close_mosaic']}")
+    logger.log(f"  cos_lr       : {aug['cos_lr']}")
+
+
+# -- Resume Logic --------------------------------------------------------------
+
+def resolve_resume_device(args, run_args):
+    """Determine the resume device from checkpoint args (Ultralytics resume keeps ckpt config)."""
+    dev = run_args.get("device") if isinstance(run_args, dict) else None
+    if dev is None:
+        resolved = "0"
+    elif isinstance(dev, (list, tuple)):
+        resolved = str(dev[0]) if dev else "0"
+    else:
+        resolved = str(dev)
+    if resolved != "cpu" and not cuda_available_for(resolved):
+        print(f"[Resume] CUDA device '{resolved}' is not currently available; Ultralytics will fall back to CPU.")
+    return resolved
+
+
+def resume_training(args):
+    last_pt = find_last_checkpoint(args.name)
+    run_dir = last_pt.parent.parent
+    run_name = run_dir.name
+    args_yaml = run_dir / "args.yaml"
+
+    logger = RunLogger(run_dir, resume=True)
+    logger.start_tee()
+    try:
+        logger.log("=" * 72)
+        logger.log("TRAIN DETECTOR RESUME LOG")
+        logger.log(f"local start time : {local_iso()}")
+        logger.log(f"command line     : {subprocess.list2cmdline(sys.argv)}")
+        logger.log(f"run name         : {run_name}")
+        logger.log(f"run dir          : {run_dir}")
+        logger.log(f"checkpoint       : {last_pt}")
+        logger.log("=" * 72)
+
+        run_args = None
+        if args_yaml.exists():
+            try:
+                with open(args_yaml, encoding="utf-8") as f:
+                    run_args = yaml.safe_load(f)
+            except Exception as e:
+                logger.log(f"[Resume] WARNING: could not read args.yaml: {e}")
+
+        device = resolve_resume_device(args, run_args)
+        hw = detect_hardware()
+        hw_fp = hardware_device_fingerprint(device)
+        log_hardware(logger, hw, device, hw_fp)
+        log_checkpoint_status(logger, run_dir, "(before resume)")
+        ckpt_meta = log_resume_checkpoint_info(logger, last_pt)
+
+        if args.input:
+            data_str = str(normalize_path(args.input))
+            if args_yaml.exists() and run_args is not None:
+                try:
+                    run_args["data"] = data_str
+                    with open(args_yaml, "w", encoding="utf-8") as f:
+                        for k, v in run_args.items():
+                            if k == "data":
+                                f.write(f"data: '{data_str}'\n")
+                            else:
+                                yaml.dump({k: v}, f, default_flow_style=True, allow_unicode=True)
+                    logger.log(f"[Resume] data path patched in args.yaml: {data_str}")
+                except Exception as e:
+                    logger.log(f"[Resume] WARNING: failed to patch args.yaml data path: {e}")
+            else:
+                logger.log("[Resume] WARNING: args.yaml not found, cannot patch data path")
+        else:
+            logger.log("[Resume] all settings loaded from checkpoint automatically")
+
+        ckpt_epoch = ckpt_meta.get("epoch") if isinstance(ckpt_meta, dict) else None
+        if isinstance(ckpt_epoch, (int, float)) and ckpt_epoch < 0:
+            train_args = ckpt_meta.get("train_args") if isinstance(ckpt_meta, dict) else None
+            total = train_args.get("epochs") if isinstance(train_args, dict) else None
+            total_txt = f"its full {total}-epoch schedule" if total else "its full training schedule"
+            msg = (f"[Resume] Run '{run_name}' already finished {total_txt}; "
+                   "last.pt is the final checkpoint (epoch marker -1), so there is nothing to resume.")
+            logger.log(msg)
+            log_results_csv(logger, run_dir)
+            best_pt = last_pt.parent / "best.pt"
+            resume_log_path = str(logger.log_path)
+            logger.close()
+            print(f"\n[Resume] {msg}")
+            print(f"  A completed run cannot be extended with --resume (Ultralytics refuses it: 'nothing to resume').")
+            print(f"  To keep training, start a NEW fine-tune run from the finished weights instead:")
+            print(f"    python train_detector/train_detector.py --input <your_data.yaml> --model {best_pt if best_pt.is_file() else last_pt} --name {run_name}-ft --epochs <more>")
+            print(f"  Run log: {resume_log_path}")
+            return best_pt, run_name, "already-finished"
+
+        monitor = make_monitor(logger, hw, device, args)
+
+        print(f"\n[Resuming Training]")
+        print(f"  checkpoint : {last_pt}")
+        print()
+
+        status = "completed"
+        model = YOLO(str(last_pt))
+        monitor.start()
+        try:
+            model.train(resume=True)
+        except KeyboardInterrupt:
+            status = "interrupted"
+            logger.log("[Resume] Interrupted by user (Ctrl+C) during resumed training.")
+        except Exception:
+            status = "crashed"
+            logger.log("[Resume] Training crashed with an exception:")
+            logger.log(traceback.format_exc())
+        finally:
+            monitor.stop()
+
+        log_checkpoint_status(logger, run_dir, f"(after resume, status: {status})")
+        log_results_csv(logger, run_dir)
+
+        best_pt = last_pt.parent / "best.pt"
+        logger.log(f"[Resume] final status: {status}; best.pt: {best_pt if best_pt.is_file() else 'not produced'}")
+
+        if status == "completed":
+            print(f"\n{'='*60}")
+            print(f"  Training complete")
+            print(f"{'='*60}")
+            print(f"  best.pt  : {best_pt}")
+            print(f"  last.pt  : {last_pt}")
+            print(f"{'='*60}")
+            print(f"\n  Next step: export to TensorRT for Manifold 3:")
+            print(f"    python export_tensorrt.py --weights {best_pt}")
+            print()
+        else:
+            print(f"\n  Training {status}. Checkpoint state is preserved in {run_dir / 'weights'}.")
+            print(f"  Resume again with:  python train_detector/train_detector.py --resume --name {run_name}")
+            print(f"  Run log: {logger.log_path}")
+            print()
+
+        return best_pt, run_name, status
+    except KeyboardInterrupt:
+        logger.log("[Resume] Interrupted by user (Ctrl+C).")
+        print("\n[Resume] Interrupted by user. See run log: " + str(logger.log_path))
+        sys.exit(130)
+    except SystemExit:
+        raise
+    except Exception:
+        logger.log("[Resume] UNEXPECTED CRASH:")
+        logger.log(traceback.format_exc())
+        print("\n[Resume] Unexpected error; full traceback logged to " + str(logger.log_path))
+        sys.exit(1)
+    finally:
+        logger.close()
+
+
 # -- Fresh Training ------------------------------------------------------------
+
+def resolve_train_device(args, logger=None):
+    device = args.device if args.device else "0"
+    if device != "cpu" and not cuda_available_for(device):
+        msg = f"[Device] Requested CUDA device '{device}' is not available; falling back to CPU."
+        print(msg)
+        if logger:
+            logger.log(msg)
+        device = "cpu"
+    args.device = device
+    return device
+
 
 def train(args):
     if not args.input:
@@ -836,65 +2066,195 @@ def train(args):
         print("        Use --resume to continue an existing run.")
         sys.exit(1)
 
-    yaml_path  = normalize_path(args.input)
-    output_dir = RUNS_DIR
-    run_name   = args.name if args.name else "detector_v1"
+    yaml_path = normalize_path(args.input)
+    requested = args.name if args.name else "detector_v1"
 
-    validate_dataset(yaml_path)
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    run_name, run_dir, mode, run_messages = resolve_fresh_attempt(args)
 
-    config = auto_config(yaml_path, args)
-    print_auto_config(config, args)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    logger = RunLogger(run_dir, resume=False)
+    logger.start_tee()
+    try:
+        for message in run_messages:
+            logger.log(message)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+        if mode == "resume":
+            logger.log(f"[Run] Colliding --name resolved by user choice: delegating to the RESUME flow for '{run_name}'.")
+            logger.close()
+            args.name = run_name
+            best_pt, _, _ = resume_training(args)
+            return {"mode": "resume", "best": best_pt, "run_name": run_name, "status": "delegated"}
 
-    print(f"\n[Training Config]")
-    print(f"  epochs     : {args.epochs}")
-    print(f"  image size : {config['imgsz']}px")
-    print(f"  patience   : {args.patience} epochs early stopping")
-    print(f"  device     : {args.device}")
-    print(f"  output     : {output_dir / run_name}")
-    print()
+        logger.log_run_startup(args, requested, run_name, run_dir, "fresh")
 
-    model = YOLO(str(resolve_pretrained_weights(config["model"])))
+        device = resolve_train_device(args, logger)
+        hw = detect_hardware()
+        hw_fp = hardware_device_fingerprint(device)
+        log_hardware(logger, hw, device, hw_fp)
 
-    model.train(
-        data=str(yaml_path),
-        epochs=args.epochs,
-        imgsz=config["imgsz"],
-        batch=config["batch"],
-        workers=config["workers"],
-        device=args.device,
-        project=str(output_dir),
-        name=run_name,
-        patience=args.patience,
-        save=True,
-        plots=True,
-        verbose=True,
-        **config["augmentation"],
-    )
+        validate_dataset(yaml_path)
+        data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+        train_path = resolve_yaml_split_path(yaml_path, str(data["train"]))
+        ds_fp = dataset_fingerprint(yaml_path, train_path)
+        log_dataset(logger, ds_fp)
 
-    run_dir = output_dir / run_name
-    best_pt = run_dir / "weights" / "best.pt"
-    last_pt = run_dir / "weights" / "last.pt"
+        cache = load_memory_cache(logger)
 
-    print(f"\n{'='*60}")
-    print(f"  Training complete")
-    print(f"{'='*60}")
-    print(f"  best.pt  : {best_pt}")
-    print(f"  last.pt  : {last_pt}")
-    print(f"  results  : {run_dir}")
-    print(f"{'='*60}")
-    print(f"\n  Next step: export to TensorRT for Manifold 3:")
-    print(f"    python export_tensorrt.py --weights {best_pt}")
-    print()
+        if args.dry_run:
+            return run_dry_summary(logger, args, cache, hw, hw_fp, ds_fp, device, run_name, run_dir)
 
-    return best_pt
+        log_checkpoint_status(logger, run_dir, "(before training)")
+
+        try:
+            chosen, provenance = calibrate_training_config(
+                args, logger, cache, hw_fp, hw, device, yaml_path, train_path, ds_fp
+            )
+        except CalibrateFail as e:
+            logger.log(f"[Calibrate] FAILED: {e}")
+            print(f"\n[ERROR] Memory calibration failed:\n  {e}")
+            print(f"  Run diagnostics log: {logger.log_path}")
+            return {"mode": "fresh", "best": None, "run_name": run_name, "status": "calibration-failed"}
+        except KeyboardInterrupt:
+            logger.log("[Run] Interrupted by user (Ctrl+C) during calibration; training never started, nothing was saved.")
+            print("\n[Run] Interrupted during calibration probes. No training was started.")
+            return {"mode": "fresh", "best": None, "run_name": run_name, "status": "interrupted"}
+
+        print_auto_config(logger, chosen, provenance, args, hw, ds_fp, device)
+        print(f"[Config ({provenance})] model={chosen['model']} imgsz={chosen['imgsz']}px batch={chosen['batch']} "
+              f"workers={chosen['workers']} multi_scale={chosen['multi_scale']} mosaic={chosen['mosaic']} "
+              f"(full detail logged to {logger.log_path.name})")
+
+        print(f"\n[Training Config]")
+        print(f"  epochs     : {args.epochs}")
+        print(f"  image size : {chosen['imgsz']}px")
+        print(f"  patience   : {args.patience} epochs early stopping")
+        print(f"  device     : {device}")
+        print(f"  output     : {run_dir}")
+        print()
+
+        monitor = make_monitor(logger, hw, device, args)
+        model = YOLO(str(resolve_pretrained_weights(chosen["model"])))
+        # Ultralytics 8.4 rejects unknown kwargs in model.train(); callbacks attach via Model.add_callback
+        model.add_callback("on_train_epoch_end", monitor.on_epoch_end)
+        monitor.start()
+
+        status = "completed"
+        try:
+            model.train(
+                data=str(yaml_path),
+                epochs=args.epochs,
+                imgsz=chosen["imgsz"],
+                batch=chosen["batch"],
+                workers=chosen["workers"],
+                device=device,
+                project=str(RUNS_DIR),
+                name=run_name,
+                exist_ok=True,
+                save_dir=str(run_dir),  # pin the exact run dir chosen above; no silent Ultralytics increment
+                patience=args.patience,
+                save=True,
+                plots=True,
+                verbose=True,
+                **chosen_augmentation(chosen),
+            )
+        except KeyboardInterrupt:
+            status = "interrupted"
+            logger.log("[Run] Interrupted by user (Ctrl+C) during training.")
+        except Exception:
+            status = "crashed"
+            logger.log("[Run] Training crashed with an exception:")
+            logger.log(traceback.format_exc())
+        finally:
+            monitor.stop()
+
+        log_checkpoint_status(logger, run_dir, f"(after training, status: {status})")
+        log_results_csv(logger, run_dir)
+
+        best_pt = run_dir / "weights" / "best.pt"
+        last_pt = run_dir / "weights" / "last.pt"
+
+        if status == "completed":
+            logger.log(f"[Run] Training completed successfully. best.pt: {best_pt}")
+            print(f"\n{'='*60}")
+            print(f"  Training complete")
+            print(f"{'='*60}")
+            print(f"  best.pt  : {best_pt}")
+            print(f"  last.pt  : {last_pt}")
+            print(f"  results  : {run_dir}")
+            print(f"  run log  : {logger.log_path}")
+            print(f"{'='*60}")
+            print(f"\n  Next step: export to TensorRT for Manifold 3:")
+            print(f"    python export_tensorrt.py --weights {best_pt}")
+            print()
+        else:
+            logger.log(f"[Run] Training {status}; partial checkpoint state kept in {run_dir / 'weights'}.")
+            print(f"\n  Training {status}. Your progress so far is saved under {run_dir / 'weights'}.")
+            print(f"  Resume with:  python train_detector/train_detector.py --resume --name {run_name}")
+            print(f"  Run log     : {logger.log_path}")
+            print()
+
+        return {"mode": "fresh", "best": best_pt, "run_name": run_name, "status": status}
+    except KeyboardInterrupt:
+        logger.log("[Run] Interrupted by user (Ctrl+C) before training finished or started.")
+        print("\n[Run] Interrupted by user. See run log: " + str(logger.log_path))
+        sys.exit(130)
+    except SystemExit:
+        raise
+    except Exception:
+        logger.log("[Run] UNEXPECTED CRASH:")
+        logger.log(traceback.format_exc())
+        print("\n[Run] Unexpected error; full traceback logged to " + str(logger.log_path))
+        sys.exit(1)
+    finally:
+        logger.close()
+
+
+# -- Dry Run ---------------------------------------------------------------------
+
+def run_dry_summary(logger, args, cache, hw, hw_fp, ds_fp, device, run_name, run_dir):
+    logger.log("[Dry Run] --dry-run exercised run-name handling, dataset validation, fingerprinting and log writing; "
+               "NO probe runs and NO training were performed.")
+
+    sel_key = selection_signature(args, ds_fp)
+    cached = lookup_cached_selection(cache, hw_fp, ds_fp, sel_key, logger)
+    if cached:
+        sel, entry = cached
+        logger.log(f"[Dry Run] Cache lookup HIT for selection key {sel_key}")
+        logger.log(f"[Dry Run] Measured-safe cached config: {sel.get('config_key')}")
+        logger.log(f"[Dry Run] Recorded peaks: GPU alloc {entry.get('peak_gpu_allocated_gb')} GB | "
+                   f"GPU reserved {entry.get('peak_gpu_reserved_gb')} GB | CPU RSS {entry.get('peak_cpu_rss_gb')} GB")
+    else:
+        logger.log(f"[Dry Run] Cache lookup MISS for selection key {sel_key}; a real run would calibrate with probe runs.")
+
+    cfg = static_candidate_config(args, hw, ds_fp.get("image_count") or 0, ds_fp.get("median_img_size"), cuda_available_for(device))
+    if cfg:
+        for note in cfg["notes"]:
+            logger.log(f"[Dry Run] static note: {note}")
+        chosen = build_chosen(cfg["model"], cfg["imgsz"], cfg["batch"], cfg["workers"], cfg["multi_scale"], 1.0)
+        print_auto_config(logger, chosen, "dry-run static estimate (no probes)", args, hw, ds_fp, device)
+        print(f"[Dry Run] Static config preview: {chosen['model']} @ {chosen['imgsz']}px batch {chosen['batch']} "
+              f"workers={chosen['workers']} multi_scale={chosen['multi_scale']} mosaic={chosen['mosaic']} "
+              f"(full detail logged to {logger.log_path.name})")
+        if cfg["explicit_unsafe"]:
+            logger.log("[Dry Run] static estimate flags the explicit override as UNSAFE (would require --force-unsafe or dynamic probes).")
+    else:
+        logger.log("[Dry Run] no candidate fits conservative static caps; a real run would probe lower (imgsz/model/batch ladder).")
+
+    logger.log(f"[Dry Run] resolved run name : {run_name}")
+    logger.log(f"[Dry Run] resolved run dir  : {run_dir}")
+    logger.log(f"[Dry Run] run log written to: {logger.log_path}")
+
+    print(f"\n[Dry Run] Resolved run name : {run_name}")
+    print(f"[Dry Run] Run directory     : {run_dir}")
+    print(f"[Dry Run] Run log           : {logger.log_path}")
+    print(f"[Dry Run] Dataset validated, fingerprints computed, log written. No probes, no training.")
+    return {"mode": "dry", "best": None, "run_name": run_name, "status": "dry-run"}
 
 
 # -- Post-Training Validation --------------------------------------------------
 
-def validate(yaml_path: Path, args):
-    run_name = args.name if args.name else "detector_v1"
+def validate(yaml_path: Path, args, run_name: str):
     run_dir = RUNS_DIR / run_name
     best_pt = run_dir / "weights" / "best.pt"
     run_args_yaml = run_dir / "args.yaml"
@@ -908,19 +2268,32 @@ def validate(yaml_path: Path, args):
 
     val_imgsz = 1024
     if run_args_yaml.exists():
-        with open(run_args_yaml) as f:
+        with open(run_args_yaml, encoding="utf-8") as f:
             run_args = yaml.safe_load(f)
         val_imgsz = run_args.get("imgsz", 1024)
 
+    device = args.device if args.device else "0"
     model   = YOLO(str(best_pt))
     metrics = model.val(
         data=str(yaml_path),
         imgsz=val_imgsz,
-        device=args.device,
+        device=device,
+        project=str(run_dir.parent),
+        name=f"{run_name}-val",
     )
 
     map50    = metrics.box.map50
     map50_95 = metrics.box.map
+
+    try:
+        log_files = sorted((run_dir / "Logs").glob("run-*.log"))
+        if log_files:
+            with open(log_files[-1], "a", encoding="utf-8") as f:
+                f.write(f"\n[Validation] best.pt at imgsz={val_imgsz} (saved under {run_dir.parent / (run_name + '-val')})\n")
+                f.write(f"  mAP@0.50   = {map50:.4f}\n")
+                f.write(f"  mAP@0.50-95 = {map50_95:.4f}\n")
+    except OSError:
+        pass
 
     print(f"\n[Metrics]")
     print(f"  mAP@0.50       : {map50:.4f}  (target: > 0.80)")
@@ -936,18 +2309,28 @@ def validate(yaml_path: Path, args):
 
 # -- Entry Point ---------------------------------------------------------------
 
-if __name__ == "__main__":
+def main():
     args = parse_args()
 
     if args.probe_vram:
         models = [args.model] if args.model else ["yolo26m.pt", "yolo26l.pt", "yolo26x.pt"]
-        ensure_vram_estimates(models, device=args.device, force=True)
+        ensure_vram_estimates(models, device=args.device or "0", force=True)
         if not args.input and not args.resume:
             sys.exit(0)
 
     if args.resume:
         resume_training(args)
-    else:
-        train(args)
-        yaml_path = normalize_path(args.input)
-        validate(yaml_path, args)
+        return
+
+    outcome = train(args)
+    if (
+        outcome
+        and outcome.get("mode") == "fresh"
+        and outcome.get("status") == "completed"
+        and not args.dry_run
+    ):
+        validate(normalize_path(args.input), args, outcome["run_name"])
+
+
+if __name__ == "__main__":
+    main()
