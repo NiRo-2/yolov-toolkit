@@ -1354,17 +1354,45 @@ def trim_results_csv(run_dir: Path, completed_epoch: int, logger=None) -> None:
             logger.log(f"[Adaptive] csv trim failed: {e}")
 
 
-def ckpt_completed_epoch(last_pt: Path) -> int:
+def ckpt_completed_epoch(ckpt_path: Path) -> int:
+    """Return completed_epoch from a .pt checkpoint. -1 means finished per Ultralytics."""
     try:
-        ckpt = torch.load(str(last_pt), map_location="cpu", weights_only=False)
-        e = ckpt.get("epoch", -1)
-        if isinstance(e, (int, float)) and e >= 0:
-            return int(e) + 1
-        if e == -1:
-            return -1  # finished
+        ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+        epoch = ckpt.get("epoch", 0)
+        if isinstance(epoch, (int, float)) and epoch >= 0:
+            return int(epoch) + 1
+        if isinstance(epoch, (int, float)) and epoch == -1:
+            return -1
+        return 0
+    except Exception:
+        return 0
+
+
+def _infer_resume_architecture_model(run_dir, ckpt_cfg=None):
+    """Infer architecture .pt name (e.g. yolo26l.pt) for a resume run."""
+    ckpt_cfg = ckpt_cfg if isinstance(ckpt_cfg, dict) else {}
+    model = ckpt_cfg.get("model")
+    if isinstance(model, (str, Path)):
+        base = Path(model).name.lower()
+        if base not in ("last.pt", "best.pt") and "weights" not in str(model).lower():
+            p = Path(model)
+            if p.suffix == ".pt":
+                return p.name
+            if p.suffix == ".yaml":
+                return p.stem + ".pt"
+    try:
+        ckpt = torch.load(str(Path(run_dir) / "weights" / "last.pt"), map_location="cpu", weights_only=False)
+        ema = ckpt.get("ema")
+        yf = None
+        if ema is not None:
+            y = getattr(ema, "yaml", None)
+            if isinstance(y, dict):
+                yf = y.get("yaml_file")
+        if yf:
+            return Path(yf).stem + ".pt"
     except Exception:
         pass
-    return 0
+    return "yolo26l.pt"
 
 
 # -- Legacy VRAM estimates (fallback heuristic only) --------------------------------
@@ -2433,30 +2461,10 @@ def ckpt_config_unsafe(ckpt_cfg: dict, native_size, caps: dict) -> list:
 
 def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run_dir):
     """Return (chosen_cfg dict, provenance) for a resume run."""
-    profile_name = args.memory_profile
     native_size = ds_fp.get("median_img_size")
-    # build base from ckpt config but reset multi_scale to 0.0
-    model = ckpt_cfg.get("model") or args.model
-    # resolve underlying architecture name (checkpoint model field is often last.pt)
-    if isinstance(model, (str, Path)):
-        base = Path(model).name.lower()
-        if base in ("last.pt", "best.pt") or "weights" in str(model).lower():
-            # try infer from checkpoint ema yaml
-            try:
-                ckpt = torch.load(str(Path(run_dir) / "weights" / "last.pt"), map_location="cpu", weights_only=False)
-                ema = ckpt.get("ema")
-                yf = getattr(ema, "yaml", {}).get("yaml_file") if isinstance(getattr(ema, "yaml", None), dict) else None
-                if yf:
-                    model = Path(yf).stem + ".pt"
-                else:
-                    model = "yolo26l.pt"
-            except Exception:
-                model = "yolo26l.pt"
-    if isinstance(model, (str, Path)) and str(model).endswith(".pt"):
-        model_name = Path(model).name
-    else:
-        model_name = str(model) if model else "yolo26l.pt"
-    # if model not in known, default to ckpt train_args model basename
+    # Resolve architecture model for probes/supervisor; actual training still resumes from last.pt.
+    model_name = _infer_resume_architecture_model(run_dir, ckpt_cfg)
+
     imgsz = ckpt_cfg.get("imgsz", 640)
     # cap imgsz to native
     if native_size and isinstance(imgsz, int) and imgsz > int(native_size):
@@ -2471,7 +2479,6 @@ def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run
     workers = min(int(workers), 4)
     multi_scale = 0.0  # always start 0 for resume
     mosaic = ckpt_cfg.get("mosaic", 1.0)
-    # normalize mosaic to ladder? keep as-is but validate via probe later
     try:
         mosaic = float(mosaic)
     except Exception:
@@ -2479,7 +2486,8 @@ def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run
     mixup = ckpt_cfg.get("mixup", 0.15)
     copy_paste = ckpt_cfg.get("copy_paste", 0.3)
     try:
-        mixup = float(mixup); copy_paste = float(copy_paste)
+        mixup = float(mixup)
+        copy_paste = float(copy_paste)
     except Exception:
         mixup, copy_paste = 0.15, 0.3
 
@@ -2507,41 +2515,54 @@ def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run
     # cache lookup for resume selections
     cache_key = "resume_selections"
     pid = fingerprint_hash(hw_fp)
-    profile = cache["hardware_profiles"].get(pid) if cache.get("hardware_profiles") else None
+    ds_key = fingerprint_hash(ds_fp)
+    profile = cache.get("hardware_profiles", {}).get(pid) if cache.get("hardware_profiles") else None
     rsel = None
     if profile:
-        rsel = profile.get(cache_key, {}).get(fingerprint_hash(ds_fp))
+        rsel = profile.get(cache_key, {}).get(ds_key)
     if rsel:
-        # validate
-        entry = rsel.get("config")
-        if entry:
-            logger.log("[Resume Calibrate] using cached resume selection.")
-            return dict(entry), "cache"
+        entry = rsel.get("config") if isinstance(rsel, dict) else None
+        if isinstance(entry, dict):
+            cached = dict(entry)
+            cached_model = str(cached.get("model") or "")
+            stale_checkpoint_model = (
+                not cached_model
+                or Path(cached_model).name.lower() in ("last.pt", "best.pt")
+                or "weights" in cached_model.lower().replace("/", "\\")
+            )
+            if stale_checkpoint_model:
+                logger.log(
+                    f"[Resume Calibrate] ignoring stale cached resume selection model '{cached_model or '<empty>'}'; "
+                    f"using inferred architecture '{model_name}'."
+                )
+                cached["model"] = model_name
+                # keep inferred safe downscales
+                cached["imgsz"] = min(int(cached.get("imgsz", chosen["imgsz"])), chosen["imgsz"])
+                cached["multi_scale"] = 0.0
+                cached["workers"] = min(int(cached.get("workers", chosen["workers"])), 4)
+                try:
+                    pid2, profile2 = get_hw_profile(cache, hw_fp)
+                    profile2.setdefault("resume_selections", {})
+                    profile2["resume_selections"][ds_key] = {
+                        "config": dict(cached),
+                        "updated_at": local_iso(),
+                    }
+                    cache["updated_at"] = local_iso()
+                    save_memory_cache(cache, logger)
+                except Exception as e:
+                    logger.log(f"[Resume Calibrate] cache rewrite failed: {e}")
+            else:
+                logger.log("[Resume Calibrate] using cached resume selection.")
+            return cached, "cache"
 
-    # if explicit --imgsz/--batch provided, honor with safety? We'll trust probe validation by returning provisional;
-    # For simplicity, if --force-unsafe, keep chosen as-is.
     if args.force_unsafe:
         logger.log("[Resume Calibrate] --force-unsafe: keeping calibrated-down config without probe validation.")
-    # Probe validation: only if imgsz <= native (probe original). Here we already capped; run a quick probe? 
-    # To keep within scope, mark provenance measured only if no unsafe reasons and probe not skipped.
-    # We'll attempt a probe for the chosen config if not --no-memory-probe and imgsz <= native.
-    use_gpu = cuda_available_for(resolve_train_device(args) if False else (args.device or "0"))
-    # device resolution handled by caller; use args.device
-    dev = args.device if args.device else "0"
-    use_gpu = cuda_available_for(dev)
-    if not args.no_memory_probe and use_gpu:
-        try:
-            from pathlib import Path as _P
-            data_yaml = None
-            # find data yaml from run args? caller passes via args.input maybe
-            pass
-        except Exception:
-            pass
+
     # record cache
     try:
         pid2, profile2 = get_hw_profile(cache, hw_fp)
         profile2.setdefault("resume_selections", {})
-        profile2["resume_selections"][fingerprint_hash(ds_fp)] = {
+        profile2["resume_selections"][ds_key] = {
             "config": dict(chosen),
             "updated_at": local_iso(),
         }
@@ -2573,6 +2594,19 @@ def run_attempt(args, logger, run_dir, last_pt, chosen, target_epochs, device, g
         resume_pt = last_pt if (last_pt and Path(last_pt).is_file()) else (weights_dir / "last.pt")
         if not (resume_pt and Path(resume_pt).is_file()):
             resume_pt = None
+    # Terminal Ultralytics checkpoint (epoch == -1) cannot be resumed.
+    if resume_pt is not None and ckpt_completed_epoch(resume_pt) == -1:
+        logger.log(f"[Attempt {attempt_no}] checkpoint {resume_pt} is finished by Ultralytics; nothing to resume.")
+        tracker = AttemptTracker(
+            logger=logger, guard=guard, run_dir=run_dir, target_epochs=target_epochs,
+            intended_cfg=dict(chosen), state=state,
+            on_emergency=None, on_adaptive=None, on_complete=None, on_crash=None,
+        )
+        tracker.status = "completed-target"
+        tracker.completed_epoch = target_epochs
+        state["completed_epoch"] = target_epochs
+        write_adaptive_state(run_dir, state)
+        return tracker
 
     # Build forced_args for GuardedDetectionTrainer
     # Determine optimizer to force for consistency across attempts
@@ -2838,11 +2872,20 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
 
     def probe_config_safe(cfg):
         # quick probe validation; reuse probe_train_once if possible
+        probe_model = cfg.get("model")
+        try:
+            pm = str(probe_model or "")
+            if Path(pm).name.lower() in ("last.pt", "best.pt") or "weights" in pm.lower().replace("/", "\\"):
+                probe_model = _infer_resume_architecture_model(run_dir, ckpt_cfg)
+        except Exception:
+            pass
         if getattr(args, "no_memory_probe", False):
+            logger.log(f"[Probe] --no-memory-probe set; skipping probe for {probe_model} (cfg={cfg}).")
             return True
         dev = device
         use_gpu = cuda_available_for(dev)
         if not use_gpu:
+            logger.log(f"[Probe] non-GPU device '{dev}'; skipping probe for {probe_model}.")
             return True
         cuda_index = cuda_index_for(dev)
         image_count = 100
@@ -2854,9 +2897,13 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
         except Exception:
             pass
         fraction = probe_fraction(image_count)
+        logger.log(
+            f"[Probe] validating model={probe_model} imgsz={cfg['imgsz']} batch={cfg['batch']} "
+            f"workers={cfg['workers']} multi_scale={cfg['multi_scale']} mosaic={cfg['mosaic']} fraction={fraction}"
+        )
         try:
             peaks = probe_train_once(
-                cfg["model"], dev, yaml_path, cfg["imgsz"], cfg["batch"], cfg["multi_scale"],
+                probe_model, dev, yaml_path, cfg["imgsz"], cfg["batch"], cfg["multi_scale"],
                 cfg["mosaic"], cfg["mixup"], cfg["copy_paste"], fraction, cuda_index, workers=cfg["workers"],
             )
             # evaluate against profile caps
@@ -2867,11 +2914,18 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
             cpu_cap = ram * profile["cpu"]
             alloc, res, rss = peaks
             if res is not None and res > gpu_cap:
+                logger.log(f"[Probe] UNSAFE {probe_model}: reserved {res:.2f} GB > cap {gpu_cap:.2f} GB")
                 return False
             if rss is not None and rss > cpu_cap:
+                logger.log(f"[Probe] UNSAFE {probe_model}: CPU RSS {rss:.2f} GB > cap {cpu_cap:.2f} GB")
                 return False
+            logger.log(
+                f"[Probe] SAFE {probe_model}: alloc={alloc} reserved={res} rss={rss} "
+                f"(caps gpu={gpu_cap:.2f} cpu={cpu_cap:.2f})"
+            )
             return True
-        except Exception:
+        except Exception as e:
+            logger.log(f"[Probe] FAILED for {probe_model}: {type(e).__name__}: {_short(str(e))}")
             return False
 
     current_ckpt = last_pt
@@ -2903,6 +2957,13 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
                               device, guard, yaml_path, ckpt_cfg, mode, attempt_no, state)
         current_ckpt = run_dir / "weights" / "last.pt"
         st = tracker.status
+        terminal_ckpt_epoch = ckpt_completed_epoch(current_ckpt) if current_ckpt.exists() else 0
+        if terminal_ckpt_epoch == -1:
+            logger.log(f"[Supervisor] checkpoint marked finished by Ultralytics after attempt {attempt_no} (status={st}); stopping.")
+            state["completed_epoch"] = target_epochs
+            final_status = "early-stopped"
+            write_adaptive_state(run_dir, state)
+            break
         logger.log(f"[Supervisor] attempt {attempt_no} status={st}")
 
         if st == "completed-target":
