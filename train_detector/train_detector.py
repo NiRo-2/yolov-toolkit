@@ -7,15 +7,16 @@ selected hardware, device, dataset and augmentation config; static estimates are
 
 Usage:
     # Fresh training run (auto-configures everything, runs dynamic memory calibration)
-    python train_detector/train_detector.py --input /path/to/data.yaml --name my_detector_v1
+    # --input is a dataset DIRECTORY: YOLO (data.yaml present or synthesized), COCO JSON, or VOC XML.
+    python train_detector/train_detector.py --input /path/to/dataset_folder --name my_detector_v1
 
     # Override any auto-calculated value (overrides are safety-checked unless --force-unsafe)
-    python train_detector/train_detector.py --input /path/to/data.yaml --name my_detector_v1 --model yolo26x.pt --batch 8
-    python train_detector/train_detector.py --input /path/to/data.yaml --name my_detector_v1 --imgsz 1024
+    python train_detector/train_detector.py --input /path/to/dataset_folder --name my_detector_v1 --model yolo26x-seg.pt --batch 8
+    python train_detector/train_detector.py --input /path/to/dataset_folder --name my_detector_v1 --imgsz 1024
 
     # Run-name collision control
-    python train_detector/train_detector.py --input /path/to/data.yaml --name my_detector_v1 --fresh
-    python train_detector/train_detector.py --input /path/to/data.yaml --name my_detector_v1 --resume
+    python train_detector/train_detector.py --input /path/to/dataset_folder --name my_detector_v1 --fresh
+    python train_detector/train_detector.py --input /path/to/dataset_folder --name my_detector_v1 --resume
 
     # Resume a crashed/interrupted run
     python train_detector/train_detector.py --resume --name my_detector_v1
@@ -24,14 +25,22 @@ Usage:
     python train_detector/train_detector.py --resume
 
     # Test run-name handling, dataset validation, fingerprinting and logging without training
-    python train_detector/train_detector.py --input /path/to/data.yaml --name DryRunTest --device cpu --dry-run
+    python train_detector/train_detector.py --input /path/to/dataset_folder --name DryRunTest --device cpu --dry-run
 
-    --input   path to data.yaml file (required for fresh training)
-              works with Windows paths: c:\Users\Ni\Desktop\project\data.yaml
+    --input   dataset DIRECTORY (required for fresh training): auto-detects the format
+              (YOLO folder with data.yaml, YOLO folder without data.yaml -> synthesized,
+              COCO JSON, VOC XML) and the annotation task (detect/segment/pose);
+              COCO/VOC are converted once into a reusable <folder>_yolo copy.
+              A data.yaml file path is rejected: pass the dataset folder instead
+              works with Windows paths: c:\Users\Ni\Desktop\project\dataset_folder
     --resume  resume from last checkpoint (fails clearly if no checkpoint exists)
     --fresh   force a new auto-suffixed run even if the run name already exists
     --name    run name to resume, or name for new run (default: detector_v1)
-    --model   override auto-selected model (yolo26n/m/l/x)
+    --task    auto|detect|segment|pose  override the auto-derived annotation task (default: auto)
+    --converted-dir  override output location for COCO/VOC -> YOLO conversion (default: <dataset>_yolo sibling)
+    --yes     accept auto-detection writes into the dataset folder (synthesized data.yaml,
+              added kpt_shape) without an interactive [y/N] prompt
+    --model   override auto-selected model (yolo26n/m/l/x, -seg, -pose)
     --batch   override auto-calculated batch size
     --workers override auto-calculated worker count
     --imgsz   override auto-calculated image size in pixels
@@ -2003,7 +2012,19 @@ def parse_args():
 
     parser.add_argument(
         "--input", type=str, default=None,
-        help="Path to data.yaml file (required for fresh training)",
+        help="Dataset DIRECTORY to auto-detect (YOLO with/without data.yaml, COCO JSON, VOC XML). Required for fresh training.",
+    )
+    parser.add_argument(
+        "--task", choices=["auto", "detect", "segment", "pose"], default="auto",
+        help="Override the auto-derived annotation task (default: auto).",
+    )
+    parser.add_argument(
+        "--converted-dir", type=str, default=None,
+        help="Override output location for COCO/VOC -> YOLO conversion (default: <dataset>_yolo sibling of the source).",
+    )
+    parser.add_argument(
+        "--yes", action="store_true",
+        help="Accept auto-detection writes into the dataset folder (synthesized data.yaml, added kpt_shape) without prompting.",
     )
     parser.add_argument(
         "--resume", action="store_true",
@@ -2305,6 +2326,360 @@ def validate_dataset(yaml_path: Path) -> None:
     print(f"  val      : {val_path}  ({count_images(val_path)} imgs)")
     if "test" in data:
         print(f"  test     : {data['test']}")
+
+
+# -- Dataset Format Auto-Detection --------------------------------------------------
+# --input points at a dataset DIRECTORY. Formats: YOLO (data.yaml present or
+# synthesized after confirmation), COCO JSON, VOC XML. The annotation task
+# (detect/segment/pose) is derived from the data unless --task overrides it.
+# COCO/VOC convert once into a reusable sibling <folder>_yolo copy.
+
+DATASET_TASKS = ("detect", "segment", "pose")
+CONVERSION_DIR_SUFFIX = "_yolo"
+CONVERSION_MANIFEST_NAME = ".conversion_manifest.json"
+
+
+def split_role(name: str):
+    """Map a dataset subdirectory name to a split role: train*/val*/valid*/validation*/test*."""
+    n = name.lower()
+    if n.startswith("train"):
+        return "train"
+    if n.startswith("val"):
+        return "val"          # covers val, valid*, validation*
+    if n.startswith("test"):
+        return "test"
+    return None
+
+
+def classify_label_tokens(vals):
+    """Classify the value tokens (after the class id) of a YOLO label line -> (task, kpts)."""
+    nf = len(vals) + 1
+    seg_ok = nf >= 7 and (nf - 1) % 2 == 0 and (nf - 1) // 2 >= 3
+    pose_ok = nf >= 8 and (nf - 5) % 3 == 0 and (nf - 5) // 3 >= 1
+    if nf == 5:
+        return "detect", None
+    if pose_ok and seg_ok:
+        # A field count can parse as both segment (1+2N) and pose (1+4+3K), e.g. 11 tokens.
+        # Normalized polygon coordinates must lie in [0,1]; pose visibility values are 0/1/2,
+        # so an out-of-[0,1] value proves pose. Otherwise treat as segment.
+        if any(v < 0.0 or v > 1.0 for v in vals):
+            return "pose", (nf - 5) // 3
+        return "segment", None
+    if seg_ok:
+        return "segment", None
+    if pose_ok:
+        return "pose", (nf - 5) // 3
+    return None, None
+
+
+def classify_label_file(path: Path):
+    """Uniform structure of one YOLO label file -> (task, kpts, max_class_id) or None (empty).
+
+    Raises ValueError when the file mixes line structures or contains bad lines.
+    """
+    task = None
+    kpts = None
+    max_class = -1
+    for lineno, raw in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        raw = raw.strip()
+        if not raw:
+            continue
+        parts = raw.split()
+        try:
+            cls = float(parts[0])
+            vals = [float(t) for t in parts[1:]]
+        except (ValueError, IndexError):
+            raise ValueError(f"line {lineno}: not a numeric YOLO label line")
+        if cls != int(cls) or cls < 0:
+            raise ValueError(f"line {lineno}: invalid class id '{parts[0]}'")
+        t, k = classify_label_tokens(vals)
+        if t is None:
+            raise ValueError(f"line {lineno}: unrecognized field count {len(vals) + 1}")
+        if task is None:
+            task, kpts = t, k
+        elif t != task or k != kpts:
+            raise ValueError(f"line {lineno}: structure '{t}' differs from earlier lines '{task}'")
+        max_class = max(max_class, int(cls))
+    if task is None:
+        return None
+    return task, kpts, max_class
+
+
+def scan_yolo_labels(label_dirs):
+    """Scan YOLO label .txt files across split label dirs.
+
+    Returns (tasks: dict task->files, ksets: dict k->files, bad: [(file, reason)], max_class_id, n_label_files).
+    """
+    tasks = {}
+    ksets = {}
+    bad = []
+    max_class = -1
+    n_files = 0
+    for d in label_dirs:
+        if d is None or not d.is_dir():
+            continue
+        for lp in sorted(d.glob("*.txt")):
+            try:
+                res = classify_label_file(lp)
+            except (ValueError, OSError) as e:
+                bad.append((str(lp), str(e)))
+                continue
+            if res is None:
+                continue
+            n_files += 1
+            t, k, mc = res
+            tasks.setdefault(t, []).append(str(lp))
+            if k is not None:
+                ksets.setdefault(k, []).append(str(lp))
+            max_class = max(max_class, mc)
+    return tasks, ksets, bad, max_class, n_files
+
+
+def _sample_list(files, cap=10):
+    s = "; ".join(files[:cap])
+    if len(files) > cap:
+        s += f" ... (+{len(files) - cap} more)"
+    return s
+
+
+def _fail_label_scan(tasks, ksets, bad):
+    print("[ERROR] YOLO label structure problems in this dataset:")
+    if bad:
+        print(f"  - {len(bad)} malformed label file(s) (non-numeric line / unrecognized field count):")
+        for f, why in bad[:10]:
+            print(f"      {f}: {why}")
+        if len(bad) > 10:
+            print(f"      ... (+{len(bad) - 10} more)")
+    if len(tasks) > 1:
+        print("  - Mixed label line structures in one dataset:")
+        for t, files in tasks.items():
+            print(f"      {t}: {_sample_list(files)}")
+    if len(ksets) > 1:
+        print("  - Pose keypoint counts differ across files:")
+        for k, files in ksets.items():
+            print(f"      kpt count {k}: {_sample_list(files)}")
+    sys.exit(1)
+
+
+def _label_dirs_for_yaml(yaml_path: Path, data: dict):
+    dirs = []
+    for key in ("train", "val", "test"):
+        v = data.get(key)
+        if not v:
+            continue
+        try:
+            sp = resolve_yaml_split_path(yaml_path, str(v))
+        except Exception:
+            continue
+        ld = sp.parent / "labels"
+        dirs.append(ld if ld.is_dir() else sp)
+    return dirs
+
+
+def derive_task_from_yolo_labels(label_dirs, logger):
+    """Derive (task, kpt_count, max_class_id, had_labels) from uniform YOLO labels; hard-fail on mixed."""
+    tasks, ksets, bad, max_class, n_files = scan_yolo_labels(label_dirs)
+    if bad or len(tasks) > 1 or len(ksets) > 1:
+        _fail_label_scan(tasks, ksets, bad)
+    if not tasks:
+        print("[Dataset Format] no YOLO label content found in this dataset; defaulting to task=detect.")
+        return "detect", None, max_class, False
+    task = next(iter(tasks))
+    k = next(iter(ksets)) if ksets else None
+    return task, k, max_class, True
+
+
+def _confirm_dataset_write(logger, args, target: Path, change_lines, reason: str) -> bool:
+    """Decision 7: never write into a user dataset folder without asking; --yes runs non-interactively."""
+    print(f"[Dataset Write] {reason}.")
+    print(f"  File: {target}")
+    for ln in change_lines:
+        print(f"    {ln}")
+    if getattr(args, "yes", False):
+        print("[Dataset Write] --yes given: applying without a prompt.")
+        return True
+    if not interactive_stdin():
+        print("[Dataset Write] stdin is not interactive; refusing to write into the dataset folder.")
+        return False
+    answer = prompt_choice(logger.log, f"Apply this change to {target}?", ["y", "N"])
+    return answer == "y"
+
+
+def _declined_dataset_write(target: Path):
+    print("[Dataset Write] Declined; nothing was written to the dataset folder.")
+    print(f"  Options: add the lines above to {target} yourself, or re-run with --yes to apply them automatically.")
+    sys.exit(1)
+
+
+def _resolve_passthrough_yaml(yaml_files, args, logger):
+    """data.yaml already present: pass through, derive task from label structure, offer pose kpt_shape auto-fix."""
+    data_yaml = next((p for p in yaml_files if p.name.lower() == "data.yaml"), yaml_files[0])
+    data = yaml.safe_load(data_yaml.read_text(encoding="utf-8")) or {}
+    task, k_derived, max_class, had = derive_task_from_yolo_labels(_label_dirs_for_yaml(data_yaml, data), logger)
+    kpt = data.get("kpt_shape")
+    if task == "pose":
+        if kpt is None:
+            k = k_derived or 0
+            addition = [f"kpt_shape: [{k}, 3]", f"flip_idx: {list(range(k))}"]
+            if not _confirm_dataset_write(logger, args, data_yaml, addition,
+                                          reason="pose labels detected but data.yaml has no kpt_shape"):
+                _declined_dataset_write(data_yaml)
+            with open(data_yaml, "a", encoding="utf-8") as f:
+                f.write("\n".join(addition) + "\n")
+            print(f"[Dataset Write] updated {data_yaml}")
+        else:
+            kk = kpt[0] if isinstance(kpt, (list, tuple)) and kpt else None
+            if kk is not None and k_derived is not None and int(kk) != int(k_derived):
+                print(f"[ERROR] data.yaml kpt_shape ({kk} keypoints) does not match the label lines ({k_derived} keypoints).")
+                sys.exit(1)
+    elif kpt is not None:
+        print(f"[WARNING] data.yaml has kpt_shape but the labels are '{task}'; kpt_shape ignored.")
+    args.dataset_had_labels = had
+    return data_yaml, task
+
+
+def _try_synthesize_yaml(input_dir: Path, args, logger):
+    """YOLO pre-split folder without data.yaml: synthesize data.yaml after confirmation."""
+    split_dirs = {}
+    for child in sorted(input_dir.iterdir()):
+        if child.is_dir():
+            role = split_role(child.name)
+            if role and role not in split_dirs:
+                split_dirs[role] = child
+
+    images_by_split = {}
+    for role, d in split_dirs.items():
+        img_dir = d / "images" if (d / "images").is_dir() else d
+        if image_files(img_dir):
+            images_by_split[role] = img_dir
+    if "train" not in images_by_split or "val" not in images_by_split:
+        return None
+
+    label_dirs = []
+    for role in ("train", "val", "test"):
+        if role not in split_dirs:
+            continue
+        ld = split_dirs[role] / "labels"
+        label_dirs.append(ld if ld.is_dir() else images_by_split[role])
+    task, k, max_class, had = derive_task_from_yolo_labels(label_dirs, logger)
+
+    names = None
+    for fname in ("classes.txt", "labels.txt"):
+        cf = input_dir / fname
+        if cf.is_file():
+            names = [ln.strip() for ln in cf.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+            break
+    if names is None:
+        if max_class < 0:
+            print(f"[ERROR] No data.yaml, no labels, and no classes.txt in {input_dir} — cannot infer class names.")
+            sys.exit(1)
+        names = [f"class_{i}" for i in range(max_class + 1)]
+    elif max_class >= len(names):
+        print(f"[ERROR] Label class id {max_class} is out of range for the {len(names)} names in classes.txt/labels.txt.")
+        sys.exit(1)
+
+    out = {"train": f"{split_dirs['train'].name}/images", "val": f"{split_dirs['val'].name}/images"}
+    if "test" in images_by_split:
+        out["test"] = f"{split_dirs['test'].name}/images"
+    out["nc"] = len(names)
+    out["names"] = names
+    if task == "pose":
+        k = k or 0
+        out["kpt_shape"] = [k, 3]
+        out["flip_idx"] = list(range(k))
+
+    content = yaml.dump(out, default_flow_style=False, sort_keys=False)
+    target = input_dir / "data.yaml"
+    if not _confirm_dataset_write(logger, args, target, content.rstrip().splitlines(),
+                                  reason=f"YOLO dataset has no data.yaml; synthesizing one (task={task})"):
+        _declined_dataset_write(target)
+    target.write_text(content, encoding="utf-8")
+    print(f"[Dataset Write] wrote {target}")
+    args.dataset_had_labels = had
+    return target, task
+
+
+def _looks_like_flat_folder(input_dir: Path) -> bool:
+    if (input_dir / "images").is_dir() and image_files(input_dir / "images"):
+        return True
+    return any(f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS for f in input_dir.iterdir())
+
+
+def apply_task_override(derived, args, fmt, had_labels):
+    """Plan taxonomy: --task override wins over derived task; impossible overrides hard-error."""
+    override = getattr(args, "task", "auto")
+    if override == "auto":
+        return derived
+    if fmt == "voc" and override != "detect":
+        print(f"[ERROR] --task {override} is not supported for VOC datasets (VOC XML has no polygons or keypoints).")
+        sys.exit(1)
+    if fmt == "coco":
+        return override  # the converter enforces what the COCO data can actually provide
+    if derived == override:
+        return derived
+    if not had_labels:
+        print(f"[WARNING] --task {override} requested on a dataset with no labels; ensure the labels match this task.")
+        return override
+    print(f"[ERROR] Dataset label structure is '{derived}' but --task {override} was requested.")
+    print("        YOLO labels are used as-is (no relabeling): drop --task or provide labels of the requested structure.")
+    sys.exit(1)
+
+
+def resolve_dataset_input(args, logger):
+    """Single entry point: --input dataset directory -> (data.yaml path, task)."""
+    input_dir = normalize_path(args.input)
+
+    if input_dir.is_file():
+        print(f"[ERROR] --input must be a dataset FOLDER, not a file: {input_dir}")
+        if input_dir.suffix.lower() in (".yaml", ".yml"):
+            print("        Pass the dataset directory containing this yaml; its data.yaml is auto-detected.")
+        print("        (To continue an existing run use: --resume --name <run> — the stored data path is reused.)")
+        sys.exit(1)
+    if not input_dir.is_dir():
+        print(f"[ERROR] Dataset directory not found: {input_dir}")
+        sys.exit(1)
+
+    had_labels = False
+    yaml_path = None
+    fmt = action = None
+
+    yaml_files = sorted(p for p in input_dir.iterdir()
+                        if p.is_file() and p.suffix.lower() in (".yaml", ".yml"))
+    if yaml_files:
+        # yaml + COCO json both present -> yaml wins (pass-through)
+        yaml_path, task = _resolve_passthrough_yaml(yaml_files, args, logger)
+        fmt, action = "yolo", "pass-through"
+        had_labels = getattr(args, "dataset_had_labels", False)
+    else:
+        synthesized = _try_synthesize_yaml(input_dir, args, logger)
+        if synthesized:
+            yaml_path, task = synthesized
+            fmt, action = "yolo", "synthesized"
+            had_labels = getattr(args, "dataset_had_labels", False)
+        elif _looks_like_flat_folder(input_dir):
+            print("[ERROR] Dataset folder looks flat (images and labels without a train/val split).")
+            print("        Split it first:")
+            print("          python flat_yolo_split/flat_yolo_split.py --input <this folder> --output <split dataset>")
+            print("        Then pass the output dataset folder to --input.")
+            sys.exit(1)
+        else:
+            found = sorted(e.name for e in input_dir.iterdir())
+            print("[ERROR] Could not detect a supported dataset format in:")
+            print(f"        {input_dir}")
+            print(f"        Contents found: {', '.join(found[:20]) if found else '(empty)'}")
+            print("        Supported formats: YOLO folder with data.yaml; YOLO train/val images+labels folders")
+            print("        (data.yaml synthesized); COCO (_annotations.coco.json per split, or annotations/ + images/);")
+            print("        Pascal VOC XML.")
+            sys.exit(1)
+
+    task = apply_task_override(task, args, fmt, had_labels)
+
+    print(f"\n[Dataset Format]")
+    print(f"  format: {fmt}")
+    print(f"  task: {task}")
+    print(f"  action: {action}")
+    print(f"  yaml: {str(yaml_path).replace(chr(92), '/')}")
+    return yaml_path, task
 
 
 # -- Log Reporting Helpers ---------------------------------------------------------
@@ -3166,7 +3541,9 @@ def resume_training(args):
 
         data_str = None
         if args.input:
-            data_str = str(normalize_path(args.input))
+            resolved_yaml, resume_task = resolve_dataset_input(args, logger)
+            args.dataset_task = resume_task
+            data_str = str(resolved_yaml)
         elif isinstance(run_args, dict) and run_args.get("data"):
             data_str = str(run_args.get("data"))
         if data_str and args_yaml.exists() and run_args is not None:
@@ -3282,7 +3659,17 @@ def train(args):
         print("        Use --resume to continue an existing run.")
         sys.exit(1)
 
-    yaml_path = normalize_path(args.input)
+    input_dir = normalize_path(args.input)
+    if input_dir.is_file():
+        print(f"[ERROR] --input must be a dataset FOLDER, not a file: {input_dir}")
+        if input_dir.suffix.lower() in (".yaml", ".yml"):
+            print("        Pass the dataset directory containing this yaml; its data.yaml is auto-detected.")
+        print("        (To continue an existing run use: --resume --name <run> — the stored data path is reused.)")
+        sys.exit(1)
+    if not input_dir.is_dir():
+        print(f"[ERROR] Dataset directory not found: {input_dir}")
+        sys.exit(1)
+
     requested = args.name if args.name else "detector_v1"
 
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
@@ -3309,6 +3696,8 @@ def train(args):
         hw_fp = hardware_device_fingerprint(device)
         log_hardware(logger, hw, device, hw_fp)
 
+        yaml_path, dataset_task = resolve_dataset_input(args, logger)
+        args.dataset_task = dataset_task
         validate_dataset(yaml_path)
         data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
         train_path = resolve_yaml_split_path(yaml_path, str(data["train"]))
@@ -3391,7 +3780,7 @@ def train(args):
             print(f"  Run log     : {logger.log_path}")
             print()
 
-        return {"mode": "fresh", "best": best_pt, "run_name": run_name, "status": status}
+        return {"mode": "fresh", "best": best_pt, "run_name": run_name, "status": status, "yaml_path": str(yaml_path)}
     except KeyboardInterrupt:
         logger.log("[Run] Interrupted by user (Ctrl+C) before training finished or started.")
         print("\n[Run] Interrupted by user. See run log: " + str(logger.log_path))
@@ -3526,7 +3915,7 @@ def main():
         and outcome.get("status") in ("completed", "completed-target")
         and not args.dry_run
     ):
-        validate(normalize_path(args.input), args, outcome["run_name"])
+        validate(Path(outcome["yaml_path"]), args, outcome["run_name"])
 
 
 if __name__ == "__main__":
