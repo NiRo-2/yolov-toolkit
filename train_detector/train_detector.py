@@ -2625,6 +2625,456 @@ def apply_task_override(derived, args, fmt, had_labels):
     sys.exit(1)
 
 
+# -- COCO Conversion Helpers -------------------------------------------------------
+
+def looks_like_coco(input_dir: Path) -> bool:
+    """COCO per-split (`<split>/_annotations.coco.json`) or canonical (`annotations/*.json` + `images/`)."""
+    for child in input_dir.iterdir():
+        if child.is_dir() and (child / "_annotations.coco.json").is_file():
+            return True
+    ann_dir = input_dir / "annotations"
+    if ann_dir.is_dir() and any(p.is_file() and p.suffix.lower() == ".json" for p in ann_dir.iterdir()):
+        if (input_dir / "images").is_dir():
+            return True
+    return False
+
+
+def _norm_polygon(poly):
+    if not poly:
+        return []
+    if isinstance(poly[0], (list, tuple)):
+        return [(float(p[0]), float(p[1])) for p in poly if isinstance(p, (list, tuple)) and len(p) >= 2]
+    pts = []
+    for i in range(0, len(poly) - 1, 2):
+        pts.append((float(poly[i]), float(poly[i + 1])))
+    return pts
+
+
+def _poly_area(pts):
+    s = 0.0
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        s += x1 * y2 - x2 * y1
+    return abs(s) / 2.0
+
+
+def _largest_polygon(segs):
+    best, best_area = None, -1.0
+    for poly in segs:
+        pts = _norm_polygon(poly)
+        if len(pts) < 3:
+            continue
+        a = _poly_area(pts)
+        if a > best_area:
+            best_area, best = a, pts
+    return best
+
+
+def _bbox_rect_pts(bbox):
+    x, y, w, h = [float(v) for v in bbox[:4]]
+    return [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+
+
+def _polygon_is_bbox_like(poly_pts, bbox):
+    if not bbox or len(bbox) != 4 or len(poly_pts) != 4:
+        return False
+    for (px, py), (rx, ry) in zip(poly_pts, _bbox_rect_pts(bbox)):
+        if abs(px - rx) > 1e-6 or abs(py - ry) > 1e-6:
+            return False
+    return True
+
+
+def _clamp01(v: float) -> float:
+    return max(0.0, min(1.0, v))
+
+
+def _read_coco_json(jp: Path, tag: str) -> dict:
+    try:
+        data = json.loads(jp.read_text(encoding="utf-8-sig"))
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[ERROR] Could not read COCO annotation file {jp}: {e}")
+        sys.exit(1)
+    if not isinstance(data, dict) or not isinstance(data.get("images"), list):
+        print(f"[ERROR] {tag}: {jp} is not a valid COCO JSON (missing 'images' list).")
+        sys.exit(1)
+    return data
+
+
+def _load_coco_split_jsons(input_dir: Path):
+    """Map split role -> [(json_path, coco_dict)]; hard-error on role collisions or unreadable jsons."""
+    splits = {}
+    for child in sorted(input_dir.iterdir()):
+        if child.is_dir() and (child / "_annotations.coco.json").is_file():
+            role = split_role(child.name)
+            jp = child / "_annotations.coco.json"
+            if role is None:
+                print(f"[COCO] warning: folder '{child.name}' holds a COCO json but is not a train/val/test split name; ignored.")
+                continue
+            if role in splits:
+                print(f"[ERROR] Two COCO folders map to the same split '{role}': {splits[role][0][0].parent} and {jp.parent}.")
+                sys.exit(1)
+            splits[role] = [(jp, _read_coco_json(jp, child.name))]
+    ann_dir = input_dir / "annotations"
+    if ann_dir.is_dir():
+        for jp in sorted(ann_dir.iterdir()):
+            if not (jp.is_file() and jp.suffix.lower() == ".json"):
+                continue
+            low = jp.name.lower()
+            if "train" in low:
+                role = "train"
+            elif "val" in low:
+                role = "val"
+            elif "test" in low:
+                role = "test"
+            else:
+                print(f"[COCO] warning: cannot infer a split from {jp.name}; ignored.")
+                continue
+            if role in splits:
+                print(f"[ERROR] Split '{role}' provided twice (per-split json and {jp}); keep one layout per dataset.")
+                sys.exit(1)
+            splits.setdefault(role, []).append((jp, _read_coco_json(jp, jp.name)))
+    return splits
+
+
+def _coco_categories(splits):
+    """Category map identical across split jsons: sorted-by-id -> class index, names, per-id metadata."""
+    base_role, base = None, {}
+    for role in sorted(splits):
+        ids = {}
+        for jp, data in splits[role]:
+            for c in data.get("categories", []):
+                try:
+                    cid = int(c["id"])
+                except (KeyError, ValueError, TypeError):
+                    print(f"[ERROR] Category without a valid id in {jp}.")
+                    sys.exit(1)
+                ids[cid] = (c.get("name") or f"class_{cid}", int(c.get("num_keypoints", 0) or 0))
+        if base_role is None:
+            base_role, base = role, ids
+            continue
+        if set(ids) != set(base):
+            print(f"[ERROR] COCO category sets differ between splits '{base_role}' and '{role}'; every split json must declare the same categories.")
+            sys.exit(1)
+        for cid in sorted(base):
+            if base[cid][0] != ids[cid][0]:
+                print(f"[ERROR] Category id {cid} is named {base[cid][0]!r} in '{base_role}' but {ids[cid][0]!r} in '{role}'.")
+                sys.exit(1)
+    ordered = sorted(base.items(), key=lambda kv: kv[0])
+    cat_map = {cid: idx for idx, (cid, _) in enumerate(ordered)}
+    names = [name for _, (name, _) in ordered]
+    return cat_map, names, base
+
+
+def _derive_coco_task(splits):
+    """Task from COCO content: keypoint annotations > genuine polygons > plain bboxes."""
+    kpt_counts = set()
+    has_polygon = False
+    for entries in splits.values():
+        for _, data in entries:
+            nk = {}
+            for c in data.get("categories", []):
+                try:
+                    nk[int(c["id"])] = int(c.get("num_keypoints", 0) or 0)
+                except (KeyError, ValueError, TypeError):
+                    pass
+            for ann in data.get("annotations", []):
+                if ann.get("iscrowd"):
+                    continue
+                cid = int(ann.get("category_id", -1))
+                if nk.get(cid, 0) > 0 and ann.get("keypoints"):
+                    kpt_counts.add(nk[cid])
+                bbox = ann.get("bbox")
+                segs = ann.get("segmentation")
+                if isinstance(segs, list):
+                    for poly in segs:
+                        pts = _norm_polygon(poly)
+                        if len(pts) >= 3 and not _polygon_is_bbox_like(pts, bbox):
+                            has_polygon = True
+    if kpt_counts:
+        if len(kpt_counts) > 1:
+            print(f"[ERROR] COCO keypoint categories declare different keypoint counts {sorted(kpt_counts)}; pose conversion needs one uniform keypoint shape.")
+            sys.exit(1)
+        return "pose", next(iter(kpt_counts))
+    if has_polygon:
+        return "segment", None
+    return "detect", None
+
+
+def _coco_source_fingerprint(input_dir: Path, out_dir: Path):
+    out_abs = out_dir.resolve()
+    files = []
+    for p in sorted(input_dir.rglob("*")):
+        if not p.is_file():
+            continue
+        rp = p.resolve()
+        if rp == out_abs or out_abs in rp.parents:
+            continue
+        st = p.stat()
+        files.append({"path": str(p.relative_to(input_dir)).replace("\\", "/"),
+                      "size": st.st_size, "mtime": int(st.st_mtime)})
+    return {"files": files}
+
+
+def _coco_ann_to_yolo(ann, im, cat_map, task, kpt_count, stats):
+    try:
+        cid = int(ann["category_id"])
+    except (KeyError, ValueError, TypeError):
+        stats["dropped"] += 1
+        return None
+    if cid not in cat_map:
+        stats["unknown_category"] += 1
+        return None
+    cls = cat_map[cid]
+    try:
+        W = float(im.get("width") or 0.0)
+        H = float(im.get("height") or 0.0)
+    except (TypeError, ValueError):
+        W = H = 0.0
+    if W <= 0 or H <= 0:
+        print(f"[ERROR] COCO image id {im.get('id')} has no valid width/height; cannot normalize labels.")
+        sys.exit(1)
+
+    bbox = None
+    raw_bbox = ann.get("bbox")
+    if isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) == 4:
+        x, y, w, h = [float(v) for v in raw_bbox]
+        if w > 0 and h > 0:
+            bbox = (x, y, w, h)
+
+    if bbox is None:
+        poly = _largest_polygon(ann.get("segmentation") or [])
+        if poly:
+            xs = [p[0] for p in poly]
+            ys = [p[1] for p in poly]
+            w, h = max(xs) - min(xs), max(ys) - min(ys)
+            if w > 0 and h > 0:
+                bbox = (min(xs), min(ys), w, h)
+
+    if task == "detect":
+        if bbox is None:
+            stats["dropped"] += 1
+            return None
+        x, y, w, h = bbox
+        return (f"{cls} {_clamp01((x + w / 2.0) / W):.6f} {_clamp01((y + h / 2.0) / H):.6f} "
+                f"{_clamp01(w / W):.6f} {_clamp01(h / H):.6f}")
+
+    if task == "segment":
+        poly = _largest_polygon(ann.get("segmentation") or [])
+        if poly:
+            if sum(1 for s in (ann.get("segmentation") or []) if len(_norm_polygon(s)) >= 3) > 1:
+                stats["multi_polygon"] += 1
+        elif bbox is not None:
+            poly = _bbox_rect_pts(bbox)
+        else:
+            stats["dropped"] += 1
+            return None
+        vals = []
+        for px, py in poly:
+            vals.append(f"{_clamp01(px / W):.6f}")
+            vals.append(f"{_clamp01(py / H):.6f}")
+        return f"{cls} " + " ".join(vals)
+
+    # pose
+    if bbox is None:
+        stats["dropped"] += 1
+        return None
+    x, y, w, h = bbox
+    parts = [str(cls), f"{_clamp01((x + w / 2.0) / W):.6f}", f"{_clamp01((y + h / 2.0) / H):.6f}",
+             f"{_clamp01(w / W):.6f}", f"{_clamp01(h / H):.6f}"]
+    kps = [float(v) if isinstance(v, (int, float)) else 0.0 for v in (ann.get("keypoints") or [])]
+    kps += [0.0, 0.0, 0.0] * max(0, kpt_count - len(kps) // 3)
+    for i in range(kpt_count):
+        kx, ky, kv = kps[3 * i], kps[3 * i + 1], kps[3 * i + 2]
+        try:
+            kv = int(kv)
+        except (TypeError, ValueError):
+            kv = 0
+        if kv not in (1, 2):
+            kv = 0
+        if kv == 0:
+            kx, ky = 0.0, 0.0
+        elif kv == 1:
+            kx, ky = 0.0, 0.0
+        else:
+            kx, ky = _clamp01(kx / W), _clamp01(ky / H)
+        parts.append(f"{kx:.6f}")
+        parts.append(f"{ky:.6f}")
+        parts.append(str(kv))
+    return " ".join(parts)
+
+
+def convert_coco_dataset(input_dir: Path, args, logger):
+    """Convert COCO JSON datasets into a *_yolo YOLO copy. Returns (data.yaml, final task, action).
+
+    Reuse rules: existing conversion with same fingerprint and task is reused; changed source rebuilds
+    (wipe allowed only because our manifest proves the folder is ours); an existing folder without our
+    manifest is never modified.
+    """
+    splits = _load_coco_split_jsons(input_dir)
+    if "train" not in splits or "val" not in splits:
+        found = ", ".join(sorted(splits)) if splits else "none"
+        print(f"[ERROR] COCO dataset needs train and val annotation JSONs; found splits: {found}")
+        sys.exit(1)
+
+    cat_map, names, _cat_meta = _coco_categories(splits)
+    derived, kpt_count = _derive_coco_task(splits)
+
+    override = getattr(args, "task", "auto")
+    task = derived
+    if override != "auto" and override != derived:
+        if override == "pose":
+            print("[ERROR] --task pose requested but this COCO dataset has no keypoint annotations (no category declares num_keypoints > 0).")
+            print("        Use --task detect or --task segment, or export this dataset with keypoints.")
+            sys.exit(1)
+        task = override  # detect-on-polygons: geometry reduced to bboxes; segment-on-bboxes: rectangular polygons
+
+    if args.converted_dir:
+        out_dir = normalize_path(args.converted_dir)
+    else:
+        out_dir = input_dir.parent / f"{input_dir.name}{CONVERSION_DIR_SUFFIX}"
+
+    fp = _coco_source_fingerprint(input_dir, out_dir)
+    fp_id = fingerprint_hash(fp)
+    manifest_path = out_dir / CONVERSION_MANIFEST_NAME
+
+    if out_dir.is_dir() and any(out_dir.iterdir()):
+        manifest = None
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                manifest = None
+        if manifest is None:
+            print(f"[ERROR] {out_dir} already exists but is not a conversion created by this tool (no {CONVERSION_MANIFEST_NAME}).")
+            print("        It will not be modified or deleted: pass --converted-dir <fresh location>, or move/remove the existing folder.")
+            sys.exit(1)
+        reusable = (isinstance(manifest, dict) and manifest.get("format") == "coco"
+                    and manifest.get("task") == task and manifest.get("fingerprint_id") == fp_id
+                    and (out_dir / "data.yaml").is_file())
+        if reusable:
+            print(f"[COCO] reusing previous conversion at {out_dir} (source fingerprint unchanged).")
+            print(f"[COCO] previous manifest: task={manifest.get('task')}, image_counts={manifest.get('image_counts')}")
+            return out_dir / "data.yaml", task, "reused-conversion"
+        print(f"[COCO] {out_dir} holds an earlier conversion but the source or requested task changed — rebuilding from scratch.")
+        shutil.rmtree(out_dir)
+
+    stats = {"missing_images": 0, "iscrowd_skipped": 0, "dropped": 0, "multi_polygon": 0, "unknown_category": 0}
+    image_counts = {}
+    print(f"[COCO] converting {input_dir} -> {out_dir} (task={task})")
+    try:
+        for role in ("train", "val", "test"):
+            if role not in splits:
+                continue
+            images_dir = out_dir / role / "images"
+            labels_dir = out_dir / role / "labels"
+            images_dir.mkdir(parents=True, exist_ok=True)
+            labels_dir.mkdir(parents=True, exist_ok=True)
+            seen_ids = set()
+            anns_by_image = {}
+            images = []
+            json_dirs = set()
+            for jp, data in splits[role]:
+                json_dirs.add(jp.parent)
+                for im in data.get("images", []):
+                    try:
+                        iid = int(im["id"])
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                    if iid in seen_ids:
+                        continue
+                    seen_ids.add(iid)
+                    images.append((jp, im))
+                for ann in data.get("annotations", []):
+                    try:
+                        anns_by_image.setdefault(int(ann["image_id"]), []).append(ann)
+                    except (KeyError, ValueError, TypeError):
+                        continue
+            referenced = {str(im.get("file_name") or "").replace("\\", "/") for _, im in images}
+            referenced_names = {Path(r).name for r in referenced if r}
+            copied = 0
+            for jp, im in images:
+                file_name = str(im.get("file_name") or "").replace("\\", "/")
+                if not file_name:
+                    stats["missing_images"] += 1
+                    continue
+                src = None
+                for base in (jp.parent, jp.parent / "images", input_dir / "images", input_dir):
+                    cand = base / file_name
+                    if cand.is_file():
+                        src = cand
+                        break
+                if src is None:
+                    stats["missing_images"] += 1
+                    print(f"[COCO] warning: image '{file_name}' from {jp.name} not found next to the json or in images/; skipped.")
+                    continue
+                dst = images_dir / Path(file_name).name
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                copied += 1
+                lines = []
+                for ann in anns_by_image.get(int(im["id"]), []):
+                    if ann.get("iscrowd"):
+                        stats["iscrowd_skipped"] += 1
+                        continue
+                    line = _coco_ann_to_yolo(ann, im, cat_map, task, kpt_count, stats)
+                    if line:
+                        lines.append(line)
+                (labels_dir / f"{Path(file_name).stem}.txt").write_text(
+                    "".join(ln + "\n" for ln in lines), encoding="utf-8")
+            image_counts[role] = copied
+            extra = []
+            for jd in json_dirs | {input_dir / "images"}:
+                probe_dirs = [jd, jd / "images"] if jd != input_dir / "images" else [jd]
+                for probe in probe_dirs:
+                    if probe.is_dir():
+                        for f in image_files(probe):
+                            rel = str(f.relative_to(jd)).replace("\\", "/")
+                            if f.name not in referenced_names and rel not in referenced:
+                                extra.append(f)
+            if extra:
+                print(f"[COCO] warning: {len(extra)} image(s) on disk in split '{role}' are not referenced by the COCO json and were not copied: {_sample_list([str(f) for f in extra])}")
+
+        yaml_out = {"train": "train/images", "val": "val/images"}
+        if "test" in splits:
+            yaml_out["test"] = "test/images"
+        yaml_out["nc"] = len(names)
+        yaml_out["names"] = names
+        if task == "pose":
+            yaml_out["kpt_shape"] = [kpt_count, 3]
+            yaml_out["flip_idx"] = list(range(kpt_count))
+        (out_dir / "data.yaml").write_text(yaml.dump(yaml_out, default_flow_style=False, sort_keys=False), encoding="utf-8")
+
+        manifest_data = {
+            "version": 1,
+            "format": "coco",
+            "task": task,
+            "source_dir": str(input_dir),
+            "fingerprint_id": fp_id,
+            "n_source_files": len(fp["files"]),
+            "image_counts": image_counts,
+            "created": local_iso(),
+        }
+        manifest_path.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
+    except OSError as e:
+        print(f"[ERROR] Could not write the converted dataset to {out_dir}: {e}")
+        print("        This location may be read-only or unavailable: pass --converted-dir <writable location> and re-run.")
+        sys.exit(1)
+
+    if stats["iscrowd_skipped"]:
+        print(f"[COCO] skipped {stats['iscrowd_skipped']} iscrowd annotation(s) (crowd regions are not valid YOLO labels).")
+    if stats["dropped"]:
+        print(f"[COCO] warning: {stats['dropped']} annotation(s) dropped (zero-area or unusable geometry).")
+    if stats["multi_polygon"]:
+        print(f"[COCO] {stats['multi_polygon']} annotation(s) had multiple polygons: kept the largest by area (YOLO labels take one polygon per object).")
+    if stats["unknown_category"]:
+        print(f"[COCO] warning: {stats['unknown_category']} annotation(s) referenced a category missing from the jsons; skipped.")
+    counts = ", ".join(f"{k}:{v}" for k, v in image_counts.items())
+    print(f"[COCO] converted {sum(image_counts.values())} images ({counts}); labels in {out_dir}/<split>/labels/")
+    return out_dir / "data.yaml", task, "converted"
+
+
 def resolve_dataset_input(args, logger):
     """Single entry point: --input dataset directory -> (data.yaml path, task)."""
     input_dir = normalize_path(args.input)
@@ -2642,6 +3092,7 @@ def resolve_dataset_input(args, logger):
     had_labels = False
     yaml_path = None
     fmt = action = None
+    task_resolved = False
 
     yaml_files = sorted(p for p in input_dir.iterdir()
                         if p.is_file() and p.suffix.lower() in (".yaml", ".yml"))
@@ -2651,28 +3102,34 @@ def resolve_dataset_input(args, logger):
         fmt, action = "yolo", "pass-through"
         had_labels = getattr(args, "dataset_had_labels", False)
     else:
-        synthesized = _try_synthesize_yaml(input_dir, args, logger)
-        if synthesized:
-            yaml_path, task = synthesized
-            fmt, action = "yolo", "synthesized"
-            had_labels = getattr(args, "dataset_had_labels", False)
-        elif _looks_like_flat_folder(input_dir):
-            print("[ERROR] Dataset folder looks flat (images and labels without a train/val split).")
-            print("        Split it first:")
-            print("          python flat_yolo_split/flat_yolo_split.py --input <this folder> --output <split dataset>")
-            print("        Then pass the output dataset folder to --input.")
-            sys.exit(1)
+        if looks_like_coco(input_dir):
+            yaml_path, task, action = convert_coco_dataset(input_dir, args, logger)
+            fmt = "coco"
+            task_resolved = True
         else:
-            found = sorted(e.name for e in input_dir.iterdir())
-            print("[ERROR] Could not detect a supported dataset format in:")
-            print(f"        {input_dir}")
-            print(f"        Contents found: {', '.join(found[:20]) if found else '(empty)'}")
-            print("        Supported formats: YOLO folder with data.yaml; YOLO train/val images+labels folders")
-            print("        (data.yaml synthesized); COCO (_annotations.coco.json per split, or annotations/ + images/);")
-            print("        Pascal VOC XML.")
-            sys.exit(1)
+            synthesized = _try_synthesize_yaml(input_dir, args, logger)
+            if synthesized:
+                yaml_path, task = synthesized
+                fmt, action = "yolo", "synthesized"
+                had_labels = getattr(args, "dataset_had_labels", False)
+            elif _looks_like_flat_folder(input_dir):
+                print("[ERROR] Dataset folder looks flat (images and labels without a train/val split).")
+                print("        Split it first:")
+                print("          python flat_yolo_split/flat_yolo_split.py --input <this folder> --output <split dataset>")
+                print("        Then pass the output dataset folder to --input.")
+                sys.exit(1)
+            else:
+                found = sorted(e.name for e in input_dir.iterdir())
+                print("[ERROR] Could not detect a supported dataset format in:")
+                print(f"        {input_dir}")
+                print(f"        Contents found: {', '.join(found[:20]) if found else '(empty)'}")
+                print("        Supported formats: YOLO folder with data.yaml; YOLO train/val images+labels folders")
+                print("        (data.yaml synthesized); COCO (_annotations.coco.json per split, or annotations/ + images/);")
+                print("        Pascal VOC XML.")
+                sys.exit(1)
 
-    task = apply_task_override(task, args, fmt, had_labels)
+    if not task_resolved:
+        task = apply_task_override(task, args, fmt, had_labels)
 
     print(f"\n[Dataset Format]")
     print(f"  format: {fmt}")
