@@ -2938,27 +2938,9 @@ def convert_coco_dataset(input_dir: Path, args, logger):
     fp = _coco_source_fingerprint(input_dir, out_dir)
     fp_id = fingerprint_hash(fp)
     manifest_path = out_dir / CONVERSION_MANIFEST_NAME
-
-    if out_dir.is_dir() and any(out_dir.iterdir()):
-        manifest = None
-        if manifest_path.is_file():
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                manifest = None
-        if manifest is None:
-            print(f"[ERROR] {out_dir} already exists but is not a conversion created by this tool (no {CONVERSION_MANIFEST_NAME}).")
-            print("        It will not be modified or deleted: pass --converted-dir <fresh location>, or move/remove the existing folder.")
-            sys.exit(1)
-        reusable = (isinstance(manifest, dict) and manifest.get("format") == "coco"
-                    and manifest.get("task") == task and manifest.get("fingerprint_id") == fp_id
-                    and (out_dir / "data.yaml").is_file())
-        if reusable:
-            print(f"[COCO] reusing previous conversion at {out_dir} (source fingerprint unchanged).")
-            print(f"[COCO] previous manifest: task={manifest.get('task')}, image_counts={manifest.get('image_counts')}")
-            return out_dir / "data.yaml", task, "reused-conversion"
-        print(f"[COCO] {out_dir} holds an earlier conversion but the source or requested task changed — rebuilding from scratch.")
-        shutil.rmtree(out_dir)
+    gate = _conversion_reuse_gate(out_dir, fp_id, "coco", task)
+    if gate == "reuse":
+        return out_dir / "data.yaml", task, "reused-conversion"
 
     stats = {"missing_images": 0, "iscrowd_skipped": 0, "dropped": 0, "multi_polygon": 0, "unknown_category": 0}
     image_counts = {}
@@ -3075,6 +3057,231 @@ def convert_coco_dataset(input_dir: Path, args, logger):
     return out_dir / "data.yaml", task, "converted"
 
 
+# -- Conversion Manifest Gate ------------------------------------------------------
+
+def _conversion_reuse_gate(out_dir: Path, fp_id: str, fmt: str, task: str) -> str:
+    """Manifest-driven reuse rules (decision 3). Returns 'reuse' or 'convert' (after wiping our own old output).
+
+    An existing non-empty output folder without our manifest is treated as unmanaged: never modified,
+    never wiped - hard error with guidance.
+    """
+    manifest_path = out_dir / CONVERSION_MANIFEST_NAME
+    if out_dir.is_dir() and any(out_dir.iterdir()):
+        manifest = None
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                manifest = None
+        if manifest is None:
+            print(f"[ERROR] {out_dir} already exists but is not a conversion created by this tool (no {CONVERSION_MANIFEST_NAME}).")
+            print("        It will not be modified or deleted: pass --converted-dir <fresh location>, or move/remove the existing folder.")
+            sys.exit(1)
+        reusable = (isinstance(manifest, dict) and manifest.get("format") == fmt
+                    and manifest.get("task") == task and manifest.get("fingerprint_id") == fp_id
+                    and (out_dir / "data.yaml").is_file())
+        if reusable:
+            print(f"[{fmt.upper()}] reusing previous conversion at {out_dir} (source fingerprint unchanged).")
+            print(f"[{fmt.upper()}] previous manifest: task={manifest.get('task')}, image_counts={manifest.get('image_counts')}")
+            return "reuse"
+        print(f"[{fmt.upper()}] {out_dir} holds an earlier conversion but the source or requested task changed — rebuilding from scratch.")
+        shutil.rmtree(out_dir)
+    return "convert"
+
+
+# -- VOC Conversion Helpers --------------------------------------------------------
+
+_VOC_HELPER_MODULE = None
+
+
+def _load_voc_helpers():
+    """Import voc_to_yolo.py helpers by file path (plan decision 4); its __main__ guard keeps import side-effect free."""
+    global _VOC_HELPER_MODULE
+    if _VOC_HELPER_MODULE is None:
+        voc_path = Path(__file__).resolve().parent.parent / "voc_to_yolo" / "voc_to_yolo.py"
+        if not voc_path.is_file():
+            print(f"[ERROR] VOC conversion needs the helpers in {voc_path}, but that file is missing.")
+            sys.exit(1)
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("voc_to_yolo_converters", voc_path)
+        module = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(module)
+        except Exception as e:
+            print(f"[ERROR] Could not load VOC helpers from {voc_path}: {e}")
+            sys.exit(1)
+        _VOC_HELPER_MODULE = module
+    return _VOC_HELPER_MODULE
+
+
+def looks_like_voc(input_dir: Path) -> bool:
+    if next(input_dir.rglob("*.xml"), None) is not None:
+        return True
+    return any(p.is_file() and p.suffix.lower() == ".xml" for p in input_dir.rglob("*.XML"))
+
+
+def _voc_pairs_in_split(split_dir: Path):
+    """Pair <stem>.xml with same-stem image (flat, images/, or JPEGImages/ neighbours). Dedupes by stem."""
+    pairs = []
+    seen_stems = set()
+    xml_files = sorted(split_dir.rglob("*.xml"))
+    xml_stems = {p.stem for p in xml_files}
+    unpaired_xmls = []
+    for xp in xml_files:
+        stem = xp.stem
+        if stem in seen_stems:
+            continue
+        img = None
+        for base in (xp.parent, xp.parent / "images", xp.parent / "JPEGImages",
+                     xp.parent.parent / "images", xp.parent.parent / "JPEGImages"):
+            for ext in sorted(IMAGE_EXTENSIONS):
+                cand = base / f"{stem}{ext}"
+                if cand.is_file():
+                    img = cand
+                    break
+            if img is not None:
+                break
+        if img is None:
+            unpaired_xmls.append(xp)
+            continue
+        seen_stems.add(stem)
+        pairs.append((img, xp))
+    paired_paths = {img for img, _ in pairs}
+    unpaired_images = [f for f in sorted(split_dir.rglob("*"))
+                       if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS and f not in paired_paths]
+    return pairs, unpaired_images, unpaired_xmls
+
+
+def convert_voc_dataset(input_dir: Path, args, logger):
+    """Pascal VOC -> YOLO conversion into a *_yolo copy. VOC is detect-only (no polygons/keypoints in XML)."""
+    override = getattr(args, "task", "auto")
+    if override in ("segment", "pose"):
+        print(f"[ERROR] --task {override} is not supported for VOC datasets: VOC XML annotations are bounding boxes only.")
+        print("        VOC conversion is always task=detect. Use a COCO or YOLO dataset for segmentation/pose training.")
+        sys.exit(1)
+
+    splits = {}
+    warnings = {}
+    for child in sorted(input_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        role = split_role(child.name)
+        if role is None:
+            if next(child.rglob("*.xml"), None) is not None:
+                print(f"[VOC] warning: folder '{child.name}' holds VOC XMLs but is not a train/val/test split name; ignored.")
+            continue
+        if role in splits:
+            print(f"[ERROR] Two folders map to the same split '{role}': {sorted(splits)[0]} and {child}.")
+            sys.exit(1)
+        splits[role] = child
+
+    if "train" not in splits or "val" not in splits:
+        print(f"[ERROR] This VOC dataset is not pre-split into train/val folders (found: {', '.join(sorted(splits)) or 'none'}).")
+        print("        Auto-split it first, then pass the output folder to --input:")
+        print("          python voc_to_yolo/voc_to_yolo.py --input <this folder> --output <split dataset>")
+        sys.exit(1)
+
+    helpers = _load_voc_helpers()
+    role_pairs = {}
+    for role, split_dir in splits.items():
+        pairs, unpaired_images, unpaired_xmls = _voc_pairs_in_split(split_dir)
+        role_pairs[role] = pairs
+        warnings[role] = (unpaired_images, unpaired_xmls)
+
+    for role in ("train", "val"):
+        if not role_pairs.get(role):
+            print(f"[ERROR] VOC split '{role}' has no image+XML pairs; nothing to convert.")
+            sys.exit(1)
+
+    all_pairs = [p for role in ("train", "val", "test") for p in role_pairs.get(role, [])]
+    names = helpers.discover_classes(all_pairs)  # alphabetically sorted -> class ids (same rule as voc_to_yolo.py)
+    if not names:
+        print("[ERROR] No annotated objects found in any VOC XML; nothing to train on.")
+        sys.exit(1)
+    cls_map = {name: i for i, name in enumerate(names)}
+
+    if args.converted_dir:
+        out_dir = normalize_path(args.converted_dir)
+    else:
+        out_dir = input_dir.parent / f"{input_dir.name}{CONVERSION_DIR_SUFFIX}"
+
+    fp = _coco_source_fingerprint(input_dir, out_dir)
+    fp_id = fingerprint_hash(fp)
+    action = _conversion_reuse_gate(out_dir, fp_id, "voc", "detect")
+    if action == "reuse":
+        return out_dir / "data.yaml", "detect", "reused-conversion"
+
+    stats = {"parse_failed": 0, "unknown_name": 0}
+    image_counts = {}
+    print(f"[VOC] converting {input_dir} -> {out_dir} (task=detect, classes discovered alphabetically)")
+    try:
+        for role in ("train", "val", "test"):
+            if role not in role_pairs:
+                continue
+            images_dir = out_dir / role / "images"
+            labels_dir = out_dir / role / "labels"
+            images_dir.mkdir(parents=True, exist_ok=True)
+            labels_dir.mkdir(parents=True, exist_ok=True)
+            copied = 0
+            for img_p, xml_p in role_pairs[role]:
+                dst = images_dir / img_p.name
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(img_p, dst)
+                copied += 1
+                lines = []
+                try:
+                    img_w, img_h, objects = helpers.parse_voc_xml(xml_p)
+                except (ValueError, Exception) as e:
+                    stats["parse_failed"] += 1
+                    print(f"[VOC] warning: {xml_p}: {e}; empty label file written for {img_p.name}.")
+                else:
+                    for ob in objects:
+                        name = ob["name"]
+                        if name not in cls_map:
+                            stats["unknown_name"] += 1
+                            continue
+                        xc, yc, bw, bh = helpers.voc_bbox_to_yolo(ob["xmin"], ob["ymin"], ob["xmax"], ob["ymax"], img_w, img_h)
+                        lines.append(f"{cls_map[name]} {_clamp01(xc):.6f} {_clamp01(yc):.6f} {_clamp01(bw):.6f} {_clamp01(bh):.6f}")
+                (labels_dir / f"{img_p.stem}.txt").write_text("".join(ln + "\n" for ln in lines), encoding="utf-8")
+            image_counts[role] = copied
+            unpaired_images, unpaired_xmls = warnings.get(role, ([], []))
+            if unpaired_images:
+                print(f"[VOC] warning: {len(unpaired_images)} image(s) in split '{role}' are unpaired (no XML file) and were not copied: {_sample_list([str(f) for f in unpaired_images])}")
+            if unpaired_xmls:
+                print(f"[VOC] warning: {len(unpaired_xmls)} XML file(s) in split '{role}' have no matching image and were ignored: {_sample_list([str(f) for f in unpaired_xmls])}")
+
+        yaml_out = {"train": "train/images", "val": "val/images"}
+        if "test" in role_pairs:
+            yaml_out["test"] = "test/images"
+        yaml_out["nc"] = len(names)
+        yaml_out["names"] = names
+        (out_dir / "data.yaml").write_text(yaml.dump(yaml_out, default_flow_style=False, sort_keys=False), encoding="utf-8")
+
+        manifest_data = {
+            "version": 1,
+            "format": "voc",
+            "task": "detect",
+            "source_dir": str(input_dir),
+            "fingerprint_id": fp_id,
+            "n_source_files": len(fp["files"]),
+            "image_counts": image_counts,
+            "created": local_iso(),
+        }
+        (out_dir / CONVERSION_MANIFEST_NAME).write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
+    except OSError as e:
+        print(f"[ERROR] Could not write the converted dataset to {out_dir}: {e}")
+        print("        This location may be read-only or unavailable: pass --converted-dir <writable location> and re-run.")
+        sys.exit(1)
+
+    if stats["parse_failed"]:
+        print(f"[VOC] {stats['parse_failed']} XML file(s) could not be parsed; their images got empty label files.")
+    if stats["unknown_name"]:
+        print(f"[VOC] warning: {stats['unknown_name']} object(s) named outside the discovered class set; skipped.")
+    counts = ", ".join(f"{k}:{v}" for k, v in image_counts.items())
+    print(f"[VOC] converted {sum(image_counts.values())} images ({counts}); classes: {names}")
+    return out_dir / "data.yaml", "detect", "converted"
+
+
 def resolve_dataset_input(args, logger):
     """Single entry point: --input dataset directory -> (data.yaml path, task)."""
     input_dir = normalize_path(args.input)
@@ -3105,6 +3312,10 @@ def resolve_dataset_input(args, logger):
         if looks_like_coco(input_dir):
             yaml_path, task, action = convert_coco_dataset(input_dir, args, logger)
             fmt = "coco"
+            task_resolved = True
+        elif looks_like_voc(input_dir):
+            yaml_path, task, action = convert_voc_dataset(input_dir, args, logger)
+            fmt = "voc"
             task_resolved = True
         else:
             synthesized = _try_synthesize_yaml(input_dir, args, logger)
