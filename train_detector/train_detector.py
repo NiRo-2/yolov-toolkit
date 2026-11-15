@@ -125,10 +125,8 @@ PREFERRED_AUTO_BATCH = 8   # auto batch target; nbs=64 gradient accumulation kee
 MIN_AUTO_BATCH = 4         # auto batch floor; batch 2 is only usable with an explicit --force-unsafe run
 BATCH_LADDER = [2, 4, 8, 16, 32, 64]
 STANDARD_IMGSZ = [320, 416, 512, 640, 768, 1024, 1280, 1536]
-MODEL_QUALITY_ORDER = ["yolo26n.pt", "yolo26m.pt", "yolo26l.pt", "yolo26x.pt"]
 
-# Task-aware model chains (plan: detect / -seg / -pose per size). MODEL_QUALITY_ORDER stays
-# the detect default (and the --probe-vram default list).
+# Task-aware model chains (plan: detect / -seg / -pose per size).
 MODEL_TASK_SUFFIXES = {"detect": "", "segment": "-seg", "pose": "-pose"}
 
 
@@ -2413,7 +2411,6 @@ def validate_dataset(yaml_path: Path) -> None:
 # (detect/segment/pose) is derived from the data unless --task overrides it.
 # COCO/VOC convert once into a reusable sibling <folder>_yolo copy.
 
-DATASET_TASKS = ("detect", "segment", "pose")
 CONVERSION_DIR_SUFFIX = "_yolo"
 CONVERSION_MANIFEST_NAME = ".conversion_manifest.json"
 
@@ -2555,7 +2552,7 @@ def _label_dirs_for_yaml(yaml_path: Path, data: dict):
     return dirs
 
 
-def derive_task_from_yolo_labels(label_dirs, logger):
+def derive_task_from_yolo_labels(label_dirs):
     """Derive (task, kpt_count, max_class_id, had_labels) from uniform YOLO labels; hard-fail on mixed."""
     tasks, ksets, bad, max_class, n_files = scan_yolo_labels(label_dirs)
     if bad or len(tasks) > 1 or len(ksets) > 1:
@@ -2594,7 +2591,7 @@ def _resolve_passthrough_yaml(yaml_files, args, logger):
     """data.yaml already present: pass through, derive task from label structure, offer pose kpt_shape auto-fix."""
     data_yaml = next((p for p in yaml_files if p.name.lower() == "data.yaml"), yaml_files[0])
     data = yaml.safe_load(data_yaml.read_text(encoding="utf-8")) or {}
-    task, k_derived, max_class, had = derive_task_from_yolo_labels(_label_dirs_for_yaml(data_yaml, data), logger)
+    task, k_derived, max_class, had = derive_task_from_yolo_labels(_label_dirs_for_yaml(data_yaml, data))
     kpt = data.get("kpt_shape")
     if task == "pose":
         if kpt is None:
@@ -2640,7 +2637,7 @@ def _try_synthesize_yaml(input_dir: Path, args, logger):
             continue
         ld = split_dirs[role] / "labels"
         label_dirs.append(ld if ld.is_dir() else images_by_split[role])
-    task, k, max_class, had = derive_task_from_yolo_labels(label_dirs, logger)
+    task, k, max_class, had = derive_task_from_yolo_labels(label_dirs)
 
     names = None
     for fname in ("classes.txt", "labels.txt"):
@@ -2684,16 +2681,11 @@ def _looks_like_flat_folder(input_dir: Path) -> bool:
     return any(f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS for f in input_dir.iterdir())
 
 
-def apply_task_override(derived, args, fmt, had_labels):
+def apply_task_override(derived, args, had_labels):
     """Plan taxonomy: --task override wins over derived task; impossible overrides hard-error."""
     override = getattr(args, "task", "auto")
     if override == "auto":
         return derived
-    if fmt == "voc" and override != "detect":
-        print(f"[ERROR] --task {override} is not supported for VOC datasets (VOC XML has no polygons or keypoints).")
-        sys.exit(1)
-    if fmt == "coco":
-        return override  # the converter enforces what the COCO data can actually provide
     if derived == override:
         return derived
     if not had_labels:
@@ -2984,7 +2976,7 @@ def _coco_ann_to_yolo(ann, im, cat_map, task, kpt_count, stats):
     return " ".join(parts)
 
 
-def convert_coco_dataset(input_dir: Path, args, logger):
+def convert_coco_dataset(input_dir: Path, args):
     """Convert COCO JSON datasets into a *_yolo YOLO copy. Returns (data.yaml, final task, action).
 
     Reuse rules: existing conversion with same fingerprint and task is reused; changed source rebuilds
@@ -3251,7 +3243,7 @@ def _voc_pairs_in_split(split_dir: Path):
     return pairs, unpaired_images, unpaired_xmls
 
 
-def convert_voc_dataset(input_dir: Path, args, logger):
+def convert_voc_dataset(input_dir: Path, args):
     """Pascal VOC -> YOLO conversion into a *_yolo copy. VOC is detect-only (no polygons/keypoints in XML)."""
     override = getattr(args, "task", "auto")
     if override in ("segment", "pose"):
@@ -3410,11 +3402,11 @@ def resolve_dataset_input(args, logger):
         had_labels = getattr(args, "dataset_had_labels", False)
     else:
         if looks_like_coco(input_dir):
-            yaml_path, task, action = convert_coco_dataset(input_dir, args, logger)
+            yaml_path, task, action = convert_coco_dataset(input_dir, args)
             fmt = "coco"
             task_resolved = True
         elif looks_like_voc(input_dir):
-            yaml_path, task, action = convert_voc_dataset(input_dir, args, logger)
+            yaml_path, task, action = convert_voc_dataset(input_dir, args)
             fmt = "voc"
             task_resolved = True
         else:
@@ -3440,7 +3432,7 @@ def resolve_dataset_input(args, logger):
                 sys.exit(1)
 
     if not task_resolved:
-        task = apply_task_override(task, args, fmt, had_labels)
+        task = apply_task_override(task, args, had_labels)
 
     print(f"\n[Dataset Format]")
     print(f"  format: {fmt}")
@@ -4354,10 +4346,14 @@ def resume_training(args):
                 if resume_task not in ("detect", "segment", "pose"):
                     try:
                         label_dirs = [train_path.parent / "labels"] if train_path is not None else []
-                        resume_task = derive_task_from_yolo_labels(label_dirs, None)[0]
+                        resume_task = derive_task_from_yolo_labels(label_dirs)[0]
                     except Exception:
                         resume_task = "detect"
                 args.dataset_task = resume_task
+                if isinstance(ckpt_task, str) and ckpt_task in ("detect", "segment", "pose") and resume_task != ckpt_task:
+                    print(f"[ERROR] Resume with --input resolves task={resume_task} but checkpoint '{run_name}' trained task={ckpt_task}.")
+                    print("        Task/architecture mismatch: start a new run with a different --name instead of --resume.")
+                    sys.exit(1)
                 ds_fp = dataset_fingerprint(yaml_path, train_path, resume_task)
                 log_dataset(logger, ds_fp)
             except Exception as e:
