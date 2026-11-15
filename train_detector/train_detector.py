@@ -125,6 +125,16 @@ BATCH_LADDER = [2, 4, 8, 16, 32, 64]
 STANDARD_IMGSZ = [320, 416, 512, 640, 768, 1024, 1280, 1536]
 MODEL_QUALITY_ORDER = ["yolo26n.pt", "yolo26m.pt", "yolo26l.pt", "yolo26x.pt"]
 
+# Task-aware model chains (plan: detect / -seg / -pose per size). MODEL_QUALITY_ORDER stays
+# the detect default (and the --probe-vram default list).
+MODEL_TASK_SUFFIXES = {"detect": "", "segment": "-seg", "pose": "-pose"}
+
+
+def model_order_for_task(task: str) -> list:
+    """Quality order n<m<l<x with the task-correct weights suffix."""
+    suffix = MODEL_TASK_SUFFIXES.get(task, "")
+    return [f"yolo26{size}{suffix}.pt" for size in ("n", "m", "l", "x")]
+
 MEMORY_CACHE_PATH = WEIGHTS_DIR / "memory_profiles.json"
 
 
@@ -948,8 +958,9 @@ def hardware_device_fingerprint(device: str) -> dict:
     return fp
 
 
-def dataset_fingerprint(yaml_path: Path, train_path: Path) -> dict:
-    """Content stats of the dataset used for calibration and cache validity."""
+def dataset_fingerprint(yaml_path: Path, train_path: Path, task: str = "detect") -> dict:
+    """Content stats of the dataset used for calibration and cache validity.
+    task makes memory-cache / calibration entries task-specific."""
     with open(yaml_path, encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
 
@@ -987,6 +998,7 @@ def dataset_fingerprint(yaml_path: Path, train_path: Path) -> dict:
 
     return {
         "data_yaml": str(yaml_path).replace("\\", "/"),
+        "task": task if task in ("detect", "segment", "pose") else "detect",
         "image_count": len(files),
         "nc": int(data.get("nc") or 0),
         "median_img_size": int(statistics.median(sizes)) if sizes else None,
@@ -1377,8 +1389,8 @@ def ckpt_completed_epoch(ckpt_path: Path) -> int:
         return 0
 
 
-def _infer_resume_architecture_model(run_dir, ckpt_cfg=None):
-    """Infer architecture .pt name (e.g. yolo26l.pt) for a resume run."""
+def _infer_resume_architecture_model(run_dir, ckpt_cfg=None, task: str = "detect"):
+    """Infer architecture .pt name (e.g. yolo26l.pt) for a resume run; static fallback is task-aware."""
     ckpt_cfg = ckpt_cfg if isinstance(ckpt_cfg, dict) else {}
     model = ckpt_cfg.get("model")
     if isinstance(model, (str, Path)):
@@ -1401,19 +1413,26 @@ def _infer_resume_architecture_model(run_dir, ckpt_cfg=None):
             return Path(yf).stem + ".pt"
     except Exception:
         pass
-    return "yolo26l.pt"
+    return f"yolo26l{MODEL_TASK_SUFFIXES.get(task, '')}.pt"
 
 
 # -- Legacy VRAM estimates (fallback heuristic only) --------------------------------
 
 # VRAM usage estimates per image at 1024px (GB).
 # FLOPs-scaled from prior YOLOv8 measurements using Ultralytics published
-# detect FLOPs (m 68.2/78.9, l 86.4/165.2, x 193.9/257.8). Local probe cache
-# overrides these when present (see load_vram_estimates / probe_vram).
+# detect FLOPs (m 68.2/78.9, l 86.4/165.2, x 193.9/257.8). seg/pose values are
+# conservative placeholders (mask / pose head penalty over detect FLOPs).
+# Local probe cache overrides these when present (see load_vram_estimates / probe_vram).
 VRAM_PER_IMAGE = {
     "yolo26m.pt": 0.52,
     "yolo26l.pt": 0.58,
     "yolo26x.pt": 1.20,
+    "yolo26m-seg.pt": 0.65,
+    "yolo26l-seg.pt": 0.75,
+    "yolo26x-seg.pt": 1.55,
+    "yolo26m-pose.pt": 0.60,
+    "yolo26l-pose.pt": 0.70,
+    "yolo26x-pose.pt": 1.45,
 }
 
 ESTIMATES_PATH = WEIGHTS_DIR / "vram_estimates.json"
@@ -1466,19 +1485,27 @@ def get_vram_per_image(model: str) -> float:
     return float(VRAM_PER_IMAGE.get(model, 1.10))
 
 
-def _write_probe_dataset(root: Path, imgsz: int = 640) -> Path:
+def _write_probe_dataset(root: Path, imgsz: int = 640, task: str = "detect", kpt_count: int = 17) -> Path:
+    """Synthetic single-image probe dataset; task-aware so -seg/-pose weights train against valid labels."""
     img_dir = root / "images"
     lbl_dir = root / "labels"
     img_dir.mkdir(parents=True)
     lbl_dir.mkdir(parents=True)
     img = np.zeros((imgsz, imgsz, 3), dtype=np.uint8)
     cv2.imwrite(str(img_dir / "probe.jpg"), img)
-    (lbl_dir / "probe.txt").write_text("", encoding="utf-8")
+    if task == "pose":
+        k = max(1, int(kpt_count))
+        keypoints = " ".join(f"{0.30 + 0.35 * ((i * 7) % 5) / 4:.2f} {0.35 + 0.30 * ((i * 5) % 4) / 3:.2f} 2"
+                             for i in range(k))
+        (lbl_dir / "probe.txt").write_text(f"0 0.5 0.5 0.4 0.4 {keypoints}\n", encoding="utf-8")
+        yaml_text = (f"train: images\nval: images\nnc: 1\nnames: ['obj']\n"
+                     f"kpt_shape: [{k}, 3]\nflip_idx: {list(range(k))}\n")
+    else:
+        # detect and segment both train fine on an empty label file (segmenter yields zero masks)
+        (lbl_dir / "probe.txt").write_text("", encoding="utf-8")
+        yaml_text = "train: images\nval: images\nnc: 1\nnames: ['obj']\n"
     yaml_path = root / "data.yaml"
-    yaml_path.write_text(
-        "train: images\nval: images\nnc: 1\nnames: ['obj']\n",
-        encoding="utf-8",
-    )
+    yaml_path.write_text(yaml_text, encoding="utf-8")
     return yaml_path
 
 
@@ -1486,10 +1513,12 @@ def probe_model_vram(model_name: str, device: str = "0") -> float:
     """Return measured GB/image @1024 from a tiny synthetic train step @640."""
     weights = resolve_pretrained_weights(model_name)
     model = YOLO(str(weights))
+    mname = Path(model_name).name.lower()
+    probe_task = "pose" if "-pose" in mname else ("segment" if "-seg" in mname else "detect")
     used_batch = 1
     with tempfile.TemporaryDirectory(prefix="yolo_vram_probe_") as tmp:
         tmp_path = Path(tmp)
-        data_yaml = _write_probe_dataset(tmp_path, imgsz=640)
+        data_yaml = _write_probe_dataset(tmp_path, imgsz=640, task=probe_task)
         last_err = None
         for batch in (2, 1):
             try:
@@ -1607,22 +1636,24 @@ def auto_workers_limit():
     return 4
 
 
-def model_candidates(image_count: int, vram_gb, for_cpu: bool) -> list:
-    """Quality-first model chain; smaller models appended as hardware fallbacks."""
+def model_candidates(image_count: int, vram_gb, for_cpu: bool, task: str = "detect") -> list:
+    """Quality-first model chain for the dataset task; smaller models appended as hardware fallbacks."""
+    order = model_order_for_task(task)
+    suffix = MODEL_TASK_SUFFIXES.get(task, "")
     if image_count < 1000:
-        choice = "yolo26m.pt"
+        size = "m"
     elif image_count < 5000:
-        choice = "yolo26l.pt"
+        size = "l"
     else:
-        choice = "yolo26x.pt" if (vram_gb or 0) >= 16 else "yolo26l.pt"
-    idx = MODEL_QUALITY_ORDER.index(choice)
-    cands = [choice] + [m for m in reversed(MODEL_QUALITY_ORDER[:idx])]
+        size = "x" if (vram_gb or 0) >= 16 else "l"
+    choice = f"yolo26{size}{suffix}.pt"
+    idx = order.index(choice)
+    cands = [choice] + [m for m in reversed(order[:idx])]
     if for_cpu:
-        cands = [m for m in cands if m != "yolo26x.pt"]
-        if "yolo26m.pt" not in cands:
-            cands.append("yolo26m.pt")
-        if "yolo26n.pt" not in cands:
-            cands.append("yolo26n.pt")
+        cands = [m for m in cands if "26x" not in m]
+        for fallback in (f"yolo26m{suffix}.pt", f"yolo26n{suffix}.pt"):
+            if fallback not in cands:
+                cands.append(fallback)
     return cands
 
 
@@ -1738,7 +1769,8 @@ def static_candidate_config(args, hw, image_count, native_size, use_gpu):
     """
     profile = MEMORY_PROFILES[args.memory_profile]
     notes = []
-    model_list = [args.model] if args.model else model_candidates(image_count, hw.get("vram_gb"), for_cpu=not use_gpu)
+    model_list = [args.model] if args.model else model_candidates(
+        image_count, hw.get("vram_gb"), for_cpu=not use_gpu, task=getattr(args, "dataset_task", "detect"))
     if args.imgsz is not None:
         imgsz_list = [int(args.imgsz)]
         if native_size and int(args.imgsz) > int(native_size):
@@ -1861,7 +1893,8 @@ def calibrate_training_config(args, logger, cache, hw_fp, hw, device, data_yaml,
                f"probe fraction {fraction:.3f} of {image_count} train images, 1 epoch, save off.")
     print("[Calibration] Running 1-epoch probe runs on a representative dataset subset to find a measured-safe config (probe weights are discarded)...")
 
-    models = [args.model] if args.model else model_candidates(image_count, hw.get("vram_gb"), for_cpu=not use_gpu)
+    models = [args.model] if args.model else model_candidates(
+        image_count, hw.get("vram_gb"), for_cpu=not use_gpu, task=getattr(args, "dataset_task", "detect"))
     if args.imgsz is not None:
         imgszs = [int(args.imgsz)]
         if native_size and int(args.imgsz) > int(native_size):
@@ -3506,7 +3539,7 @@ def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run
     """Return (chosen_cfg dict, provenance) for a resume run."""
     native_size = ds_fp.get("median_img_size")
     # Resolve architecture model for probes/supervisor; actual training still resumes from last.pt.
-    model_name = _infer_resume_architecture_model(run_dir, ckpt_cfg)
+    model_name = _infer_resume_architecture_model(run_dir, ckpt_cfg, task=ds_fp.get("task", "detect"))
 
     imgsz = ckpt_cfg.get("imgsz", 640)
     # cap imgsz to native
@@ -3919,7 +3952,7 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
         try:
             pm = str(probe_model or "")
             if Path(pm).name.lower() in ("last.pt", "best.pt") or "weights" in pm.lower().replace("/", "\\"):
-                probe_model = _infer_resume_architecture_model(run_dir, ckpt_cfg)
+                probe_model = _infer_resume_architecture_model(run_dir, ckpt_cfg, task=ds_fp.get("task", "detect"))
         except Exception:
             pass
         if getattr(args, "no_memory_probe", False):
@@ -4235,21 +4268,31 @@ def resume_training(args):
                 yaml_path = None
         train_path = None
         ds_fp = {}
-        if yaml_path is not None and yaml_path.exists():
-            try:
-                validate_dataset(yaml_path)
-                data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-                train_path = resolve_yaml_split_path(yaml_path, str(data["train"]))
-                ds_fp = dataset_fingerprint(yaml_path, train_path)
-                log_dataset(logger, ds_fp)
-            except Exception as e:
-                logger.log(f"[Resume] dataset fingerprint failed: {e}")
-
         ckpt_cfg = {}
         if isinstance(ckpt_meta, dict):
             ta = ckpt_meta.get("train_args")
             if isinstance(ta, dict):
                 ckpt_cfg = dict(ta)
+        if yaml_path is not None and yaml_path.exists():
+            try:
+                validate_dataset(yaml_path)
+                data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+                train_path = resolve_yaml_split_path(yaml_path, str(data["train"]))
+                resume_task = getattr(args, "dataset_task", None)
+                ckpt_task = ckpt_cfg.get("task")
+                if resume_task not in ("detect", "segment", "pose") and isinstance(ckpt_task, str):
+                    resume_task = ckpt_task
+                if resume_task not in ("detect", "segment", "pose"):
+                    try:
+                        label_dirs = [train_path.parent / "labels"] if train_path is not None else []
+                        resume_task = derive_task_from_yolo_labels(label_dirs, None)[0]
+                    except Exception:
+                        resume_task = "detect"
+                args.dataset_task = resume_task
+                ds_fp = dataset_fingerprint(yaml_path, train_path, resume_task)
+                log_dataset(logger, ds_fp)
+            except Exception as e:
+                logger.log(f"[Resume] dataset fingerprint failed: {e}")
 
         cache = load_memory_cache(logger)
         chosen, prov = calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run_dir)
@@ -4369,7 +4412,7 @@ def train(args):
         validate_dataset(yaml_path)
         data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
         train_path = resolve_yaml_split_path(yaml_path, str(data["train"]))
-        ds_fp = dataset_fingerprint(yaml_path, train_path)
+        ds_fp = dataset_fingerprint(yaml_path, train_path, dataset_task)
         log_dataset(logger, ds_fp)
 
         cache = load_memory_cache(logger)
@@ -4508,6 +4551,29 @@ def run_dry_summary(logger, args, cache, hw, hw_fp, ds_fp, device, run_name, run
 
 # -- Post-Training Validation --------------------------------------------------
 
+def task_metric_lines(model_task, metrics) -> list:
+    """Extra per-task validation metrics to display/log when the metrics object exposes them.
+    The mAP@0.50 box gate stays the pass/fail truth; seg/pose lines are informational."""
+    t = str(model_task or "").strip().lower()
+    out = []
+    if t == "segment":
+        seg = getattr(metrics, "seg", None)
+        if seg is not None:
+            for attr, label in (("map50", "mAP@0.50 (seg)"), ("map", "mAP@0.50:0.95 (seg)")):
+                val = getattr(seg, attr, None)
+                if isinstance(val, (int, float)):
+                    out.append((label, float(val)))
+    elif t == "pose":
+        pose = getattr(metrics, "pose", None)
+        if pose is not None:
+            for attr, label in (("mp", "Pose mP"), ("mr", "Pose mR"),
+                                ("map50", "mAP@0.50 (pose)"), ("map", "mAP@0.50:0.95 (pose)")):
+                val = getattr(pose, attr, None)
+                if isinstance(val, (int, float)):
+                    out.append((label, float(val)))
+    return out
+
+
 def validate(yaml_path: Path, args, run_name: str):
     run_dir = RUNS_DIR / run_name
     best_pt = run_dir / "weights" / "best.pt"
@@ -4538,6 +4604,7 @@ def validate(yaml_path: Path, args, run_name: str):
 
     map50    = metrics.box.map50
     map50_95 = metrics.box.map
+    task_lines = task_metric_lines(getattr(model, "task", None), metrics)
 
     try:
         log_files = sorted((run_dir / "Logs").glob("run-*.log"))
@@ -4546,12 +4613,16 @@ def validate(yaml_path: Path, args, run_name: str):
                 f.write(f"\n[Validation] best.pt at imgsz={val_imgsz} (saved under {run_dir.parent / (run_name + '-val')})\n")
                 f.write(f"  mAP@0.50   = {map50:.4f}\n")
                 f.write(f"  mAP@0.50-95 = {map50_95:.4f}\n")
+                for label, value in task_lines:
+                    f.write(f"  {label} = {value:.4f}\n")
     except OSError:
         pass
 
     print(f"\n[Metrics]")
     print(f"  mAP@0.50       : {map50:.4f}  (target: > 0.80)")
     print(f"  mAP@0.50:0.95  : {map50_95:.4f}")
+    for label, value in task_lines:
+        print(f"  {label:<15}: {value:.4f}")
 
     if map50 >= 0.80:
         print(f"\n  PASS -- model meets target accuracy (mAP@0.50 >= 0.80)")
