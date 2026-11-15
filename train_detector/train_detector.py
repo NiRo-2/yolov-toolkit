@@ -89,6 +89,8 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 from ultralytics.models.yolo.detect.train import DetectionTrainer
+from ultralytics.models.yolo.segment.train import SegmentationTrainer
+from ultralytics.models.yolo.pose.train import PoseTrainer
 
 try:
     import psutil
@@ -869,10 +871,10 @@ def make_guard(logger, hw, device, args, guard_enabled=True) -> MemoryGuard:
                        args.memory_profile, guard_enabled)
 
 
-# -- Guarded trainer subclass ----------------------------------------------------
-class GuardedDetectionTrainer(DetectionTrainer):
+# -- Guarded trainer subclasses ----------------------------------------------------
+class GuardedTrainerMixin:
     """
-    DetectionTrainer subclass that:
+    Memory-guard plumbing layered onto a task-specific Ultralytics trainer:
       - forces unsafe checkpoint settings to safe ones on resume (check_resume override)
       - rewrites args.yaml with the forced values after base __init__
       - allows an AttemptTracker to attach callbacks
@@ -922,6 +924,50 @@ class GuardedDetectionTrainer(DetectionTrainer):
         except Exception as e:
             if self._logger is not None:
                 self._logger.log(f"[GuardedTrainer] _rewrite_args_yaml error: {e}")
+
+
+class GuardedDetectionTrainer(GuardedTrainerMixin, DetectionTrainer):
+    """Detect trainer + guard plumbing."""
+
+
+class GuardedSegmentTrainer(GuardedTrainerMixin, SegmentationTrainer):
+    """Segment trainer + guard plumbing (YOLO26 -seg weights need this trainer class)."""
+
+
+class GuardedPoseTrainer(GuardedTrainerMixin, PoseTrainer):
+    """Pose trainer + guard plumbing (YOLO26 -pose weights need this trainer class)."""
+
+
+GUARDED_TRAINERS = {
+    "detect": GuardedDetectionTrainer,
+    "segment": GuardedSegmentTrainer,
+    "pose": GuardedPoseTrainer,
+}
+
+
+def guarded_trainer_for_task(task):
+    """Task-correct guarded trainer class. Ultralytics must train -seg/-pose weights with
+    SegmentationTrainer/PoseTrainer: the detect trainer produces tuple predictions that
+    crash its own val NMS."""
+    return GUARDED_TRAINERS.get(task, GuardedDetectionTrainer)
+
+
+def resolve_attempt_task(args, ckpt_cfg=None, chosen=None) -> str:
+    """Best-effort task for a supervised attempt: resolved dataset task -> checkpoint train_args
+    -> model-name suffix (-pose wins over -seg) -> detect."""
+    t = getattr(args, "dataset_task", None)
+    if t in GUARDED_TRAINERS:
+        return t
+    if isinstance(ckpt_cfg, dict):
+        ct = ckpt_cfg.get("task")
+        if ct in GUARDED_TRAINERS:
+            return ct
+    model_name = str((chosen or {}).get("model") or "").lower()
+    if "-pose" in model_name:
+        return "pose"
+    if "-seg" in model_name:
+        return "segment"
+    return "detect"
 
 
 # -- Fingerprints ------------------------------------------------------------------
@@ -3684,7 +3730,7 @@ def run_attempt(args, logger, run_dir, last_pt, chosen, target_epochs, device, g
         write_adaptive_state(run_dir, state)
         return tracker
 
-    # Build forced_args for GuardedDetectionTrainer
+    # Build forced_args for the guarded trainer
     # Determine optimizer to force for consistency across attempts
     opt_name = "MuSGD"
     if resume_pt is not None and Path(resume_pt).is_file():
@@ -3745,8 +3791,10 @@ def run_attempt(args, logger, run_dir, last_pt, chosen, target_epochs, device, g
     if attempt_epochs < 1:
         attempt_epochs = 1
 
-    # build trainer via partial
-    trainer_cls = functools.partial(GuardedDetectionTrainer, forced_args=forced_args, tracker=tracker, logger=logger)
+    # build trainer via partial (task-correct: -seg/-pose weights need SegmentationTrainer/PoseTrainer;
+    # the detect trainer on seg/pose models crashes its own val NMS with tuple predictions)
+    attempt_task = resolve_attempt_task(args, ckpt_cfg, chosen)
+    trainer_cls = functools.partial(guarded_trainer_for_task(attempt_task), forced_args=forced_args, tracker=tracker, logger=logger)
 
     # callbacks
     cb_map = tracker.callbacks()
@@ -3811,7 +3859,7 @@ def run_attempt(args, logger, run_dir, last_pt, chosen, target_epochs, device, g
             for fn in fns:
                 model.add_callback(ev, fn)
 
-        logger.log(f"[Attempt {attempt_no}] starting: resume={resume_pt is not None} epochs={train_kwargs.get('epochs')} batch={chosen['batch']} imgsz={chosen['imgsz']}")
+        logger.log(f"[Attempt {attempt_no}] starting: task={attempt_task} trainer={guarded_trainer_for_task(attempt_task).__name__} resume={resume_pt is not None} epochs={train_kwargs.get('epochs')} batch={chosen['batch']} imgsz={chosen['imgsz']}")
         try:
             model.train(trainer=trainer_cls, **train_kwargs)
         except KeyboardInterrupt:
