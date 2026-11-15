@@ -3014,6 +3014,7 @@ def convert_coco_dataset(input_dir: Path, args, logger):
     else:
         out_dir = input_dir.parent / f"{input_dir.name}{CONVERSION_DIR_SUFFIX}"
 
+    _validate_converted_dir(input_dir, out_dir)
     fp = _coco_source_fingerprint(input_dir, out_dir)
     fp_id = fingerprint_hash(fp)
     manifest_path = out_dir / CONVERSION_MANIFEST_NAME
@@ -3138,6 +3139,25 @@ def convert_coco_dataset(input_dir: Path, args, logger):
 
 # -- Conversion Manifest Gate ------------------------------------------------------
 
+def _validate_converted_dir(input_dir: Path, out_dir: Path) -> None:
+    """Hard-error when --converted-dir overlaps the input dataset: a conversion rebuild
+    (wipe) must never be able to delete the user's raw source images/annotations."""
+    in_abs = input_dir.resolve()
+    out_abs = out_dir.resolve()
+    if out_abs == in_abs:
+        print(f"[ERROR] --converted-dir points at the input dataset itself: {out_abs}")
+        print("        Use a separate output location (or omit --converted-dir for the default sibling copy).")
+        sys.exit(1)
+    if out_abs in in_abs.parents:
+        print(f"[ERROR] --converted-dir ({out_abs}) is inside the input dataset ({in_abs});")
+        print("        conversion output would live inside its own source.")
+        sys.exit(1)
+    if in_abs in out_abs.parents:
+        print(f"[ERROR] --converted-dir ({out_abs}) contains the input dataset ({in_abs});")
+        print("        a conversion rebuild could wipe the source dataset.")
+        sys.exit(1)
+
+
 def _conversion_reuse_gate(out_dir: Path, fp_id: str, fmt: str, task: str) -> str:
     """Manifest-driven reuse rules (decision 3). Returns 'reuse' or 'convert' (after wiping our own old output).
 
@@ -3152,8 +3172,8 @@ def _conversion_reuse_gate(out_dir: Path, fp_id: str, fmt: str, task: str) -> st
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 manifest = None
-        if manifest is None:
-            print(f"[ERROR] {out_dir} already exists but is not a conversion created by this tool (no {CONVERSION_MANIFEST_NAME}).")
+        if manifest is None or not isinstance(manifest, dict):
+            print(f"[ERROR] {out_dir} already exists but is not a conversion created by this tool (no usable {CONVERSION_MANIFEST_NAME}).")
             print("        It will not be modified or deleted: pass --converted-dir <fresh location>, or move/remove the existing folder.")
             sys.exit(1)
         reusable = (isinstance(manifest, dict) and manifest.get("format") == fmt
@@ -3284,6 +3304,7 @@ def convert_voc_dataset(input_dir: Path, args, logger):
     else:
         out_dir = input_dir.parent / f"{input_dir.name}{CONVERSION_DIR_SUFFIX}"
 
+    _validate_converted_dir(input_dir, out_dir)
     fp = _coco_source_fingerprint(input_dir, out_dir)
     fp_id = fingerprint_hash(fp)
     action = _conversion_reuse_gate(out_dir, fp_id, "voc", "detect")
