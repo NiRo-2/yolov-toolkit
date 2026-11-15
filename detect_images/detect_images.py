@@ -32,6 +32,16 @@ batched together in a single model call; tiles from different source images
 are never batched together. Detections from all tiles of one image are merged
 with class-wise NMS. Pass --no-tiles to restore whole-image inference.
 
+The detection task (detect/segment/pose) comes from the loaded model
+(YOLO.model.task), not a CLI flag. Segment models add polygon contours per
+detection; on tiled runs, mask fragments of one object spanning several tiles
+are chained transitively by box IoU (union-find) and composited into a single
+whole polygon. Pose models add keypoints; across a merged tile group each
+keypoint index takes the highest-visibility candidate within its member tile
+extent. JSON exports gain polygons_px/polygons_norm (segment) and
+keypoints_px/keypoints_norm (pose); all existing box fields stay unchanged for
+every task.
+
 When recursive scanning finds images in subfolders, outputs are still written
 flat under detect_images/detections/<input_folder_name>/. Files in subfolders are renamed by
 prepending the relative subpath joined with underscores
@@ -60,9 +70,11 @@ import shutil
 import subprocess
 import sys
 import threading
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional, Tuple
 import cv2
+import numpy as np
 from pathlib import Path
 from ultralytics import YOLO  # type: ignore[union-attr]
 from PIL import Image, ExifTags
@@ -109,6 +121,11 @@ FONT_THICKNESS  = 2
 LABEL_BG_COLOR  = (0, 200, 0)      # green background
 LABEL_TX_COLOR  = (0, 0, 0)        # black text
 LABEL_PADDING   = 4
+
+# Segment mask overlay and pose keypoint style
+MASK_ALPHA      = 0.35             # semi-transparent fill over the mask polygon
+KEYPOINT_COLOR  = (0, 0, 255)      # red keypoints
+KEYPOINT_RADIUS = 4
 
 
 # -- Path Normalization --------------------------------------------------------
@@ -260,28 +277,218 @@ def resolve_batch(value) -> Tuple[int, str]:
 
 # -- Drawing -------------------------------------------------------------------
 
-def results_to_dets(result, x_offset: float = 0.0, y_offset: float = 0.0) -> list:
-    """Adapt one ultralytics Results object's boxes into a flat det-dict list.
+def _to_numpy(t):
+    """Return a numpy array from a torch tensor or array-like."""
+    if hasattr(t, "cpu"):
+        return t.cpu().numpy()
+    return np.asarray(t)
 
-    Each det dict: {"cls": int, "conf": float, "x1": float, "y1": float,
+
+def _result_polygons(result) -> list:
+    """Per-box polygon contours (source-image pixel coords) from result.masks.
+
+    Masks are resized to the result's native shape, binarized, and reduced to
+    the largest external contour via cv2.findContours (one polygon per box).
+    """
+    masks = getattr(result, "masks", None)
+    if masks is None or getattr(masks, "data", None) is None:
+        return []
+    orig_shape = getattr(result, "orig_shape", None)
+    polygons = []
+    for mask in masks.data:
+        arr = _to_numpy(mask)
+        if orig_shape is not None and arr.shape[:2] != tuple(orig_shape):
+            arr = cv2.resize(arr, (orig_shape[1], orig_shape[0]), interpolation=cv2.INTER_LINEAR)
+        binary = (arr > 0.5).astype(np.uint8)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            biggest = max(contours, key=cv2.contourArea)
+            polygons.append([(float(px), float(py)) for px, py in biggest.reshape(-1, 2)])
+        else:
+            polygons.append([])
+    return polygons
+
+
+def _result_keypoints(result) -> list:
+    """Per-box keypoint lists [[x, y, visibility], ...] in native image coords."""
+    keypoints_obj = getattr(result, "keypoints", None)
+    if keypoints_obj is None or getattr(keypoints_obj, "data", None) is None:
+        return []
+    out = []
+    for kp in keypoints_obj.data:
+        out.append([[float(x), float(y), float(vis)] for x, y, vis in _to_numpy(kp)])
+    return out
+
+
+def results_to_dets(result, x_offset: float = 0.0, y_offset: float = 0.0, task: str = "detect") -> list:
+    """Adapt one ultralytics Results object into a flat det-dict list for its task.
+
+    Base dict (every task): {"cls": int, "conf": float, "x1": float, "y1": float,
     "x2": float, "y2": float}. Coordinates are offset into source-image space
     (used when the Results came from a tile crop rather than the full image).
+    Segment dets additionally carry "polygon": [(x, y), ...]; pose dets carry
+    "keypoints": [[x, y, vis], ...]. Detect dets are byte-identical to the
+    historical 5-field behavior.
     """
+    polygons = _result_polygons(result) if task == "segment" else []
+    keypoints = _result_keypoints(result) if task == "pose" else []
     dets = []
-    for box in result.boxes:
+    for i, box in enumerate(result.boxes):
         x1, y1, x2, y2 = map(float, box.xyxy[0])
-        dets.append({
+        det = {
             "cls": int(box.cls[0]),
             "conf": float(box.conf[0]),
             "x1": x1 + x_offset,
             "y1": y1 + y_offset,
             "x2": x2 + x_offset,
             "y2": y2 + y_offset,
-        })
+        }
+        if task == "segment":
+            det["polygon"] = [(px + x_offset, py + y_offset) for px, py in polygons[i]] if i < len(polygons) else []
+        elif task == "pose":
+            det["keypoints"] = [
+                [kx + x_offset, ky + y_offset, vis] for kx, ky, vis in keypoints[i]
+            ] if i < len(keypoints) else []
+        dets.append(det)
     return dets
 
 
-def detect_image_tiled(model, image_bgr, conf, tile, overlap, iou, batch_size=1) -> list:
+def _boxes_iou(first: dict, second: dict) -> float:
+    inter_w = max(0.0, min(first["x2"], second["x2"]) - max(first["x1"], second["x1"]))
+    inter_h = max(0.0, min(first["y2"], second["y2"]) - max(first["y1"], second["y1"]))
+    intersection = inter_w * inter_h
+    first_area = max(0.0, first["x2"] - first["x1"]) * max(0.0, first["y2"] - first["y1"])
+    second_area = max(0.0, second["x2"] - second["x1"]) * max(0.0, second["y2"] - second["y1"])
+    union = first_area + second_area - intersection
+    return intersection / union if union else 0.0
+
+
+def group_by_iou(dets: list, iou_thresh: float) -> list:
+    """Group detections per class by box IoU, chained transitively via union-find.
+
+    An object spanning three or more tiles merges even when its outer tiles'
+    boxes don't overlap directly, as long as each neighbor pair crosses the
+    threshold. Groups never mix classes.
+    """
+    parent = list(range(len(dets)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    by_class = defaultdict(list)
+    for i, det in enumerate(dets):
+        by_class[det["cls"]].append(i)
+    for indices in by_class.values():
+        for a_pos in range(len(indices)):
+            for b_pos in range(a_pos + 1, len(indices)):
+                ia, ib = indices[a_pos], indices[b_pos]
+                if _boxes_iou(dets[ia], dets[ib]) >= iou_thresh:
+                    ra, rb = find(ia), find(ib)
+                    if ra != rb:
+                        parent[rb] = ra
+
+    grouped = defaultdict(list)
+    for i, det in enumerate(dets):
+        grouped[find(i)].append(det)
+    return list(grouped.values())
+
+
+def _merge_mask_group(group: list) -> dict:
+    """Composite a group of tile mask fragments into one whole-polygon detection.
+
+    Member polygons are OR-filled onto a canvas covering only the group's union
+    bbox; cv2.findContours on the composite yields the merged polygon (no slice
+    seam). Box = union bbox, conf = max.
+    """
+    ux1 = min(d["x1"] for d in group)
+    uy1 = min(d["y1"] for d in group)
+    ux2 = max(d["x2"] for d in group)
+    uy2 = max(d["y2"] for d in group)
+    canvas_w = max(1, int(round(ux2 - ux1)))
+    canvas_h = max(1, int(round(uy2 - uy1)))
+    canvas = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+    drew_any = False
+    for det in group:
+        points = np.array(
+            [[int(round(px - ux1)), int(round(py - uy1))] for px, py in det.get("polygon", [])],
+            dtype=np.int32,
+        )
+        if len(points) >= 3:
+            cv2.fillPoly(canvas, [points], 1)
+            drew_any = True
+    polygon: list = []
+    if drew_any:
+        contours, _ = cv2.findContours(canvas, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            biggest = max(contours, key=cv2.contourArea)
+            polygon = [(float(px + ux1), float(py + uy1)) for px, py in biggest.reshape(-1, 2)]
+    if not polygon:
+        fallback = max(group, key=lambda d: len(d.get("polygon", [])))
+        polygon = list(fallback.get("polygon", []))
+    return {
+        "cls": group[0]["cls"],
+        "conf": max(d["conf"] for d in group),
+        "x1": ux1, "y1": uy1, "x2": ux2, "y2": uy2,
+        "polygon": polygon,
+    }
+
+
+def _merge_keypoint_group(group: list) -> dict:
+    """Merge a tile group's keypoints by per-index visibility voting.
+
+    A candidate counts only if its coordinates fall inside the member tile's
+    extent; the surviving highest-visibility candidate wins. Indices with no
+    valid candidate are kept as [0, 0, 0]. Box = union bbox, conf = max.
+    """
+    ux1 = min(d["x1"] for d in group)
+    uy1 = min(d["y1"] for d in group)
+    ux2 = max(d["x2"] for d in group)
+    uy2 = max(d["y2"] for d in group)
+    k_count = max((len(d.get("keypoints", [])) for d in group), default=0)
+    merged_keypoints = []
+    for k in range(k_count):
+        best = None
+        for det in group:
+            kps = det.get("keypoints", [])
+            if k >= len(kps):
+                continue
+            x, y, vis = kps[k]
+            tile = det.get("tile")
+            if tile is not None:
+                tx1, ty1, tx2, ty2 = tile
+                if x < tx1 - 1e-6 or x > tx2 + 1e-6 or y < ty1 - 1e-6 or y > ty2 + 1e-6:
+                    continue
+            if best is None or vis > best[2]:
+                best = [x, y, vis]
+        merged_keypoints.append(best if best is not None else [0.0, 0.0, 0.0])
+    return {
+        "cls": group[0]["cls"],
+        "conf": max(d["conf"] for d in group),
+        "x1": ux1, "y1": uy1, "x2": ux2, "y2": uy2,
+        "keypoints": merged_keypoints,
+    }
+
+
+def merge_grouped_dets(dets: list, iou_thresh: float, task: str) -> list:
+    """Merge a tiled image's segment/pose detections (union-find grouping + compositing).
+
+    Single-member groups pass through unchanged (no canvas compositing).
+    """
+    merged = []
+    for group in group_by_iou(dets, iou_thresh):
+        if len(group) == 1:
+            merged.append(group[0])
+        elif task == "segment":
+            merged.append(_merge_mask_group(group))
+        else:
+            merged.append(_merge_keypoint_group(group))
+    return merged
+
+
+def detect_image_tiled(model, image_bgr, conf, tile, overlap, iou, batch_size=1, task: str = "detect") -> list:
     """Run tiled detection over one image; returns a flat list of det dicts.
 
     Crops all tile windows for this image and runs them through the model in
@@ -290,8 +497,10 @@ def detect_image_tiled(model, image_bgr, conf, tile, overlap, iou, batch_size=1)
     explicitly so Ultralytics runs inference at the tile's native size
     instead of silently resizing crops to its default 640. When the image
     fits within one tile, `iter_tile_windows` returns a single whole-image
-    window, so this is equivalent to whole-image inference. Detections from
-    multiple tiles are merged with class-wise NMS.
+    window, so this is equivalent to whole-image inference. Detect dets from
+    multiple tiles are merged with class-wise NMS; segment and pose dets are
+    merged with transitive IoU chaining (`group_by_iou`) plus mask compositing
+    or keypoint voting, and carry their per-tile extent in "tile".
     """
     h, w = image_bgr.shape[:2]
     windows = iter_tile_windows(w, h, tile, overlap)
@@ -304,11 +513,17 @@ def detect_image_tiled(model, image_bgr, conf, tile, overlap, iou, batch_size=1)
 
     all_dets = []
     for (tx1, ty1, tx2, ty2), result in zip(windows, tile_results):
-        all_dets.extend(results_to_dets(result, x_offset=tx1, y_offset=ty1))
+        dets = results_to_dets(result, x_offset=tx1, y_offset=ty1, task=task)
+        if task != "detect":
+            for det in dets:
+                det["tile"] = (tx1, ty1, tx2, ty2)
+        all_dets.extend(dets)
 
     if len(windows) == 1:
         return all_dets
-    return nms_xyxy(all_dets, iou_thresh=iou)
+    if task == "detect":
+        return nms_xyxy(all_dets, iou_thresh=iou)
+    return merge_grouped_dets(all_dets, iou, task)
 
 
 def export_json(img_array, dets, class_names):
@@ -336,6 +551,14 @@ def export_json(img_array, dets, class_names):
             "confidence": round(conf, 4),
             "pixel": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
             "yolo": {"cx": round(yolo_cx, 6), "cy": round(yolo_cy, 6), "bw": round(yolo_bw, 6), "bh": round(yolo_bh, 6)},
+            **({
+                "polygons_px": [[int(round(px)), int(round(py))] for px, py in det["polygon"]],
+                "polygons_norm": [[round(px / w, 6), round(py / h, 6)] for px, py in det["polygon"]],
+            } if det.get("polygon") is not None else {}),
+            **({
+                "keypoints_px": [[round(kx, 2), round(ky, 2), round(vis, 4)] for kx, ky, vis in det["keypoints"]],
+                "keypoints_norm": [[round(kx / w, 6), round(ky / h, 6), round(vis, 4)] for kx, ky, vis in det["keypoints"]],
+            } if det.get("keypoints") is not None else {}),
         })
     return items
 
@@ -370,16 +593,41 @@ def extract_image_metadata(img_path: Path, exiftool_cmd) -> Tuple[Dict, str]:
         return {}, "none"
 
 
-def draw_detections(image, dets, class_names):
-    """Draw bounding boxes and confidence labels on image.
+def _draw_mask_overlay(image, polygon, x1: int, y1: int, x2: int, y2: int) -> None:
+    """Blend a semi-transparent colored mask for a polygon over its box region."""
+    h, w = image.shape[:2]
+    rx1, ry1 = max(0, min(x1, w - 1)), max(0, min(y1, h - 1))
+    rx2, ry2 = max(0, min(x2, w - 1)), max(0, min(y2, h - 1))
+    if rx2 <= rx1 or ry2 <= ry1:
+        return
+    region = image[ry1:ry2 + 1, rx1:rx2 + 1]
+    mask = np.zeros(region.shape[:2], dtype=np.uint8)
+    points = np.array([[int(px - rx1), int(py - ry1)] for px, py in polygon], dtype=np.int32)
+    if len(points) < 3:
+        return
+    cv2.fillPoly(mask, [points], 1)
+    colored = np.zeros_like(region)
+    colored[mask == 1] = BOX_COLOR
+    image[ry1:ry2 + 1, rx1:rx2 + 1] = cv2.addWeighted(region, 1.0, colored, MASK_ALPHA, 0)
 
-    dets: list of {"cls": int, "conf": float, "x1"/"y1"/"x2"/"y2": float}.
+
+def draw_detections(image, dets, class_names):
+    """Draw detections: boxes + labels; semi-transparent mask fills for segment
+    dets and keypoint circles for pose dets. Detect rendering is unchanged.
+
+    dets: list of {"cls": int, "conf": float, "x1"/"y1"/"x2"/"y2": float,
+    optionally "polygon": [(x, y), ...] or "keypoints": [[x, y, vis], ...]}.
     """
     for det in dets:
         x1, y1, x2, y2 = int(det["x1"]), int(det["y1"]), int(det["x2"]), int(det["y2"])
         conf            = det["conf"]
         cls_id          = det["cls"]
         cls_name        = class_names[cls_id]
+
+        # Segment mask overlay first, so the box and label stay on top
+        polygon = det.get("polygon")
+        if polygon:
+            _draw_mask_overlay(image, polygon, x1, y1, x2, y2)
 
         # Draw bounding box
         cv2.rectangle(image, (x1, y1), (x2, y2), BOX_COLOR, BOX_THICKNESS)
@@ -406,6 +654,11 @@ def draw_detections(image, dets, class_names):
             (x1 + LABEL_PADDING, label_y - LABEL_PADDING),
             FONT, FONT_SCALE, LABEL_TX_COLOR, FONT_THICKNESS
         )
+
+        # Pose keypoints (drawn last so they stay visible over box/label)
+        for kx, ky, vis in det.get("keypoints", []):
+            if vis > 0:
+                cv2.circle(image, (int(round(kx)), int(round(ky))), KEYPOINT_RADIUS, KEYPOINT_COLOR, -1)
 
     return image
 
@@ -557,6 +810,8 @@ def run(args):
     # Load model
     model = YOLO(str(model_path))
     class_names = model.names
+    model_task = getattr(model, "task", None) or "detect"
+    print(f"  task       : {model_task}")
 
     # Shared, thread-safe state mutated from worker threads.
     state = {
@@ -749,6 +1004,7 @@ def run(args):
                         model, im, args.conf,
                         args.tile_imgsz, args.tile_overlap, args.tile_iou,
                         batch_size,
+                        task=model_task,
                     )
                     pool.submit(post_process, idx, p, im, dets, flat_name, display_name)
             else:
@@ -756,7 +1012,7 @@ def run(args):
                 results_list = list(model(images_for_model, conf=args.conf, verbose=False))
 
                 for (idx, p, im, flat_name, display_name), r in zip(valid, results_list):
-                    dets = results_to_dets(r)
+                    dets = results_to_dets(r, task=model_task)
                     pool.submit(post_process, idx, p, im, dets, flat_name, display_name)
     # ThreadPoolExecutor.__exit__ waits for all submitted tasks to complete.
 
