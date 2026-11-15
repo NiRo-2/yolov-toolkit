@@ -411,6 +411,20 @@ python train_detector/train_detector.py --resume
 | `--patience` | `100` | Early stopping patience |
 | `--device` | `0` | `0` for GPU, `cpu` for CPU |
 | `--probe-vram` | off | Measure or refresh local VRAM estimates; exits when `--input` is omitted |
+| `--fix-label-structure` | off | Repair a segment dataset that mixes a few bbox-only labels into polygons in place (`.label_repair_backup/` + `.label_repair_manifest.json`); refused unless `segment` dominates every split at ≥95% |
+
+### Mixed annotation types
+
+Ultralytics reads YOLO label files **line-by-line, per-annotation**, so a `Segmentation`-configured run (e.g. a `-seg` checkpoint) that hits a bbox-only line parses it as `class + 4 scalars` in a segment tensor and **silently drops every polygon in the dataset**. `train_detector.py` therefore refuses mixed-structure datasets outright at validation rather than train a broken segmenter.
+
+When a dataset is segment-dominant but a small bbox-only minority slipped in (common with Roboflow exports that mix rectangle and polygon tools), `--fix-label-structure` expands each 5-field bbox line into its exact 4-corner polygon ring in place:
+
+- Originals are preserved under `<dataset>/.label_repair_backup/` (the first original wins on repeat runs) and every change is recorded in `<dataset>/.label_repair_manifest.json`.
+- The repair is refused unless `segment` is both ≥95% of all label lines **and** a strict majority within every non-empty split; any unparseable line, foreign same-named artifact, or a `.bak` that no longer matches its recorded hash aborts the run and restores every touched file.
+- Repaired runs delete the stale `<split>/labels.cache` so Ultralytics re-indexes the new polygons, then re-scan strictly (post-repair the dataset must be 100% segment) before training.
+- Coordinates use exact decimal math (no binary-float drift) and shortest round-trip formatting, so untouched values keep their original precision.
+
+**Repair the source before tiling:** run `--fix-label-structure` on the original dataset, then run `tile_yolo_dataset.py` on the repaired output — tiling clips polygons correctly, but only once every label line is already a polygon.
 
 ### Auto-configuration
 
@@ -693,6 +707,7 @@ Both `vlm_yolo_prep.py` and `voc_to_yolo.py` generate this file automatically. [
 - **OOM crash during training?** Add `--batch 8` or `--batch 4` to override the auto-calculated batch size. With `nbs=64`, batch 4 still yields an effective batch of 64 via gradient accumulation.
 - **PC crashed mid-training?** Run with `--resume` — picks up from the last saved epoch automatically.
 - **Specific variants not detected?** (e.g. rusted bolts, painted-over screws) Collect photos of those specific types and add them to the dataset.
+- **Roboflow export mixes rectangles and polygons?** `train_detector.py` refuses mixed-structure labels (Ultralytics would silently drop every segment). Use `--fix-label-structure` to normalise the bbox-only lines to polygons first, then tile.
 
 ---
 

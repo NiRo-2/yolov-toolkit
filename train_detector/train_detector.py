@@ -39,7 +39,12 @@ Usage:
     --task    auto|detect|segment|pose  override the auto-derived annotation task (default: auto)
     --converted-dir  override output location for COCO/VOC -> YOLO conversion (default: <dataset>_yolo sibling)
     --yes     accept auto-detection writes into the dataset folder (synthesized data.yaml,
-              added kpt_shape) without an interactive [y/N] prompt
+              added kpt_shape, label-structure repair) without an interactive [y/N] prompt
+    --fix-label-structure
+              normalise a segment dataset that mixes a few 5-field bbox-only label lines
+              into polygons in place (originals kept under <dataset>/.label_repair_backup/,
+              audit in <dataset>/.label_repair_manifest.json); refused unless segment
+              dominates every split at >=95% of label lines. Run before tiling.
     --model   override auto-selected model (yolo26n/m/l/x, -seg, -pose)
     --batch   override auto-calculated batch size
     --workers override auto-calculated worker count
@@ -82,6 +87,7 @@ import time
 import traceback
 import yaml
 from datetime import datetime
+from fractions import Fraction
 from pathlib import Path
 
 import cv2
@@ -2101,7 +2107,11 @@ def parse_args():
     )
     parser.add_argument(
         "--yes", action="store_true",
-        help="Accept auto-detection writes into the dataset folder (synthesized data.yaml, added kpt_shape) without prompting.",
+        help="Accept auto-detection writes into the dataset folder (synthesized data.yaml, added kpt_shape, label-structure repair) without prompting.",
+    )
+    parser.add_argument(
+        "--fix-label-structure", action="store_true",
+        help="Repair a segment dataset that mixes a few 5-field bbox-only label lines into polygons in place (backup + manifest under the dataset folder); refused unless segment dominates every split at >=95% of label lines. Applies the repair without a [y/N] prompt.",
     )
     parser.add_argument(
         "--resume", action="store_true",
@@ -2552,6 +2562,22 @@ def _label_dirs_for_yaml(yaml_path: Path, data: dict):
     return dirs
 
 
+def _label_dirs_with_roles(yaml_path: Path, data: dict):
+    """Same split->label-dir resolution as _label_dirs_for_yaml, but each dir is tagged with its role."""
+    pairs = []
+    for key in ("train", "val", "test"):
+        v = data.get(key)
+        if not v:
+            continue
+        try:
+            sp = resolve_yaml_split_path(yaml_path, str(v))
+        except Exception:
+            continue
+        ld = sp.parent / "labels"
+        pairs.append((key, ld if ld.is_dir() else sp))
+    return pairs
+
+
 def derive_task_from_yolo_labels(label_dirs):
     """Derive (task, kpt_count, max_class_id, had_labels) from uniform YOLO labels; hard-fail on mixed."""
     tasks, ksets, bad, max_class, n_files = scan_yolo_labels(label_dirs)
@@ -2591,7 +2617,8 @@ def _resolve_passthrough_yaml(yaml_files, args, logger):
     """data.yaml already present: pass through, derive task from label structure, offer pose kpt_shape auto-fix."""
     data_yaml = next((p for p in yaml_files if p.name.lower() == "data.yaml"), yaml_files[0])
     data = yaml.safe_load(data_yaml.read_text(encoding="utf-8")) or {}
-    task, k_derived, max_class, had = derive_task_from_yolo_labels(_label_dirs_for_yaml(data_yaml, data))
+    task, k_derived, max_class, had = derive_task_with_repair(
+        _label_dirs_with_roles(data_yaml, data), data_yaml.parent, args, logger)
     kpt = data.get("kpt_shape")
     if task == "pose":
         if kpt is None:
@@ -2631,13 +2658,13 @@ def _try_synthesize_yaml(input_dir: Path, args, logger):
     if "train" not in images_by_split or "val" not in images_by_split:
         return None
 
-    label_dirs = []
+    role_pairs = []
     for role in ("train", "val", "test"):
         if role not in split_dirs:
             continue
         ld = split_dirs[role] / "labels"
-        label_dirs.append(ld if ld.is_dir() else images_by_split[role])
-    task, k, max_class, had = derive_task_from_yolo_labels(label_dirs)
+        role_pairs.append((role, ld if ld.is_dir() else images_by_split.get(role, split_dirs[role])))
+    task, k, max_class, had = derive_task_with_repair(role_pairs, input_dir, args, logger)
 
     names = None
     for fname in ("classes.txt", "labels.txt"):
@@ -2694,6 +2721,586 @@ def apply_task_override(derived, args, had_labels):
     print(f"[ERROR] Dataset label structure is '{derived}' but --task {override} was requested.")
     print("        YOLO labels are used as-is (no relabeling): drop --task or provide labels of the requested structure.")
     sys.exit(1)
+
+
+# -- Mixed-Label Structure Repair ---------------------------------------------------
+# A segment dataset may contain a tiny minority of 5-field bbox-only lines that Roboflow
+# left as rectangles. Ultralytics silently drops EVERY polygon when box/segment counts
+# differ (ultralytics/data/dataset.py mixed-dataset branch), so the toolkit hard-rejects
+# mixed structures. This opt-in repair normalises only the bbox minority into exact 4-vertex
+# polygons, in place, with backups and an audit manifest. Strict scanning stays intact;
+# repair is additive and only entered when a live minority exists. Repair the source dataset
+# before tiling (tile_yolo_dataset propagates mixes rather than rejecting them).
+
+LABEL_REPAIR_MANIFEST_NAME = ".label_repair_manifest.json"
+LABEL_REPAIR_BACKUP_DIRNAME = ".label_repair_backup"
+LABEL_REPAIR_FORMAT = "label_repair"
+LABEL_REPAIR_VERSION = 1
+LABEL_REPAIR_MIN_RATIO = 0.95
+
+
+class _LabelRepairAbort(Exception):
+    """Raised when a repair write must be aborted and already-written files rolled back."""
+
+
+def _fmt_coord(v: float) -> str:
+    """Round-trip-exact number text matching the export style (whole numbers as 1/0)."""
+    s = repr(v)
+    if "e" in s or "E" in s:
+        s = f"{v:.17f}".rstrip("0")
+        if s.endswith("."):
+            s = s[:-1]
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
+
+
+def _to_fraction(value) -> Fraction:
+    """Parse a coordinate token into an exact decimal Fraction (binary float noise avoided)."""
+    if isinstance(value, Fraction):
+        return value
+    if isinstance(value, str):
+        return Fraction(value)
+    return Fraction(repr(float(value)))
+
+
+def bbox_line_to_polygon(cls, cx, cy, w, h):
+    """Expand one bbox line into a 4-vertex ring, clamped to [0,1]. Returns a dict.
+
+    Arithmetic is exact decimal (Fraction) so coordinates survive round-trip: cx - w/2 done in
+    binary floats would produce values like 0.30976562500000004 that corrupt the export precision.
+    vertices order x1,y1 -> x2,y1 -> x2,y2 -> x1,y2 so the 9-token line re-reads as segment.
+    zero_area True when clamping collapses the box (x1==x2 or y1==y2) -> the line should drop.
+    Returned coords are floats (nearest double to each exact coordinate).
+    """
+    cx, cy, w, h = _to_fraction(cx), _to_fraction(cy), _to_fraction(w), _to_fraction(h)
+    half_w = w / 2
+    half_h = h / 2
+    x1 = cx - half_w
+    y1 = cy - half_h
+    x2 = cx + half_w
+    y2 = cy + half_h
+    zero = Fraction(0)
+    one = Fraction(1)
+    clamped = False
+
+    def clamp(val: Fraction) -> Fraction:
+        nonlocal clamped
+        if val < zero:
+            clamped = True
+            return zero
+        if val > one:
+            clamped = True
+            return one
+        return val
+
+    x1, y1, x2, y2 = clamp(x1), clamp(y1), clamp(x2), clamp(y2)
+    zero_area = (x1 == x2) or (y1 == y2)
+    coords = [x1, y1, x2, y1, x2, y2, x1, y2]
+    return {"coords": [float(c) for c in coords], "clamped": clamped, "zero_area": zero_area}
+
+
+def analyze_label_lines(label_dirs_with_roles, backup_root):
+    """Per-line label census (independent of classify_label_file's intra-file raise).
+
+    label_dirs_with_roles: [(role, Path)]; backup_root: dataset folder artifacts live in.
+    Returns counts by role and merged, dominant kind/ratio, split-majority verdicts, the
+    minority line list, unparseable lines, and the backup root. Empty files count 0 lines.
+    """
+    backup_root = Path(backup_root)
+    by_role = {}
+    role_total = {}
+    merged = {}
+    all_lines = []          # (relpath, abspath, lineno, kind, token_count, out_of_range)
+    unparseable = []        # (relpath, abspath, lineno, reason)
+    label_dirs = []
+
+    for role, d in label_dirs_with_roles:
+        if d is None:
+            continue
+        d = Path(d)
+        label_dirs.append(d)
+        counts = {}
+        total = 0
+        if not d.is_dir():
+            by_role[role] = counts
+            role_total[role] = 0
+            continue
+        for lp in sorted(d.glob("*.txt")):
+            try:
+                text = lp.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                unparseable.append((str(lp), str(lp), 0, f"unreadable: {exc}"))
+                continue
+            try:
+                relpath = str(lp.relative_to(backup_root))
+            except ValueError:
+                relpath = str(lp)
+            for lineno, raw in enumerate(text.splitlines(), 1):
+                stripped = raw.strip()
+                if not stripped:
+                    continue
+                parts = stripped.split()
+                try:
+                    cls = float(parts[0])
+                    vals = [float(tok) for tok in parts[1:]]
+                except (ValueError, IndexError):
+                    unparseable.append((relpath, str(lp), lineno, "non-numeric YOLO label line"))
+                    continue
+                if cls != int(cls) or cls < 0:
+                    unparseable.append((relpath, str(lp), lineno, f"invalid class id '{parts[0]}'"))
+                    continue
+                kind, _kpts = classify_label_tokens(vals)
+                if kind is None:
+                    unparseable.append((relpath, str(lp), lineno, f"unrecognized field count {len(vals) + 1}"))
+                    continue
+                counts[kind] = counts.get(kind, 0) + 1
+                merged[kind] = merged.get(kind, 0) + 1
+                total += 1
+                out_of_range = any(v < 0.0 or v > 1.0 for v in vals)
+                all_lines.append((relpath, str(lp), lineno, kind, len(vals) + 1, out_of_range))
+        by_role[role] = counts
+        role_total[role] = total
+
+    total_lines = sum(merged.values())
+    dominant = max(merged, key=lambda k: merged[k]) if merged else None
+    dominant_ratio = (merged[dominant] / total_lines) if total_lines else 0.0
+
+    split_verdicts = {}
+    split_majority_ok = True
+    for role, counts in by_role.items():
+        total = role_total[role]
+        if total == 0:
+            split_verdicts[role] = (None, 0, 0)
+            continue
+        role_dom = max(counts, key=lambda k: counts[k])
+        seg = counts.get("segment", 0)
+        split_verdicts[role] = (role_dom, seg, total)
+        if role_dom != "segment" or seg <= total / 2:
+            split_majority_ok = False
+
+    minority = []
+    if dominant is not None:
+        for relpath, abspath, lineno, kind, token, oob in all_lines:
+            if kind != dominant:
+                minority.append((relpath, abspath, lineno, kind, token, oob))
+
+    return {
+        "by_role": by_role,
+        "role_total": role_total,
+        "line_counts": merged,
+        "total_lines": total_lines,
+        "dominant": dominant,
+        "dominant_ratio": dominant_ratio,
+        "split_majority_ok": split_majority_ok,
+        "split_verdicts": split_verdicts,
+        "minority": minority,
+        "unparseable": unparseable,
+        "backup_root": backup_root,
+        "label_dirs": label_dirs,
+    }
+
+
+def repairability(analysis):
+    """Both guard granularities: global >=95% segment dominance AND segment majority in
+    every split that has label lines, bbox-only in-range minority, no unparseable lines."""
+    total = analysis["total_lines"]
+    if total == 0:
+        return False, "dataset has no label lines to repair"
+    dominant = analysis["dominant"]
+    if dominant != "segment":
+        return False, f"dominant label kind is '{dominant}', not segment (only segment datasets are repairable)"
+    ratio = analysis["dominant_ratio"]
+    if ratio < LABEL_REPAIR_MIN_RATIO:
+        return False, f"segment is only {ratio * 100:.2f}% of label lines (need >= {LABEL_REPAIR_MIN_RATIO * 100:.0f}%)"
+    if not analysis["split_majority_ok"]:
+        offenders = [
+            r for r, (_d, _seg, tot) in analysis["split_verdicts"].items()
+            if tot > 0 and analysis["by_role"][r].get("segment", 0) <= tot / 2
+        ]
+        return False, "segment is not the strict majority in split(s): " + ", ".join(sorted(offenders))
+    for relpath, _abs, lineno, kind, token, oob in analysis["minority"]:
+        if kind != "detect":
+            return False, f"minority line {relpath}:{lineno} is '{kind}' (only 5-field bbox lines can be repaired)"
+        if token != 5:
+            return False, f"minority line {relpath}:{lineno} has {token} fields (expected a 5-field bbox line)"
+        if oob:
+            return False, f"minority line {relpath}:{lineno} has coordinates outside [0,1] (refusing to clamp polygons/rectangles silently)"
+    if analysis["unparseable"]:
+        relpath, _abs, lineno, reason = analysis["unparseable"][0]
+        return False, f"unparseable line {relpath}:{lineno}: {reason}"
+    return True, "repairable"
+
+
+def _detect_line_ending(text: str) -> str:
+    if "\r\n" in text:
+        return "\r\n"
+    if "\r" in text:
+        return "\r"
+    return "\n"
+
+
+def _label_repair_artifact_gate(backup_root: Path):
+    """Mirror the .conversion_manifest.json refusal: refuse foreign same-named artifacts,
+    write nothing. Returns the existing tool manifest dict, or None."""
+    manifest_path = backup_root / LABEL_REPAIR_MANIFEST_NAME
+    backup_dir = backup_root / LABEL_REPAIR_BACKUP_DIRNAME
+    manifest = None
+    if manifest_path.is_dir():
+        print(f"[Label Repair] {manifest_path} is a directory, not this tool's manifest file; refusing to write.")
+        sys.exit(1)
+    if manifest_path.is_file():
+        try:
+            loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            loaded = None
+        if not isinstance(loaded, dict):
+            print(f"[Label Repair] {manifest_path} exists but is not a repair created by this tool "
+                  f"(no usable {LABEL_REPAIR_MANIFEST_NAME}); it will not be modified. Move/remove it or "
+                  "use a different dataset.")
+            sys.exit(1)
+        if loaded.get("format") != LABEL_REPAIR_FORMAT or loaded.get("version") != LABEL_REPAIR_VERSION:
+            print(f"[Label Repair] {manifest_path} is not a {LABEL_REPAIR_FORMAT} v{LABEL_REPAIR_VERSION} manifest "
+                  "created by this tool; refusing to write.")
+            sys.exit(1)
+        manifest = loaded
+    if backup_dir.exists() and not backup_dir.is_dir():
+        print(f"[Label Repair] {backup_dir} exists but is not a directory created by this tool; refusing to write.")
+        sys.exit(1)
+    if backup_dir.is_dir() and manifest is None:
+        print(f"[Label Repair] {backup_dir} exists without a valid {LABEL_REPAIR_MANIFEST_NAME}; it is not managed "
+              "by this tool, so nothing will be written. Move/remove it first.")
+        sys.exit(1)
+    return manifest
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _restore_label_backups(restore_map, backup_root, logger):
+    for relpath, orig_bytes in restore_map.items():
+        target = backup_root / relpath
+        try:
+            target.write_bytes(orig_bytes)
+            print(f"[Label Repair] restored {relpath} from backup.")
+        except OSError as exc:
+            print(f"[Label Repair] WARNING: could not restore {relpath}: {exc}")
+
+
+def _print_label_repair_diagnosis(tasks, ksets, bad, analysis, reason):
+    print("[ERROR] YOLO label structure problems in this dataset:")
+    if bad:
+        print(f"  - {len(bad)} malformed label file(s) (non-numeric line / unrecognized field count):")
+        for f, why in bad[:10]:
+            print(f"      {f}: {why}")
+        if len(bad) > 10:
+            print(f"      ... (+{len(bad) - 10} more)")
+    if len(tasks) > 1:
+        print("  - Mixed label line structures in one dataset:")
+        for t, files in tasks.items():
+            print(f"      {t}: {_sample_list(files)}")
+    if len(ksets) > 1:
+        print("  - Pose keypoint counts differ across files:")
+        for k, files in ksets.items():
+            print(f"      kpt count {k}: {_sample_list(files)}")
+    dominant = analysis["dominant"]
+    ratio = analysis["dominant_ratio"]
+    total = analysis["total_lines"]
+    print(f"  - Dominant kind: {dominant}; dominant ratio: {ratio * 100:.2f}%; total label lines: {total}")
+    print("  - Per-split label line counts:")
+    for role in ("train", "val", "test"):
+        if role not in analysis["by_role"]:
+            continue
+        tot = analysis["role_total"][role]
+        kinds = analysis["by_role"][role]
+        if tot == 0:
+            print(f"      {role}: 0 label lines")
+            continue
+        verdict = "segment majority" if kinds.get("segment", 0) > tot / 2 else "segment NOT majority"
+        kind_txt = ", ".join(f"{k}={c}" for k, c in sorted(kinds.items()))
+        print(f"      {role}: {kind_txt}  ({verdict})")
+    minority = analysis["minority"]
+    if minority:
+        print(f"  - Minority (non-dominant) label lines: {len(minority)}")
+        for relpath, _abs, lineno, kind, token, oob in minority[:10]:
+            flag = " [coords out of [0,1]]" if oob else ""
+            print(f"      {relpath}:{lineno}  kind={kind} fields={token}{flag}")
+        if len(minority) > 10:
+            print(f"      ... (+{len(minority) - 10} more)")
+    if analysis["unparseable"]:
+        print(f"  - Unparseable lines: {len(analysis['unparseable'])}")
+        for relpath, _abs, lineno, why in analysis["unparseable"][:10]:
+            print(f"      {relpath}:{lineno}  {why}")
+        if len(analysis["unparseable"]) > 10:
+            print(f"      ... (+{len(analysis['unparseable']) - 10} more)")
+    print(f"  - Repair refused: {reason}")
+    print("  - To attempt an in-place repair (bbox lines -> polygons, with backup + manifest), run:")
+    print(f"      python train_detector/train_detector.py --input \"{analysis['backup_root']}\" --fix-label-structure --dry-run")
+
+
+def derive_task_with_repair(label_dirs_with_roles, backup_root, args, logger):
+    """Strict-first derive; only when the strict scan would fail do we analyse repairability.
+
+    Clean datasets take the exact same path (and prints) as derive_task_from_yolo_labels and
+    touch nothing. On a live minority we run the guards, then consent + repair, then re-derive.
+    """
+    dirs = [d for _role, d in label_dirs_with_roles if d is not None]
+    tasks, ksets, bad, max_class, _n = scan_yolo_labels(dirs)
+    if not (bad or len(tasks) > 1 or len(ksets) > 1):
+        if not tasks:
+            print("[Dataset Format] no YOLO label content found in this dataset; defaulting to task=detect.")
+            return "detect", None, max_class, False
+        task = next(iter(tasks))
+        k = next(iter(ksets)) if ksets else None
+        return task, k, max_class, True
+
+    analysis = analyze_label_lines(label_dirs_with_roles, backup_root)
+    ok, reason = repairability(analysis)
+    if not ok:
+        _print_label_repair_diagnosis(tasks, ksets, bad, analysis, reason)
+        sys.exit(1)
+    repair_label_structures(analysis, args, logger)
+    tasks2, ksets2, bad2, max_class2, _n2 = scan_yolo_labels(dirs)
+    if bad2 or len(tasks2) > 1 or len(ksets2) > 1:
+        # repair_label_structures should have restored and exited; keep a defensive net.
+        _fail_label_scan(tasks2, ksets2, bad2)
+    task2 = next(iter(tasks2)) if tasks2 else "detect"
+    k2 = next(iter(ksets2)) if ksets2 else None
+    return task2, k2, max_class2, True
+
+
+def _build_repair_file_plan(analysis):
+    """Group minority lines by file and compute byte-minimal rewritten content + audit records."""
+    backup_root = analysis["backup_root"]
+    minority_by_file = {}
+    for relpath, abspath, lineno, _kind, _token, _oob in analysis["minority"]:
+        minority_by_file.setdefault((relpath, abspath), set()).add(lineno)
+
+    plans = []
+    for (relpath, abspath), target_lines in sorted(minority_by_file.items()):
+        path = Path(abspath)
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise _LabelRepairAbort(f"could not read {relpath}: {exc}")
+        nl = _detect_line_ending(text)
+        had_trailing = text.endswith(("\n", "\r"))
+        lines = text.splitlines()
+        entries = []
+        new_lines = []
+        converted = clamped = dropped = 0
+        for idx, raw in enumerate(lines, 1):
+            if idx in target_lines:
+                parts = raw.split()
+                cls = int(float(parts[0]))
+                # Pass the verbatim token strings so polygon math stays exact-decimal.
+                res = bbox_line_to_polygon(cls, *parts[1:])
+                if res["zero_area"]:
+                    entries.append({
+                        "relpath": relpath, "lineno": idx, "original": raw, "repaired": "",
+                        "clamped": bool(res["clamped"]), "dropped": True,
+                    })
+                    dropped += 1
+                    continue
+                new_line = f"{cls} " + " ".join(_fmt_coord(v) for v in res["coords"])
+                new_lines.append(new_line)
+                converted += 1
+                if res["clamped"]:
+                    clamped += 1
+                entries.append({
+                    "relpath": relpath, "lineno": idx, "original": raw, "repaired": new_line,
+                    "clamped": bool(res["clamped"]), "dropped": False,
+                })
+            else:
+                new_lines.append(raw)  # byte-identical original content for unchanged lines
+        new_text = nl.join(new_lines)
+        if had_trailing and new_lines:
+            new_text += nl
+        plans.append({
+            "relpath": relpath, "path": path, "new_text": new_text,
+            "entries": entries, "converted": converted, "clamped": clamped, "dropped": dropped,
+        })
+    return plans
+
+
+def _print_repair_change_summary(analysis, plans):
+    dominant = analysis["dominant"]
+    ratio = analysis["dominant_ratio"]
+    total = analysis["total_lines"]
+    files_changed = len(plans)
+    lines_converted = sum(p["converted"] for p in plans)
+    clamped = sum(p["clamped"] for p in plans)
+    dropped = sum(p["dropped"] for p in plans)
+    print("[Label Repair] segment-dominant dataset with a bbox-only minority:")
+    print(f"  dominant: {dominant}  ratio: {ratio * 100:.2f}%  total label lines: {total}")
+    print("  per-split label line counts:")
+    for role in ("train", "val", "test"):
+        if role not in analysis["by_role"]:
+            continue
+        tot = analysis["role_total"][role]
+        kinds = analysis["by_role"][role]
+        if tot == 0:
+            print(f"    {role}: 0 label lines")
+            continue
+        verdict = "segment majority" if kinds.get("segment", 0) > tot / 2 else "segment NOT majority"
+        kind_txt = ", ".join(f"{k}={c}" for k, c in sorted(kinds.items()))
+        print(f"    {role}: {kind_txt}  ({verdict})")
+    print(f"  files to change: {files_changed}  lines to convert: {lines_converted}  clamped: {clamped}  dropped: {dropped}")
+    print("  change preview:")
+    for plan in plans:
+        for e in plan["entries"]:
+            arrow = "(dropped)" if e["dropped"] else e["repaired"]
+            print(f"    {e['relpath']}:{e['lineno']}")
+            print(f"      - {e['original']}")
+            print(f"      + {arrow}")
+    return files_changed, lines_converted, clamped, dropped
+
+
+def repair_label_structures(analysis, args, logger):
+    """Consent-gated, byte-minimal in-place repair with backup, manifest, cache cleanup and
+    a strict re-scan that fully restores every written .bak on any failure."""
+    backup_root = analysis["backup_root"]
+    manifest = _label_repair_artifact_gate(backup_root)
+    backup_dir = backup_root / LABEL_REPAIR_BACKUP_DIRNAME
+
+    # Pristine backup identities from any prior tool run (first original wins).
+    pristine_sha = {}
+    existing_entries = []
+    if manifest and isinstance(manifest.get("entries"), list):
+        for e in manifest["entries"]:
+            if isinstance(e, dict) and "relpath" in e:
+                existing_entries.append(e)
+                if e.get("original_sha256"):
+                    pristine_sha[e["relpath"]] = e["original_sha256"]
+
+    plans = _build_repair_file_plan(analysis)
+    if not plans:
+        # Idempotency: a live minority was expected but nothing maps to a writable file.
+        return False
+    files_changed, lines_converted, clamped, dropped = _print_repair_change_summary(analysis, plans)
+
+    command = (f"python train_detector/train_detector.py --input \"{backup_root}\" "
+               "--fix-label-structure --dry-run")
+
+    if getattr(args, "fix_label_structure", False) or getattr(args, "yes", False):
+        why = "fix-label-structure" if getattr(args, "fix_label_structure", False) else "yes"
+        logger.log(f"[Label Repair] --{why} given: applying repair without a prompt.")
+    elif interactive_stdin():
+        answer = prompt_choice(logger.log, "Apply this label-structure repair to the dataset?", ["y", "N"])
+        if answer != "y":
+            print("[Label Repair] Declined; nothing was written to the dataset folder.")
+            print(f"  Options: apply manually, or re-run with --fix-label-structure:")
+            print(f"    {command}")
+            sys.exit(1)
+    else:
+        print("[Label Repair] stdin is not interactive; refusing to write into the dataset folder.")
+        print(f"  Re-run with --fix-label-structure (or --yes) to apply:")
+        print(f"    {command}")
+        sys.exit(1)
+
+    restore_map = {}
+    try:
+        for plan in plans:
+            relpath = plan["relpath"]
+            path = plan["path"]
+            try:
+                rel_for_backup = path.relative_to(backup_root)
+            except ValueError:
+                raise _LabelRepairAbort(f"{relpath} is outside the dataset folder {backup_root}; cannot back it up")
+            bak_path = backup_dir / (str(rel_for_backup) + ".bak")
+            orig_bytes = path.read_bytes()
+            if bak_path.exists():
+                expected = pristine_sha.get(relpath)
+                if expected is None:
+                    raise _LabelRepairAbort(
+                        f"backup {bak_path} exists with no manifest entry to verify it against; refusing to overwrite")
+                if _sha256_bytes(bak_path.read_bytes()) != expected:
+                    raise _LabelRepairAbort(
+                        f"existing backup {bak_path} no longer matches its manifest original_sha256; refusing to use it as a rollback target")
+            else:
+                bak_path.parent.mkdir(parents=True, exist_ok=True)
+                bak_path.write_bytes(orig_bytes)
+                pristine_sha[relpath] = _sha256_bytes(orig_bytes)
+            restore_map[relpath] = orig_bytes
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                fh.write(plan["new_text"])
+    except _LabelRepairAbort as exc:
+        _restore_label_backups(restore_map, backup_root, logger)
+        print(f"[Label Repair] Aborted before completing: {exc}")
+        print("  No partial repair was left in place.")
+        sys.exit(1)
+    except OSError as exc:
+        _restore_label_backups(restore_map, backup_root, logger)
+        print(f"[Label Repair] Write failed: {exc}")
+        print("  All already-written files were restored from their backups.")
+        sys.exit(1)
+
+    # Strict re-scan: never leave a half-repaired dataset.
+    tasks2, ksets2, bad2, _mc2, _n2 = scan_yolo_labels(analysis["label_dirs"])
+    if bad2 or len(tasks2) > 1 or len(ksets2) > 1:
+        _restore_label_backups(restore_map, backup_root, logger)
+        print("[Label Repair] post-repair strict scan still failed; restored every repaired file.")
+        _fail_label_scan(tasks2, ksets2, bad2)
+
+    # Manifest audit (merge with prior entries, dedupe by relpath+lineno).
+    merged_entries = list(existing_entries)
+    seen = {(e.get("relpath"), e.get("lineno")) for e in merged_entries if isinstance(e, dict)}
+    for plan in plans:
+        relpath = plan["relpath"]
+        sha = pristine_sha.get(relpath, _sha256_bytes(restore_map.get(relpath, b"")))
+        for e in plan["entries"]:
+            key = (e["relpath"], e["lineno"])
+            if key in seen:
+                continue
+            seen.add(key)
+            merged_entries.append({
+                "relpath": e["relpath"],
+                "split": Path(e["relpath"]).parts[0] if Path(e["relpath"]).parts else "",
+                "lineno": e["lineno"],
+                "original": e["original"],
+                "repaired": e["repaired"],
+                "clamped": e["clamped"],
+                "dropped": e["dropped"],
+                "original_sha256": sha,
+                "created_at": local_iso(),
+            })
+
+    split_counts = {role: {**counts, "total_lines": analysis["role_total"][role]}
+                    for role, counts in analysis["by_role"].items()}
+    manifest_out = {
+        "format": LABEL_REPAIR_FORMAT,
+        "version": LABEL_REPAIR_VERSION,
+        "dominant_task": "segment",
+        "created_at": local_iso(),
+        "dominant_ratio": analysis["dominant_ratio"],
+        "split_counts": split_counts,
+        "files_changed": files_changed,
+        "lines_converted": lines_converted,
+        "clamped": clamped,
+        "dropped": dropped,
+        "entries": merged_entries,
+    }
+    (backup_root / LABEL_REPAIR_MANIFEST_NAME).write_text(
+        json.dumps(manifest_out, indent=2), encoding="utf-8")
+
+    # Delete Ultralytics label caches adjacent to repaired labels dirs (Ultralytics keys the
+    # cache on summed label+image byte size; deleting makes the effect deterministic).
+    for plan in plans:
+        labels_dir = plan["path"].parent
+        cache_path = labels_dir.with_suffix(".cache")
+        if cache_path.is_file():
+            try:
+                cache_path.unlink()
+                print(f"[Label Repair] removed stale cache {cache_path}")
+            except OSError as exc:
+                print(f"[Label Repair] WARNING: could not remove {cache_path}: {exc}")
+
+    print(f"[Label Repair] applied: files_changed={files_changed} lines_converted={lines_converted} "
+          f"clamped={clamped} dropped={dropped} backups_dir={backup_dir}")
+    logger.log(f"[Label Repair] applied files_changed={files_changed} lines_converted={lines_converted} "
+               f"clamped={clamped} dropped={dropped} manifest={backup_root / LABEL_REPAIR_MANIFEST_NAME}")
+    return True
 
 
 # -- COCO Conversion Helpers -------------------------------------------------------
