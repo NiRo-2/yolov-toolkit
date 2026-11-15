@@ -108,6 +108,126 @@ def keep_clipped_box(
     return (x2 - x1) * (y2 - y1) / orig_area >= min_frac
 
 
+def polygon_area(points: list[tuple[float, float]]) -> float:
+    """Return the absolute area of a closed polygon using the shoelace formula."""
+    n = len(points)
+    if n < 3:
+        return 0.0
+    area = 0.0
+    for i in range(n):
+        x1, y1 = points[i]
+        x2, y2 = points[(i + 1) % n]
+        area += x1 * y2 - x2 * y1
+    return abs(area) / 2.0
+
+
+def clip_polygon_to_tile(
+    points: list[tuple[float, float]],
+    tx1: int,
+    ty1: int,
+    tx2: int,
+    ty2: int,
+) -> list[tuple[float, float]] | None:
+    """Clip a pixel-space polygon to a tile (Sutherland–Hodgman).
+
+    Returns the surviving vertices relative to the tile origin, or None when
+    fewer than 3 vertices remain (a polygon line needs at least 3 points).
+    """
+    def clip_half(poly, inside, crossing):
+        out: list[tuple[float, float]] = []
+        prev = poly[-1]
+        prev_in = inside(prev)
+        for cur in poly:
+            cur_in = inside(cur)
+            if cur_in:
+                if not prev_in:
+                    out.append(crossing(prev, cur))
+                out.append(cur)
+            elif prev_in:
+                out.append(crossing(prev, cur))
+            prev, prev_in = cur, cur_in
+        return out
+
+    def cross_vertical(a, b, x):
+        ax, ay = a
+        bx, by = b
+        if abs(bx - ax) < 1e-12:
+            return (x, (ay + by) / 2)
+        t = (x - ax) / (bx - ax)
+        return (x, ay + t * (by - ay))
+
+    def cross_horizontal(a, b, y):
+        ax, ay = a
+        bx, by = b
+        if abs(by - ay) < 1e-12:
+            return ((ax + bx) / 2, y)
+        t = (y - ay) / (by - ay)
+        return (ax + t * (bx - ax), y)
+
+    poly: list[tuple[float, float]] = list(points)
+    for inside, crossing in (
+        (lambda p: p[0] >= tx1, lambda a, b: cross_vertical(a, b, tx1)),
+        (lambda p: p[0] <= tx2, lambda a, b: cross_vertical(a, b, tx2)),
+        (lambda p: p[1] >= ty1, lambda a, b: cross_horizontal(a, b, ty1)),
+        (lambda p: p[1] <= ty2, lambda a, b: cross_horizontal(a, b, ty2)),
+    ):
+        if not poly:
+            return None
+        poly = clip_half(poly, inside, crossing)
+    if len(poly) < 3:
+        return None
+    return [(x - tx1, y - ty1) for x, y in poly]
+
+
+def polygon_to_yolo_line(
+    cls_id: int,
+    points: list[tuple[float, float]],
+    tile_w: int,
+    tile_h: int,
+) -> str:
+    """Serialize tile-relative polygon points as a normalized YOLO segmentation line."""
+    parts = [str(cls_id)]
+    for x, y in points:
+        parts.append(f"{x / tile_w:.6f}")
+        parts.append(f"{y / tile_h:.6f}")
+    return " ".join(parts)
+
+
+def keypoints_to_tile_line(
+    keypoints: list[tuple[float, float, int]],
+    tx1: int,
+    ty1: int,
+    tx2: int,
+    ty2: int,
+    img_w: int,
+    img_h: int,
+) -> str:
+    """Serialize pixel keypoints as tile-normalized triplets using YOLO visibility rules.
+
+    A visible keypoint (kv=2) inside the tile is clamped to the tile edge and stays
+    kv=2; outside the tile it becomes (0, 0, 1) — labelled but invisible. kv=0/1
+    entries pass through unchanged in source-image-normalized coordinates.
+    """
+    tile_w = tx2 - tx1
+    tile_h = ty2 - ty1
+    parts: list[str] = []
+    for kx, ky, kv in keypoints:
+        if kv == 2:
+            if kx < tx1 or kx > tx2 or ky < ty1 or ky > ty2:
+                parts.extend(("0.000000", "0.000000", "1"))
+            else:
+                nx = min(max(kx - tx1, 0.0), tile_w) / tile_w
+                ny = min(max(ky - ty1, 0.0), tile_h) / tile_h
+                parts.append(f"{nx:.6f}")
+                parts.append(f"{ny:.6f}")
+                parts.append("2")
+        else:
+            parts.append(f"{kx / img_w:.6f}")
+            parts.append(f"{ky / img_h:.6f}")
+            parts.append(str(kv))
+    return " ".join(parts)
+
+
 def select_empty_tiles(
     labelled_count: int,
     empty_indices: list[int],

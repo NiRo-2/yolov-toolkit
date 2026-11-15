@@ -19,8 +19,12 @@ import yaml
 
 from tile_geometry import (
     clip_box_to_tile,
+    clip_polygon_to_tile,
     iter_tile_windows,
     keep_clipped_box,
+    keypoints_to_tile_line,
+    polygon_area,
+    polygon_to_yolo_line,
     select_empty_tiles,
     xyxy_to_yolo_line,
     yolo_line_to_xyxy,
@@ -116,23 +120,56 @@ def resolve_images_dir(dataset_root: Path, configured_path: object) -> Path:
     return path if path.is_absolute() else dataset_root / path
 
 
-def parse_labels(label_path: Path, width: int, height: int) -> list[tuple[int, float, float, float, float]]:
+def parse_labels(
+    label_path: Path,
+    width: int,
+    height: int,
+    kpt_k: int | None = None,
+) -> list[tuple]:
+    """Parse one label file into typed records: (kind, cls, x1, y1, x2, y2, extra).
+
+    kind 0 — detect (5 fields; extra unused): pixel xyxy box.
+    kind 1 — segment (1 + 2N fields, N >= 3): bbox derived from the polygon plus
+             the pixel-space polygon points as `extra`.
+    kind 2 — pose (only when `kpt_k` is given from data.yaml `kpt_shape`):
+             exactly 1 + 4 + 3K fields; pixel keypoints with visibility as `extra`.
+    """
     if not label_path.exists():
         return []
-    boxes: list[tuple[int, float, float, float, float]] = []
+    records: list[tuple] = []
     for line_no, line in enumerate(label_path.read_text(encoding="utf-8").splitlines(), start=1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
         fields = stripped.split()
-        if len(fields) != 5:
-            raise ValueError(f"{label_path.name}:{line_no} expected 5 fields")
         try:
             values = [float(field) for field in fields]
         except ValueError as exc:
             raise ValueError(f"{label_path.name}:{line_no} has non-numeric values") from exc
-        boxes.append(yolo_line_to_xyxy(values, width, height))
-    return boxes
+        n = len(values)
+        cls_id = int(values[0])
+        if kpt_k is not None:
+            expected = 1 + 4 + 3 * kpt_k
+            if n != expected:
+                raise ValueError(f"{label_path.name}:{line_no} expected {expected} pose fields")
+            _cls, x1, y1, x2, y2 = yolo_line_to_xyxy(values[:5], width, height)
+            keypoints: list[tuple[float, float, int]] = []
+            for i in range(kpt_k):
+                kv = int(values[5 + 3 * i + 2])
+                if kv not in (0, 1, 2):
+                    raise ValueError(f"{label_path.name}:{line_no} keypoint visibility must be 0, 1 or 2")
+                keypoints.append((values[5 + 3 * i] * width, values[5 + 3 * i + 1] * height, kv))
+            records.append((2, cls_id, x1, y1, x2, y2, keypoints))
+        elif n == 5:
+            records.append((0,) + yolo_line_to_xyxy(values, width, height))
+        elif n >= 7 and n % 2 == 1:
+            points = [(values[i] * width, values[i + 1] * height) for i in range(1, n, 2)]
+            xs = [px for px, _ in points]
+            ys = [py for _, py in points]
+            records.append((1, cls_id, min(xs), min(ys), max(xs), max(ys), points))
+        else:
+            raise ValueError(f"{label_path.name}:{line_no} expected 5 fields")
+    return records
 
 
 def write_tile(
@@ -176,7 +213,8 @@ def write_tile(
 
 
 def process_split(
-    split: str, images_dir: Path, dataset_root: Path, args: argparse.Namespace, output_dir: Path
+    split: str, images_dir: Path, dataset_root: Path, args: argparse.Namespace, output_dir: Path,
+    kpt_k: int | None = None,
 ) -> tuple[int, int, list[dict]]:
     """Tile one split, streaming per source image so memory stays O(one image).
 
@@ -210,17 +248,36 @@ def process_split(
             continue
         height, width = image.shape[:2]
         try:
-            boxes = parse_labels(labels_dir / f"{image_path.stem}.txt", width, height)
+            records = parse_labels(labels_dir / f"{image_path.stem}.txt", width, height, kpt_k)
         except (OSError, UnicodeDecodeError, ValueError) as exc:
             print(f"[WARNING] Skipping corrupt label for {image_path.name}: {exc}")
             continue
 
         for x1, y1, x2, y2 in iter_tile_windows(width, height, args.imgsz, args.overlap):
             tile_labels: list[str] = []
-            for cls_id, bx1, by1, bx2, by2 in boxes:
+            for record in records:
+                kind = record[0]
+                cls_id, bx1, by1, bx2, by2 = record[1], record[2], record[3], record[4], record[5]
+                extra = record[6] if kind else None
                 clipped = clip_box_to_tile(bx1, by1, bx2, by2, x1, y1, x2, y2)
-                if clipped is not None and keep_clipped_box((bx2 - bx1) * (by2 - by1), clipped):
-                    tile_labels.append(xyxy_to_yolo_line(cls_id, *clipped, x2 - x1, y2 - y1))
+                if clipped is None:
+                    continue
+                if kind == 0:
+                    if keep_clipped_box((bx2 - bx1) * (by2 - by1), clipped):
+                        tile_labels.append(xyxy_to_yolo_line(cls_id, *clipped, x2 - x1, y2 - y1))
+                elif kind == 1:
+                    orig_area = polygon_area(extra)
+                    if orig_area <= 0:
+                        continue
+                    clipped_poly = clip_polygon_to_tile(extra, x1, y1, x2, y2)
+                    if clipped_poly is not None and polygon_area(clipped_poly) / orig_area >= 0.2:
+                        tile_labels.append(polygon_to_yolo_line(cls_id, clipped_poly, x2 - x1, y2 - y1))
+                else:
+                    if keep_clipped_box((bx2 - bx1) * (by2 - by1), clipped):
+                        bbox_line = xyxy_to_yolo_line(cls_id, *clipped, x2 - x1, y2 - y1)
+                        tile_labels.append(
+                            f"{bbox_line} {keypoints_to_tile_line(extra, x1, y1, x2, y2, width, height)}"
+                        )
             if tile_labels:
                 try:
                     manifest.append(
@@ -264,6 +321,9 @@ def process_split(
 def write_data_yaml(output_dir: Path, source_data: dict, splits: list[str]) -> Path:
     lines = [f"{split}: {split}/images" for split in splits]
     lines.extend([f"nc: {source_data['nc']}", f"names: {source_data['names']}"])
+    for key in ("kpt_shape", "flip_idx"):
+        if key in source_data:
+            lines.append(f"{key}: {source_data[key]}")
     yaml_path = output_dir / "data.yaml"
     yaml_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return yaml_path
@@ -277,6 +337,17 @@ def run(args: argparse.Namespace) -> None:
     if not splits:
         sys.exit(f"[ERROR] {input_yaml} has no train, val, or test split.")
 
+    kpt_k: int | None = None
+    kpt_shape = source_data.get("kpt_shape")
+    if kpt_shape is not None:
+        try:
+            kpt_k = int(kpt_shape[0])
+            shape_ok = isinstance(kpt_shape, (list, tuple)) and len(kpt_shape) == 2 and int(kpt_shape[1]) == 3 and kpt_k > 0
+        except (TypeError, ValueError, IndexError):
+            shape_ok = False
+        if not shape_ok:
+            sys.exit(f"[ERROR] kpt_shape in {input_yaml} must be [K, 3] with K > 0.")
+
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest: list[dict] = []
     total = 0
@@ -286,7 +357,7 @@ def run(args: argparse.Namespace) -> None:
         except ValueError as exc:
             print(f"[WARNING] Skipping split '{split}': {exc}")
             continue
-        labelled_count, empty_count, split_manifest = process_split(split, images_dir, dataset_root, args, output_dir)
+        labelled_count, empty_count, split_manifest = process_split(split, images_dir, dataset_root, args, output_dir, kpt_k)
         manifest.extend(split_manifest)
         total += labelled_count + empty_count
         print(f"[{split}] {labelled_count} labelled + {empty_count} empty tiles written")
