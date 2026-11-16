@@ -1038,20 +1038,20 @@ def fingerprint_hash(fp: dict) -> str:
 
 def load_memory_cache(logger=None) -> dict:
     if not MEMORY_CACHE_PATH.exists():
-        return {"version": 2, "hardware_profiles": {}}
+        return {"version": 3, "hardware_profiles": {}}
     try:
         with open(MEMORY_CACHE_PATH, encoding="utf-8") as f:
             data = json.load(f)
-        if not isinstance(data, dict) or data.get("version") != 2:
+        if not isinstance(data, dict) or data.get("version") != 3:
             if logger:
-                logger.log(f"[Cache] {MEMORY_CACHE_PATH} is not schema version 2; starting fresh.")
-            return {"version": 2, "hardware_profiles": {}}
+                logger.log(f"[Cache] {MEMORY_CACHE_PATH} is not schema version 3; starting fresh (full recalibration).")
+            return {"version": 3, "hardware_profiles": {}}
         data.setdefault("hardware_profiles", {})
         return data
     except (OSError, json.JSONDecodeError) as e:
         if logger:
             logger.log(f"[Cache] Ignoring corrupt memory cache {MEMORY_CACHE_PATH}: {e}")
-        return {"version": 2, "hardware_profiles": {}}
+        return {"version": 3, "hardware_profiles": {}}
 
 
 def save_memory_cache(cache: dict, logger) -> bool:
@@ -1072,14 +1072,22 @@ def sig_num(v) -> str:
     return str(v)
 
 
-def config_signature(model, imgsz, batch, workers, multi_scale, mosaic=1.0, mixup=0.15, copy_paste=0.3) -> str:
-    """Cache config key: model|imgsz|batch|workers|ms|mosaic|mixup|copy_paste."""
+def config_signature(model, imgsz, batch, workers, multi_scale, mosaic=1.0, mixup=0.15,
+                     copy_paste=0.3, degrees=180, close_mosaic=60, flipud=0.5,
+                     cos_lr=True, nbs=64) -> str:
+    """
+    Cache config key: model|imgsz|batch|workers|ms|mosaic|mixup|copy_paste|degrees|close_mosaic.
+    flipud/cos_lr/nbs are accepted so full chosen dicts splat safely; they are fixed
+    policy constants and are not keyed (degrees/close_mosaic vary per rung).
+    """
     return "|".join([
         str(model), str(imgsz), str(batch), str(workers),
         f"ms{sig_num(multi_scale)}",
         f"mosaic{sig_num(mosaic)}",
         f"mixup{sig_num(mixup)}",
         f"copy{sig_num(copy_paste)}",
+        f"deg{sig_num(degrees)}",
+        f"cm{sig_num(close_mosaic)}",
     ])
 
 
@@ -1089,7 +1097,9 @@ def selection_signature(args, ds_fp: dict) -> str:
         "model": args.model, "imgsz": args.imgsz, "batch": args.batch, "workers": args.workers,
     }.items() if v is not None}
     sig = json.dumps(explicit, sort_keys=True, separators=(",", ":")) if explicit else "auto"
-    return f"ds:{fingerprint_hash(ds_fp)}|profile:{args.memory_profile}|{sig}"
+    # Intent marker: selections recorded under a different auto-policy (e.g. the
+    # old speed-balanced defaults) never satisfy a post-change run.
+    return f"ds:{fingerprint_hash(ds_fp)}|profile:{args.memory_profile}|intent:quality-v1|{sig}"
 
 
 def get_hw_profile(cache: dict, hw_fp: dict):
@@ -1833,11 +1843,16 @@ def _short(s: str) -> str:
 
 
 def build_chosen(model, imgsz, batch, workers, multi_scale, mosaic, mixup=0.15, copy_paste=0.3):
-    """Canonical chosen-config dict used for cache keys and training kwargs."""
+    """
+    Canonical chosen-config dict used for cache keys and training kwargs.
+    Carries the fixed auto augmentation constants (degrees/flipud/close_mosaic/
+    cos_lr/nbs) so probes, training and the cache all see the same truth.
+    """
     return {
         "model": model, "imgsz": int(imgsz), "batch": int(batch), "workers": int(workers),
         "multi_scale": float(multi_scale), "mosaic": float(mosaic),
         "mixup": float(mixup), "copy_paste": float(copy_paste),
+        "degrees": 180, "flipud": 0.5, "close_mosaic": 60, "cos_lr": True, "nbs": 64,
     }
 
 
@@ -4107,15 +4122,15 @@ def log_resume_checkpoint_info(logger, last_pt: Path):
 def chosen_augmentation(chosen: dict) -> dict:
     """Full Ultralytics augmentation kwargs built from a calibrated selection."""
     aug = {
-        "degrees": 180,
-        "flipud": 0.5,
+        "degrees": chosen.get("degrees", 180),
+        "flipud": chosen.get("flipud", 0.5),
         "copy_paste": chosen["copy_paste"],
         "mixup": chosen["mixup"],
         "mosaic": chosen["mosaic"],
         "multi_scale": chosen["multi_scale"],
-        "close_mosaic": 60,
-        "cos_lr": True,
-        "nbs": 64,
+        "close_mosaic": chosen.get("close_mosaic", 60),
+        "cos_lr": chosen.get("cos_lr", True),
+        "nbs": chosen.get("nbs", 64),
     }
     return aug
 
@@ -4220,21 +4235,13 @@ def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run
     if unsafe_reasons:
         logger.log("[RESUME CALIBRATE] original checkpoint config unsafe: " + "; ".join(unsafe_reasons))
 
-    chosen = {
-        "model": model_name,
-        "imgsz": int(imgsz),
-        "batch": int(batch),
-        "workers": int(workers),
-        "multi_scale": float(multi_scale),
-        "mosaic": float(mosaic),
-        "mixup": float(mixup),
-        "copy_paste": float(copy_paste),
-    }
+    chosen = build_chosen(model_name, imgsz, batch, workers, multi_scale, mosaic,
+                          mixup=mixup, copy_paste=copy_paste)
 
     # cache lookup for resume selections
     cache_key = "resume_selections"
     pid = fingerprint_hash(hw_fp)
-    ds_key = fingerprint_hash(ds_fp)
+    ds_key = f"{fingerprint_hash(ds_fp)}|intent:quality-v1"
     profile = cache.get("hardware_profiles", {}).get(pid) if cache.get("hardware_profiles") else None
     rsel = None
     if profile:

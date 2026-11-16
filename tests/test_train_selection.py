@@ -151,3 +151,51 @@ def test_calibrate_steps_down_ladder_when_heaviest_unsafe(monkeypatch):
     assert chosen["copy_paste"] == 0.3
     # The old standalone "multi-scale upgrade (ms 0.5, mosaic 0.5)" probe is gone.
     assert not any(c["multi_scale"] == 0.5 and c["mosaic"] == 0.5 for c in calls)
+
+
+def test_build_chosen_carries_fixed_aug_constants():
+    chosen = td.build_chosen("yolo26x.pt", 640, 8, 4, 0.5, 1.0)
+    assert chosen["degrees"] == 180
+    assert chosen["flipud"] == 0.5
+    assert chosen["close_mosaic"] == 60
+    assert chosen["cos_lr"] is True
+    assert chosen["nbs"] == 64
+    # splat-safe through config_signature (record_calibration/run_probe style)
+    td.config_signature(**chosen)
+
+
+def test_config_signature_differs_on_close_mosaic_and_degrees():
+    base = td.config_signature("yolo26x.pt", 640, 8, 4, 0.0, 1.0, 0.15, 0.3)
+    same = td.config_signature("yolo26x.pt", 640, 8, 4, 0.0, 1.0, 0.15, 0.3)
+    diff_cm = td.config_signature("yolo26x.pt", 640, 8, 4, 0.0, 1.0, 0.15, 0.3, close_mosaic=30)
+    diff_deg = td.config_signature("yolo26x.pt", 640, 8, 4, 0.0, 1.0, 0.15, 0.3, degrees=45)
+    assert base == same
+    assert base != diff_cm
+    assert base != diff_deg
+
+
+def test_eight_key_resume_signature_matches_build_chosen_signature():
+    """Configs written without the fixed constants (defaults) must hash identically."""
+    eight = td.config_signature("yolo26x.pt", 640, 8, 4, 0.0, 1.0, 0.15, 0.3)
+    thirteen = td.config_signature(**td.build_chosen("yolo26x.pt", 640, 8, 4, 0.0, 1.0, 0.15, 0.3))
+    assert eight == thirteen
+
+
+def test_selection_signature_contains_quality_intent_marker():
+    args = argparse.Namespace(model=None, imgsz=None, batch=None, workers=None, memory_profile="safe")
+    ds_fp = {"image_count": 123, "task": "detect", "names": ["a"]}
+    sig = td.selection_signature(args, ds_fp)
+    assert "intent:quality-v1" in sig
+
+
+def test_load_memory_cache_discards_version_two_fixture(tmp_path, monkeypatch):
+    import json
+    cache_file = tmp_path / "memory_profiles.json"
+    cache_file.write_text(json.dumps({
+        "version": 2,
+        "hardware_profiles": {"hw": {"selections": {"k": {"config_key": "old"}}, "configs": {}}},
+    }), encoding="utf-8")
+    monkeypatch.setattr(td, "MEMORY_CACHE_PATH", cache_file)
+    fresh = td.load_memory_cache(FakeCalibrateLogger())
+    assert fresh["version"] == 3
+    assert fresh["hardware_profiles"] == {}
