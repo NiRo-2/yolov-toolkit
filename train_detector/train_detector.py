@@ -5,6 +5,16 @@ Every fresh or resumed training invocation writes a per-run text log under <run_
 Memory/model/batch selection is dynamically calibrated with real-dataset probe runs for the
 selected hardware, device, dataset and augmentation config; static estimates are fallback only.
 
+AUTO SELECTION POLICY: quality-first. Fresh runs attempt the largest task model
+(yolo26x / -seg / -pose) first for every dataset size and the heaviest augmentation
+combo (mosaic 1.0, copy_paste 0.3, mixup 0.15, multi_scale 0.5) first, then step down
+the model/imgsz/batch/augmentation ladders only when a dynamic probe or the runtime
+guard says a config is memory-unsafe; a stable run steps back up the ladder. Nothing
+trains unverified unless --force-unsafe or --no-memory-probe is passed explicitly.
+Runs are slower by design; safety guarantees are unchanged (memory-profile safe by
+default). The selection cache (weights/memory_profiles.json) is schema version 3 keyed
+ by intent "quality-v1": the first run after this policy change recalibrates fully.
+
 Usage:
     # Fresh training run (auto-configures everything, runs dynamic memory calibration)
     # --input is a dataset DIRECTORY: YOLO (data.yaml present or synthesized), COCO JSON, or VOC XML.
@@ -60,7 +70,7 @@ Usage:
 
 Output:
     train_detector/weights/<model>.pt                 <- Ultralytics pretrained backbones (cached)
-    train_detector/weights/memory_profiles.json       <- measured dynamic memory cache (schema v2)
+    train_detector/weights/memory_profiles.json       <- measured dynamic memory cache (schema v3, quality-v1 intent)
     train_detector/weights/vram_estimates.json        <- legacy fallback estimates only
     train_detector/runs/detect/<name>/Logs/run-<localtime><offset>.log     <- fresh run log
     train_detector/runs/detect/<name>/Logs/resume-<localtime><offset>.log  <- resume run log
@@ -4148,6 +4158,9 @@ def print_auto_config(logger, chosen, provenance, args, hw, ds_fp, device):
     logger.log(f"  train imgs : {ds_fp.get('image_count')}")
     native = ds_fp.get("median_img_size")
     logger.log(f"  native res : {native}px" if native else "  native res : unknown")
+
+    logger.log("\n[Selection policy] quality-first (largest model / heaviest safe aug); speed not prioritized")
+    logger.log("  downgrades and step-ups happen only on measured probe/adaptive signals (see [Calibrate]/[Adaptive] lines)")
 
     logger.log(f"\n[Selected Config] (source: {provenance})")
     logger.log(f"  model      : {chosen['model']}")

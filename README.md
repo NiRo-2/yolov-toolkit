@@ -426,31 +426,24 @@ When a dataset is segment-dominant but a small bbox-only minority slipped in (co
 
 **Repair the source before tiling:** run `--fix-label-structure` on the original dataset, then run `tile_yolo_dataset.py` on the repaired output — tiling clips polygons correctly, but only once every label line is already a polygon.
 
-### Auto-configuration
+### Auto-configuration — quality-first policy
 
-The script detects your hardware and dataset size, then selects the best model, image size, and batch size automatically.
+The script detects your hardware and dataset, then targets **maximum achievable quality/accuracy** — speed is not prioritized. Every selection stays **probe-verified safe**: dynamic 1-epoch probe runs on a dataset subset measure real GPU/CPU memory, and configs only ship when a probe (or the runtime memory guard) says they fit.
 
-| Train images | VRAM | Model | imgsz | Reason |
-|---|---|---|---|---|
-| < 1,000 | ≥ 16GB | yolo26m | 1280 | Small dataset — m avoids overfit |
-| 1,000–5,000 | ≥ 16GB | yolo26l | 1024 | l+1280 already fits batch 8; 1024 kept for imgsz/batch balance |
-| > 5,000 | ≥ 16GB | yolo26x | 1280† | Large dataset justifies x |
-| < 1,000 | ≥ 12GB | yolo26m | 1024 | Small dataset, safe imgsz |
-| 1,000–5,000 | ≥ 12GB | yolo26l | 1024 | VRAM limit, keep imgsz safe |
-| > 5,000 | ≥ 12GB | yolo26l | 1024 | l is safe ceiling at 12GB |
-| < 1,000 | ≥ 8GB | yolo26m | 640 | Low VRAM, keep it safe |
-| 1,000–5,000 | ≥ 8GB | yolo26m | 1024 | m is safe at 8GB + 1024 |
-| > 5,000 | ≥ 8GB | yolo26l | 1024 | Dataset justifies l |
-| any | < 8GB | yolo26m | 640 | Low VRAM, minimal safe config |
-| any | CPU | yolo26m | 640 | CPU fallback |
+- **Model:** the largest task model is tried first for every dataset size — GPU runs attempt `yolo26x` → `l` → `m` → `n` (task-correct `-seg`/`-pose` suffixes); CPU runs attempt `l` → `m` → `n` (x excluded on CPU as a practicality cap). Dataset size no longer picks the model; dynamic probes decide fit. Smaller models are probe-failure fallbacks, not defaults.
+- **imgsz:** native-capped — the largest standard size that does not upscale beyond the dataset's native resolution, then lower standards as fallbacks.
+- **Augmentation:** the heaviest combo is attempted first — `mosaic 1.0, copy_paste 0.3, mixup 0.15, multi_scale 0.5` — and the run steps down an augmentation ladder only on measured-unsafe probes. Fixed fresh-run constants: `degrees=180`, `flipud=0.5`, `close_mosaic=60`, `cos_lr=True`, `nbs=64`.
+- **Batch ladder:** `8 → 4` (effective batch stays 64 via `nbs` gradient accumulation). Batch is only considered at imgsz/model combos whose probes pass; `MIN_AUTO_BATCH=4` floor as before.
+- **Adaptive supervisor:** during training the runtime guard downgrades batch/aug/imgsz/workers on pressure, and a stable run **steps back up** the ladder one rung at a time, each step probe-verified before adoption.
+- **Resume:** the checkpoint's own augmentation (including `multi_scale`) is kept when a probe on the current hardware says it is safe; it is reset to `0.0` only when the probe says unsafe or cannot verify (no dataset yaml, CPU device, `--no-memory-probe`).
 
-† `yolo26x`@1280 only ships when it reaches the batch-8 minimum, which needs roughly ≥ 17.6GB VRAM. At exactly 16GB, `yolo26x`@1280 only reaches batch 4, so the script falls back to `yolo26x`@1024 instead.
+**Expect slower runs than the old speed-balanced defaults — this is by design.** Safety guarantees are unchanged: `--memory-profile safe` remains the default, guards and adaptive recovery stay active, and nothing trains unverified unless you explicitly pass `--force-unsafe` or `--no-memory-probe`.
 
-**Key constraint:** imgsz is only raised when batch size stays ≥ 4. Fresh runs set `nbs=64` so YOLO gradient accumulation keeps the effective batch at 64 even when per-step batch is smaller. The `[Auto Config]` block prints `effective batch` when batch < 64.
+**Cache:** measured-safe selections are cached at `train_detector/weights/memory_profiles.json` (schema **v3**, keyed by intent `quality-v1`). The first run after this policy change discards the old v2 cache and recalibrates fully (one round of probe runs).
 
-Batch size is calculated from VRAM × 85% safety margin ÷ VRAM-per-image estimate, clamped to powers of 2 (4, 8, 16, 32, 64). Worker count is calculated from CPU cores and RAM, capped at 8 for Windows stability.
+**Key constraint:** imgsz is only raised when batch size stays ≥ 4. Fresh runs set `nbs=64` so YOLO gradient accumulation keeps the effective batch at 64 even when per-step batch is smaller. The `[Auto Config]` block prints `effective batch` when batch < 64, plus a `[Selection policy]` line stating the quality-first behavior.
 
-**Augmentation** (fresh runs only; not applied on `--resume`): `degrees=180`, `flipud=0.5`, `copy_paste=0.3`, `mixup=0.15`, `multi_scale=0.5` (when VRAM supports batch ≥ 4 under peak multi-scale sizing; otherwise `0.0`), `close_mosaic=60`, `cos_lr=True`, `nbs=64`. The script prints `[Auto Config]` (including effective batch when batch < 64) and an `[Augmentation Config]` block before training starts.
+Worker count is calculated from CPU cores and RAM, capped at 8 for Windows stability.
 
 ### VRAM probe
 

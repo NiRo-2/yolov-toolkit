@@ -340,6 +340,19 @@ def test_aug_step_up_candidate_climbs_one_rung(monkeypatch):
     assert td.aug_step_up_candidate(cfg) is None  # already at the top
 
 
+def test_print_auto_config_states_quality_first_policy():
+    logger = FakeCalibrateLogger()
+    chosen = td.build_chosen("yolo26x.pt", 1024, 8, 4, 0.5, 1.0)
+    args = argparse.Namespace(batch=None, workers=None)
+    hw = {"gpu_name": "RTX 4080", "vram_gb": 16.0, "cpu_cores": 12, "ram_gb": 32.0}
+    ds_fp = {"image_count": 1000, "median_img_size": 1280}
+    td.print_auto_config(logger, chosen, "measured", args, hw, ds_fp, "0")
+    policy = [l for l in logger.lines if "[Selection policy]" in l]
+    assert len(policy) == 1
+    assert "quality-first" in policy[0]
+    assert "speed not prioritized" in policy[0]
+
+
 def test_aug_step_up_candidate_returns_none_when_maxed_or_off_ladder():
     assert td.aug_step_up_candidate(make_cfg(1.0, 0.3, 0.15, 0.5)) is None
     assert td.aug_step_up_candidate(make_cfg(0.7, 0.25, 0.1, 0.3)) is None
