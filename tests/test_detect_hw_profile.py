@@ -102,3 +102,103 @@ def test_only_detections_flag_removed():
     import detect_images.detect_images as mod
     src = Path(mod.__file__).read_text()
     assert "--only-detections" not in src
+
+
+def test_precision_kwargs_fp32(monkeypatch):
+    """half=False must always return an empty dict (FP32, unchanged)."""
+    monkeypatch.setattr(di, "_SUPPORTS_QUANTIZE", True)
+    assert di._precision_kwargs(False) == {}
+    monkeypatch.setattr(di, "_SUPPORTS_QUANTIZE", False)
+    assert di._precision_kwargs(False) == {}
+
+
+def test_precision_kwargs_half_on_modern(monkeypatch):
+    """On a build that supports quantize, half=True -> {"quantize": 16}."""
+    monkeypatch.setattr(di, "_SUPPORTS_QUANTIZE", True)
+    assert di._precision_kwargs(True) == {"quantize": 16}
+
+
+def test_precision_kwargs_half_on_legacy(monkeypatch):
+    """On an older build, half=True -> {"half": True}."""
+    monkeypatch.setattr(di, "_SUPPORTS_QUANTIZE", False)
+    assert di._precision_kwargs(True) == {"half": True}
+
+
+def test_supports_quantize_probe_matches_cfg():
+    """The module-level probe must agree with ultralytics' DEFAULT_CFG_DICT."""
+    try:
+        from ultralytics.cfg import DEFAULT_CFG_DICT as _UCFG
+        assert di._SUPPORTS_QUANTIZE == ("quantize" in _UCFG)
+    except Exception:
+        assert di._SUPPORTS_QUANTIZE is False
+
+
+class _FakeStdout:
+    """Line-buffered fake stdout that yields queued lines then EOF."""
+
+    def __init__(self, lines):
+        self._lines = list(lines)
+        self._pos = 0
+
+    def readline(self):
+        if self._pos >= len(self._lines):
+            return ""
+        line = self._lines[self._pos]
+        self._pos += 1
+        return line
+
+
+class _FakeProc:
+    def __init__(self, lines):
+        self.stdout = _FakeStdout(lines)
+        self.stdin = type("S", (), {"write": lambda self, s: None, "flush": lambda self: None})()
+        self._poll = None  # None == still running (matches subprocess.Popen.poll semantics)
+
+    def poll(self):
+        return self._poll
+
+    def kill(self):
+        self._poll = -1
+
+
+def test_stay_open_pool_captures_output_before_ready(monkeypatch):
+    """_read_ready must return the command's stdout, not [].
+
+    Regression: the pool previously discarded every line emitted before {ready}
+    by re-draining stdout through a no-op _collect_output, so pooled exiftool
+    output was always lost.
+    """
+    payload_lines = [
+        '[{"SourceFile": "a.jpg", "JFIF:JFIFVersion": [1, 2]}]\n',
+        '{ready}\n',
+    ]
+    fake = _FakeProc(payload_lines)
+    pool = di.StayOpenExifToolPool(["exiftool"], 1)
+    ok, lines = pool._read_ready(fake, 5.0)
+    assert ok is True
+    assert lines == ['[{"SourceFile": "a.jpg", "JFIF:JFIFVersion": [1, 2]}]\n']
+
+
+def test_stay_open_pool_run_returns_captured_output(monkeypatch):
+    """run() must surface the daemon's stdout instead of falling back to spawn."""
+    payload_lines = [
+        '[{"SourceFile": "a.jpg", "EXIF:DateTimeOriginal": "2024:01:01 00:00:00"}]\n',
+        '{ready}\n',
+    ]
+    fake = _FakeProc(payload_lines)
+    pool = di.StayOpenExifToolPool(["exiftool"], 1)
+    pool._procs = [fake]
+    rc, out, err = pool.run(["-j", "a.jpg"])
+    assert rc == 0
+    assert "SourceFile" in out
+    assert err == ""
+
+
+def test_stay_open_pool_ready_marker_excluded(monkeypatch):
+    """The {ready} sentinel itself must never appear in the captured output."""
+    fake = _FakeProc(['output line\n', '{ready}\n'])
+    pool = di.StayOpenExifToolPool(["exiftool"], 1)
+    ok, lines = pool._read_ready(fake, 5.0)
+    assert ok is True
+    assert lines == ['output line\n']
+    assert all("{ready}" not in ln for ln in lines)

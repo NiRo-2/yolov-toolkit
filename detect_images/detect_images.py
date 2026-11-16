@@ -92,6 +92,31 @@ try:
 except Exception:
     torch = None  # type: ignore[assignment]
 
+# -- Precision kwargs -----------------------------------------------------------
+# Ultralytics deprecated the ``half`` kwarg on YOLO model() calls in favor of
+# ``quantize`` (integer bit width) on newer builds. Probe once at import time
+# and route every inference call through ``_precision_kwargs`` so the correct
+# kwarg is used without changing the CLI surface.
+try:
+    from ultralytics.cfg import DEFAULT_CFG_DICT as _UCFG  # noqa: E402
+    _SUPPORTS_QUANTIZE = "quantize" in _UCFG
+except Exception:
+    _SUPPORTS_QUANTIZE = False
+
+
+def _precision_kwargs(half_on: bool) -> dict:
+    """Return the ultralytics precision kwarg dict for the requested half flag.
+
+    ``False`` -> ``{}`` (FP32, unchanged).
+    ``True`` on a build that supports ``quantize`` -> ``{"quantize": 16}`` (FP16).
+    ``True`` on an older build -> ``{"half": True}`` (legacy kwarg).
+    """
+    if not half_on:
+        return {}
+    if _SUPPORTS_QUANTIZE:
+        return {"quantize": 16}
+    return {"half": True}
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -413,9 +438,9 @@ def measure_inference_vram(engine, imgsz, half, device="cuda:0", runs=2):
     dummy = _np.zeros((imgsz, imgsz, 3), dtype=_np.uint8)
     try:
         for _ in range(runs):
-            engine([dummy], imgsz=imgsz, half=half, verbose=False, device=device)
+            engine([dummy], imgsz=imgsz, verbose=False, device=device, **_precision_kwargs(half))
         torch.cuda.reset_peak_memory_stats()
-        engine([dummy], imgsz=imgsz, half=half, verbose=False, device=device)
+        engine([dummy], imgsz=imgsz, verbose=False, device=device, **_precision_kwargs(half))
         peak = torch.cuda.max_memory_reserved()
         return int(peak * 1.15)
     except Exception:
@@ -455,7 +480,7 @@ def run_batch(engine, items, imgsz, conf, half, task, batch, device="cuda:0"):
     while remaining:
         chunk = remaining[:working_batch]
         try:
-            outs = engine(chunk, conf=conf, imgsz=imgsz, half=half, verbose=False, device=device)
+            outs = engine(chunk, conf=conf, imgsz=imgsz, verbose=False, device=device, **_precision_kwargs(half))
             for it, r in zip(chunk, outs):
                 results.append((it, r))
             remaining = remaining[working_batch:]
@@ -569,17 +594,22 @@ class StayOpenExifToolPool:
         return
 
     def _read_ready(self, proc, timeout):
+        """Read stdout until ``{ready}`` or timeout.
+
+        Returns ``(ok, lines)`` where ``lines`` is everything emitted *before*
+        the ready marker (i.e. the actual command output), ready marker excluded.
+        """
         lines = []
         try:
             while True:
                 line = proc.stdout.readline()
                 if not line:
-                    return False
-                lines.append(line)
+                    return False, lines
                 if line.strip() == "{ready}":
-                    return True
+                    return True, lines
+                lines.append(line)
         except Exception:
-            return False
+            return False, lines
 
     def run(self, args_list):
         """Run an exiftool command (list of args) and return (returncode, stdout, stderr)."""
@@ -595,14 +625,14 @@ class StayOpenExifToolPool:
                     payload = "\n".join(args_list) + "\n-execute\n"
                     proc.stdin.write(payload)
                     proc.stdin.flush()
-                    ok = self._read_ready(proc, self._timeout)
+                    ok, out_lines = self._read_ready(proc, self._timeout)
                     if not ok:
                         try:
                             proc.kill()
                         except Exception:
                             pass
                         continue
-                    out = "".join(self._collect_output(proc))
+                    out = "".join(out_lines)
                     return 0, out, ""
                 except Exception:
                     try:
@@ -613,7 +643,9 @@ class StayOpenExifToolPool:
             return self._fallback(args_list)
 
     def _collect_output(self, proc):
-        # Drain whatever the daemon emitted before {ready} (usually nothing for -execute).
+        # Compatibility shim. Real output is captured by _read_ready, which
+        # returns the lines emitted before {ready}; this hook is retained so
+        # external callers that drain stdout directly still have an API.
         return []
 
     def _fallback(self, args_list):
@@ -853,7 +885,7 @@ def merge_grouped_dets(dets: list, iou_thresh: float, task: str) -> list:
     return merged
 
 
-def detect_image_tiled(model, image_bgr, conf, tile, overlap, iou, batch_size=1, task: str = "detect") -> list:
+def detect_image_tiled(model, image_bgr, conf, tile, overlap, iou, batch_size=1, task: str = "detect", half=False) -> list:
     """Run tiled detection over one image; returns a flat list of det dicts.
 
     When ``batch_size <= 1`` this runs the legacy per-tile path verbatim so
@@ -877,7 +909,7 @@ def detect_image_tiled(model, image_bgr, conf, tile, overlap, iou, batch_size=1,
 
         tile_results = []
         for crop in crops:
-            tile_results.append(model([crop], conf=conf, imgsz=tile, verbose=False)[0])
+            tile_results.append(model([crop], conf=conf, imgsz=tile, verbose=False, **_precision_kwargs(half))[0])
 
         all_dets = []
         for (tx1, ty1, tx2, ty2), result in zip(windows, tile_results):
@@ -909,7 +941,8 @@ class TileBatcher:
     results: merge/NMS still runs once per image.
     """
 
-    def __init__(self, model, conf, tile, overlap, iou, batch_size, task, device="cuda:0", half=False):
+    def __init__(self, model, conf, tile, overlap, iou, batch_size, task, device="cuda:0", half=False,
+                 on_complete=None):
         self._model = model
         self._conf = conf
         self._tile = tile
@@ -924,6 +957,7 @@ class TileBatcher:
         self._dets_by_job = defaultdict(list)  # job_id -> [det, ...]
         self._results = {}            # job_id -> merged det list
         self._completed_jobs = set()
+        self._on_complete = on_complete
 
     def submit(self, crop, window, job_id):
         self._pending.append((crop, window, job_id))
@@ -939,7 +973,8 @@ class TileBatcher:
             crops = [c for (c, _w, _j) in chunk]
             try:
                 outs = self._model(crops, conf=self._conf, imgsz=self._tile,
-                                   half=self._half, verbose=False, device=self._device)
+                                   verbose=False, device=self._device,
+                                   **_precision_kwargs(self._half))
             except Exception:
                 outs = [None] * len(crops)
             for (crop, window, job_id), result in zip(chunk, outs):
@@ -969,11 +1004,15 @@ class TileBatcher:
         dets = self._dets_by_job.pop(job_id, [])
         if len(dets) <= 1:
             self._results[job_id] = dets
-            return
-        if self._task == "detect":
+        elif self._task == "detect":
             self._results[job_id] = nms_xyxy(dets, iou_thresh=self._iou)
         else:
             self._results[job_id] = merge_grouped_dets(dets, self._iou, self._task)
+        if self._on_complete is not None:
+            try:
+                self._on_complete(job_id, self._results[job_id])
+            except Exception:
+                pass
 
     def results_for(self, job_id):
         return self._results.get(job_id, [])
@@ -1205,15 +1244,31 @@ def _run_parallel(image_paths, images_dir, total, model, model_task, args,
                   batch_size, workers, decode_workers, byte_budget,
                   exiftool_pool, post_process, safe_print, output_dir,
                   half_on, device):
-    """Hardware-aware pipeline: decode pool -> bounded queue -> TileBatcher -> post pool."""
+    """Hardware-aware pipeline: decode pool -> bounded queue -> TileBatcher -> post pool.
+
+    Each image is decoded exactly once: decode workers pull paths from a shared
+    FIFO queue with ``get_nowait()`` until it is empty, instead of every worker
+    iterating the full image list. In tiled mode tiles accumulate across
+    decoded images and are flushed once ``working_batch`` tiles are pending,
+    so a single ``model()`` call can mix tiles from several source images;
+    per-image merge/NMS is unaffected because it is keyed by ``job_id``.
+    """
     from concurrent.futures import ThreadPoolExecutor
     from queue import Queue, Empty
+
+    path_queue = Queue()
+    for p in image_paths:
+        path_queue.put(p)
 
     in_queue = Queue(maxsize=max(1, decode_workers * 4))
     post_semaphore = threading.Semaphore(max(1, workers * 2))
 
     def decode_worker():
-        for p in image_paths:
+        while True:
+            try:
+                p = path_queue.get_nowait()
+            except Empty:
+                return
             im = cv2.imread(str(p))
             if im is None:
                 safe_print(f"  SKIP (could not read): {p.name}")
@@ -1227,15 +1282,13 @@ def _run_parallel(image_paths, images_dir, total, model, model_task, args,
             except Exception:
                 if byte_budget is not None:
                     byte_budget.release(img_bytes)
-                break
+                return
 
     decode_pool = ThreadPoolExecutor(max_workers=decode_workers,
                                      thread_name_prefix="decode")
-    for _ in range(decode_workers):
-        decode_pool.submit(decode_worker)
+    decode_futures = [decode_pool.submit(decode_worker) for _ in range(decode_workers)]
 
     working_batch = max(1, batch_size)
-    halvings = 0
     batcher = None
     if args.tiles:
         batcher = TileBatcher(model, args.conf, args.tile_imgsz, args.tile_overlap,
@@ -1252,13 +1305,31 @@ def _run_parallel(image_paths, images_dir, total, model, model_task, args,
     post_pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="post")
     job_counter = [0]
     job_lock = threading.Lock()
+    meta_lock = threading.Lock()
+    # job_id -> (idx, p, im, img_bytes, flat_name, display_name)
+    job_meta = {}
 
     def next_job_id():
         with job_lock:
             job_counter[0] += 1
             return job_counter[0]
 
-    def process_one(p, im):
+    def on_complete(job_id, dets):
+        with meta_lock:
+            meta = job_meta.pop(job_id, None)
+        if meta is None:
+            return
+        idx, p, im, img_bytes, flat_name, display_name = meta
+        try:
+            post_pool.submit(submit_post, idx, p, im, dets, flat_name, display_name)
+        finally:
+            if byte_budget is not None:
+                byte_budget.release(img_bytes)
+
+    if batcher is not None:
+        batcher._on_complete = on_complete
+
+    def process_one(p, im, img_bytes):
         idx = job_counter[0] + 1
         try:
             display_name = str(p.relative_to(images_dir))
@@ -1267,31 +1338,39 @@ def _run_parallel(image_paths, images_dir, total, model, model_task, args,
         flat_name = flat_output_name(p, images_dir)
         job_id = next_job_id()
         if args.tiles:
+            with meta_lock:
+                job_meta[job_id] = (idx, p, im, img_bytes, flat_name, display_name)
             h, w = im.shape[:2]
             for (tx1, ty1, tx2, ty2) in iter_tile_windows(w, h, args.tile_imgsz, args.tile_overlap):
                 batcher.submit(im[ty1:ty2, tx1:tx2], (tx1, ty1, tx2, ty2), job_id=job_id)
-            batcher.flush()
-            dets = batcher.results_for(job_id)
+            # Flush once enough tiles are pending to fill a model() call; tiles
+            # from several decoded images may share the call. Leftover tiles
+            # are drained in the ``finally`` block.
+            if len(batcher._pending) >= working_batch:
+                batcher.flush()
         else:
             try:
-                outs = model([im], conf=args.conf, verbose=False, half=half_on, device=device)
+                outs = model([im], conf=args.conf, verbose=False, device=device,
+                             **_precision_kwargs(half_on))
                 r = outs[0] if outs else None
             except Exception:
                 r = None
             dets = results_to_dets(r, task=model_task) if r is not None else []
-        post_pool.submit(submit_post, idx, p, im, dets, flat_name, display_name)
+            post_pool.submit(submit_post, idx, p, im, dets, flat_name, display_name)
+            if byte_budget is not None:
+                byte_budget.release(img_bytes)
 
     try:
         while True:
             try:
                 p, im, img_bytes = in_queue.get(timeout=0.5)
             except Empty:
-                if all(not t.is_alive() for t in decode_pool._threads):
+                if all(f.done() for f in decode_futures):
                     break
                 continue
             try:
-                process_one(p, im)
-            finally:
+                process_one(p, im, img_bytes)
+            except Exception:
                 if byte_budget is not None:
                     byte_budget.release(img_bytes)
     finally:
@@ -1674,7 +1753,7 @@ def run(args):
                         dets = detect_image_tiled(
                             model, im, args.conf,
                             args.tile_imgsz, args.tile_overlap, args.tile_iou,
-                            batch_size, task=model_task,
+                            batch_size, task=model_task, half=half_on,
                         )
                         pool.submit(post_process, idx, p, im, dets, flat_name, display_name)
                 else:
