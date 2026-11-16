@@ -4368,6 +4368,25 @@ def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run
     return chosen, provenance
 
 
+def aug_step_up_candidate(cfg: dict):
+    """
+    Next-heavier AUG_LADDER rung for cfg's augmentation combo, or None when the
+    combo is already the heaviest rung or is off-ladder (e.g. a checkpoint's
+    custom aug values — no defined heavier target).
+    """
+    cur = (cfg["mosaic"], cfg["copy_paste"], cfg["mixup"], cfg["multi_scale"])
+    cur_r = (round(cur[0], 2), round(cur[1], 2), round(cur[2], 2), round(cur[3], 2))
+    for i, t in enumerate(AUG_LADDER):
+        if (round(t[0], 2), round(t[1], 2), round(t[2], 2), round(t[3], 2)) == cur_r:
+            if i == 0:
+                return None
+            t = AUG_LADDER[i - 1]
+            new = dict(cfg)
+            new["mosaic"], new["copy_paste"], new["mixup"], new["multi_scale"] = t
+            return new
+    return None
+
+
 # -- Adaptive supervisor ---------------------------------------------------------
 def run_attempt(args, logger, run_dir, last_pt, chosen, target_epochs, device, guard,
                 yaml_path, ckpt_cfg, mode, attempt_no, state):
@@ -4788,26 +4807,30 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
             if (state.get("stable_epochs", 0) >= STABLE_EPOCHS_BEFORE_STEP_UP
                     and guard.peak_reserved() < (hw.get("vram_gb", 0) * STABLE_STEP_UP_GPU_FRACTION)
                     and tracker.oom_auto_reduced is False):
-                # attempt step-up: try higher batch or multi_scale
-                new_cfg = dict(current_cfg)
+                # Quality-first step-up: batch first, then climb one rung up the
+                # AUG_LADDER (mosaic 0.5->1.0, ms 0->0.5 etc.); every candidate
+                # must pass probe_config_safe before it is adopted.
                 stepped = False
-                # try batch step up
                 if current_cfg["batch"] < 8:
-                    # try next in reverse ladder
-                    rev = [1, 2, 4, 8]
-                    for b in rev:
-                        if b > current_cfg["batch"]:
-                            new_cfg["batch"] = b
+                    new_batch = next((b for b in (1, 2, 4, 8) if b > current_cfg["batch"]), None)
+                    if new_batch is not None:
+                        cand = dict(current_cfg)
+                        cand["batch"] = new_batch
+                        if probe_config_safe(cand):
+                            logger.log(f"[Adaptive] step-up approved (batch): {current_cfg['batch']} -> {new_batch}")
+                            current_cfg = cand
                             stepped = True
-                            break
-                # try multi_scale 0->0.5 if mosaic<=0.5
-                if (not stepped and current_cfg["multi_scale"] == 0.0 and current_cfg["mosaic"] <= 0.5):
-                    new_cfg["multi_scale"] = 0.5
-                    stepped = True
-                if stepped and probe_config_safe(new_cfg):
-                    logger.log(f"[Adaptive] step-up approved: {current_cfg} -> {new_cfg}")
-                    current_cfg = new_cfg
-                else:
+                        else:
+                            logger.log(f"[Adaptive] batch step-up to {new_batch} probe-rejected; trying augmentation step-up.")
+                if not stepped:
+                    cand = aug_step_up_candidate(current_cfg)
+                    if cand is not None and probe_config_safe(cand):
+                        cur_a = (current_cfg['mosaic'], current_cfg['copy_paste'], current_cfg['mixup'], current_cfg['multi_scale'])
+                        new_a = (cand['mosaic'], cand['copy_paste'], cand['mixup'], cand['multi_scale'])
+                        logger.log(f"[Adaptive] step-up approved (augmentation ladder): {cur_a} -> {new_a}")
+                        current_cfg = cand
+                        stepped = True
+                if not stepped:
                     logger.log("[Adaptive] step-up not approved (unsafe or not eligible).")
             # continue loop (next attempt runs more)
             mode = "resume"

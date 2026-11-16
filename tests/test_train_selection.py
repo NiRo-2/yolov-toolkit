@@ -302,3 +302,119 @@ def test_resume_selection_cache_key_carries_intent_marker(monkeypatch, tmp_path)
     keys = list(profile["resume_selections"].keys())
     assert len(keys) == 1
     assert "intent:quality-v1" in keys[0]
+
+
+def make_cfg(mosaic, copy_paste, mixup, multi_scale, batch=8):
+    cfg = {"model": "yolo26x.pt", "imgsz": 640, "batch": batch, "workers": 2,
+           "mosaic": mosaic, "copy_paste": copy_paste, "mixup": mixup, "multi_scale": multi_scale}
+    cfg.update(td.build_chosen("yolo26x.pt", 640, batch, 2, multi_scale, mosaic,
+                               mixup=mixup, copy_paste=copy_paste))
+    return cfg
+
+
+def test_aug_step_up_candidate_climbs_one_rung(monkeypatch):
+    # A climb moves exactly one rung up the declared AUG_LADDER.
+    cand = td.aug_step_up_candidate(make_cfg(0.5, 0.0, 0.0, 0.0))
+    assert (cand["mosaic"], cand["copy_paste"], cand["mixup"], cand["multi_scale"]) == (0.5, 0.3, 0.0, 0.0)
+    # ms 0 rung under the top -> heaviest rung (plan example: ms 0->0.5)
+    cand = td.aug_step_up_candidate(make_cfg(1.0, 0.3, 0.15, 0.0))
+    assert (cand["mosaic"], cand["copy_paste"], cand["mixup"], cand["multi_scale"]) == (1.0, 0.3, 0.15, 0.5)
+    # mixup climb
+    cand = td.aug_step_up_candidate(make_cfg(1.0, 0.3, 0.0, 0.0))
+    assert (cand["mosaic"], cand["copy_paste"], cand["mixup"], cand["multi_scale"]) == (1.0, 0.3, 0.15, 0.0)
+    # carried constants survive the climb
+    assert cand["degrees"] == 180 and cand["close_mosaic"] == 60
+    # repeated climbs from the bottom rung walk the whole ladder to the top,
+    # visiting mosaic 0.5 -> 1.0 and multi_scale 0 -> 0.5 along the way.
+    cfg = make_cfg(0.0, 0.0, 0.0, 0.0)
+    visited = []
+    for _ in range(len(AUG_LADDER)):
+        cand = td.aug_step_up_candidate(cfg)
+        if cand is None:
+            break
+        cfg = cand
+        visited.append((cfg["mosaic"], cfg["copy_paste"], cfg["mixup"], cfg["multi_scale"]))
+    assert visited == AUG_LADDER[:7][::-1]
+    # the top rung is the plan's example endpoint: mosaic 1.0 with ms 0.5
+    assert visited[-1] == (1.0, 0.3, 0.15, 0.5)
+    assert td.aug_step_up_candidate(cfg) is None  # already at the top
+
+
+def test_aug_step_up_candidate_returns_none_when_maxed_or_off_ladder():
+    assert td.aug_step_up_candidate(make_cfg(1.0, 0.3, 0.15, 0.5)) is None
+    assert td.aug_step_up_candidate(make_cfg(0.7, 0.25, 0.1, 0.3)) is None
+
+
+class FakeGuard:
+    def peak_reserved(self):
+        return 1.0
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+
+def run_supervisor_stepup(monkeypatch, tmp_path, start_aug, unsafe_rungs):
+    """Drive run_adaptive_supervisor with stubbed attempts/probes; return (attempt_cfgs, probe_cfgs, status)."""
+    attempt_cfgs = []
+    probe_cfgs = []
+
+    def fake_probe(model_name, device, data_yaml, imgsz, batch, multi_scale, mosaic, mixup,
+                   copy_paste, fraction, cuda_index, workers=0):
+        probe_cfgs.append((mosaic, copy_paste, mixup, multi_scale, batch))
+        if (mosaic, copy_paste, mixup, multi_scale) in unsafe_rungs:
+            return (9.0, 9.5, 1.0)  # > safe cap 10*0.68 = 6.8 GB
+        return (1.0, 2.0, 1.0)
+
+    def fake_run_attempt(args, logger, run_dir, current_ckpt, current_cfg, target_epochs,
+                         device, guard, yaml_path, ckpt_cfg, mode, attempt_no, state):
+        attempt_cfgs.append((current_cfg["mosaic"], current_cfg["multi_scale"], current_cfg["batch"]))
+        state["completed_epoch"] = state.get("completed_epoch", 0) + 1
+        import types
+        tracker = types.SimpleNamespace(
+            status="completed-attempt",
+            completed_epoch=state["completed_epoch"],
+            adaptive_triggered=False,
+            emergency_triggered=False,
+            oom_auto_reduced=False,
+        )
+        return tracker
+
+    monkeypatch.setattr(td, "probe_train_once", fake_probe)
+    monkeypatch.setattr(td, "cuda_available_for", lambda d: True)
+    monkeypatch.setattr(td, "cuda_index_for", lambda d: 0)
+    monkeypatch.setattr(td, "run_attempt", fake_run_attempt)
+
+    args = argparse.Namespace(patience=100, memory_profile="safe", no_memory_probe=False, force_unsafe=False)
+    hw = {"vram_gb": 10.0, "ram_gb": 32.0, "cpu_cores": 8, "gpu_name": "FakeGPU"}
+    chosen = make_cfg(*start_aug)
+    state = {"run_name": "t", "target_epochs": 12, "completed_epoch": 0,
+             "provisional": True, "stable_epochs": 0, "downgrade_count": 0, "history": []}
+    status = td.run_adaptive_supervisor(
+        args=args, logger=FakeCalibrateLogger(), run_dir=tmp_path / "run", run_name="t",
+        last_pt=None, chosen=chosen, target_epochs=12, device="0", hw=hw,
+        guard=FakeGuard(), state=state, yaml_path=None, ckpt_cfg={}, mode="fresh",
+    )
+    return attempt_cfgs, probe_cfgs, status
+
+
+def test_supervisor_steps_augmentation_up_when_stable_and_safe(monkeypatch, tmp_path):
+    attempt_cfgs, probe_cfgs, status = run_supervisor_stepup(
+        monkeypatch, tmp_path, start_aug=(0.5, 0.0, 0.0, 0.0), unsafe_rungs=set())
+    assert status == "completed-target"
+    # attempts start on the 0.5-mosaic rung and climb to mosaic 1.0 after stability
+    assert attempt_cfgs[0] == (0.5, 0.0, 8)
+    assert any(c[0] == 1.0 for c in attempt_cfgs)
+    assert attempt_cfgs[-1][0] == 1.0
+    # the candidate rung was probe-validated before approval
+    assert (1.0, 0.0, 0.0, 0.0, 8) in probe_cfgs
+
+
+def test_supervisor_keeps_aug_when_step_up_probe_rejects(monkeypatch, tmp_path):
+    attempt_cfgs, probe_cfgs, status = run_supervisor_stepup(
+        monkeypatch, tmp_path, start_aug=(0.5, 0.0, 0.0, 0.0),
+        unsafe_rungs={(1.0, 0.0, 0.0, 0.0)})
+    assert (1.0, 0.0, 0.0, 0.0, 8) in probe_cfgs  # candidate was attempted
+    assert all(c[0] == 0.5 for c in attempt_cfgs)  # ...and never adopted
