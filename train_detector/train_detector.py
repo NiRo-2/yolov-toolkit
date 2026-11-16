@@ -1654,24 +1654,19 @@ def auto_workers_limit():
 
 
 def model_candidates(image_count: int, vram_gb, for_cpu: bool, task: str = "detect") -> list:
-    """Quality-first model chain for the dataset task; smaller models appended as hardware fallbacks."""
+    """
+    Quality-first model chain for the dataset task: the largest task model is
+    the first attempt for every dataset size; smaller models are appended only
+    as probe-failure fallbacks. Fit is decided by dynamic probes, this order
+    is fallback only. CPU runs cap the chain at 'l' (practicality cap).
+    """
     order = model_order_for_task(task)
-    suffix = MODEL_TASK_SUFFIXES.get(task, "")
-    if image_count < 1000:
-        size = "m"
-    elif image_count < 5000:
-        size = "l"
-    else:
-        size = "x" if (vram_gb or 0) >= 16 else "l"
-    choice = f"yolo26{size}{suffix}.pt"
-    idx = order.index(choice)
-    cands = [choice] + [m for m in reversed(order[:idx])]
     if for_cpu:
-        cands = [m for m in cands if "26x" not in m]
-        for fallback in (f"yolo26m{suffix}.pt", f"yolo26n{suffix}.pt"):
-            if fallback not in cands:
-                cands.append(fallback)
-    return cands
+        chain = ["l", "m", "n"]
+    else:
+        chain = ["x", "l", "m", "n"]
+    suffix = MODEL_TASK_SUFFIXES.get(task, "")
+    return [f"yolo26{size}{suffix}.pt" for size in chain]
 
 
 # -- Dynamic Memory Calibration ----------------------------------------------------
