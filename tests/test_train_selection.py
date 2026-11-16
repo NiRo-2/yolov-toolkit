@@ -303,6 +303,18 @@ def test_resume_selection_cache_key_carries_intent_marker(monkeypatch, tmp_path)
     assert len(keys) == 1
     assert "intent:quality-v1" in keys[0]
 
+    # The key written on the first run must be the key the lookup reads back:
+    # a second calibration against the SAME cache short-circuits to "cache".
+    chosen2, provenance2 = td.calibrate_resume_config(
+        make_resume_args(), FakeCalibrateLogger(), cache,
+        {"vram_gb": 10.0, "ram_gb": 32.0, "cpu_cores": 8, "gpu_name": "FakeGPU"},
+        {"fp": 1}, {"median_img_size": 1280, "image_count": 1000, "task": "detect"},
+        dict(RESUME_CKPT_CFG), tmp_path / "run",
+        yaml_path=tmp_path / "ds" / "data.yaml", device="0",
+    )
+    assert provenance2 == "cache"
+    assert chosen2["multi_scale"] == 0.5  # the probe-kept value survives the cache round-trip
+
 
 def make_cfg(mosaic, copy_paste, mixup, multi_scale, batch=8):
     cfg = {"model": "yolo26x.pt", "imgsz": 640, "batch": batch, "workers": 2,
