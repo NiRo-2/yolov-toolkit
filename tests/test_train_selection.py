@@ -199,3 +199,106 @@ def test_load_memory_cache_discards_version_two_fixture(tmp_path, monkeypatch):
     fresh = td.load_memory_cache(FakeCalibrateLogger())
     assert fresh["version"] == 3
     assert fresh["hardware_profiles"] == {}
+
+
+def make_resume_args(force_unsafe=False, no_memory_probe=False):
+    return argparse.Namespace(
+        force_unsafe=force_unsafe, no_memory_probe=no_memory_probe, memory_profile="safe",
+    )
+
+
+RESUME_CKPT_CFG = {
+    "model": "yolo26x.pt", "imgsz": 640, "batch": 4, "workers": 4,
+    "multi_scale": 0.5, "mosaic": 1.0, "mixup": 0.15, "copy_paste": 0.3,
+}
+
+
+def run_resume_calibrate(monkeypatch, tmp_path, peaks, yaml_path="use_tmp", device="0",
+                         force_unsafe=False, no_memory_probe=False):
+    calls = []
+
+    def fake_probe(model_name, device, data_yaml, imgsz, batch, multi_scale, mosaic, mixup,
+                   copy_paste, fraction, cuda_index, workers=0):
+        calls.append({
+            "model": model_name, "imgsz": imgsz, "batch": batch, "workers": workers,
+            "multi_scale": multi_scale, "mosaic": mosaic, "mixup": mixup, "copy_paste": copy_paste,
+        })
+        return peaks
+
+    monkeypatch.setattr(td, "probe_train_once", fake_probe)
+    monkeypatch.setattr(td, "cuda_available_for", lambda d: d != "cpu")
+    monkeypatch.setattr(td, "cuda_index_for", lambda d: 0)
+    monkeypatch.setattr(td, "save_memory_cache", lambda cache, logger: True)
+    monkeypatch.setattr(td, "_infer_resume_architecture_model",
+                        lambda run_dir, ckpt_cfg=None, task="detect": "yolo26x.pt")
+
+    if yaml_path == "use_tmp":
+        ds_dir = tmp_path / "ds"
+        imgs = ds_dir / "train" / "images"
+        imgs.mkdir(parents=True)
+        (imgs / "a.jpg").write_bytes(b"\xff\xd8\xff")
+        (ds_dir / "data.yaml").write_text(
+            "train: train/images\nval: val/images\nnc: 1\nnames: [a]\n", encoding="utf-8")
+        yaml_arg = ds_dir / "data.yaml"
+    else:
+        yaml_arg = None
+
+    logger = FakeCalibrateLogger()
+    hw = {"vram_gb": 10.0, "ram_gb": 32.0, "cpu_cores": 8, "gpu_name": "FakeGPU"}
+    ds_fp = {"median_img_size": 1280, "image_count": 1000, "task": "detect"}
+    cache = {"version": 3, "hardware_profiles": {}}
+    chosen, provenance = td.calibrate_resume_config(
+        make_resume_args(force_unsafe=force_unsafe, no_memory_probe=no_memory_probe),
+        logger, cache, hw, {"fp": 1}, ds_fp, dict(RESUME_CKPT_CFG), tmp_path / "run",
+        yaml_path=yaml_arg, device=device,
+    )
+    return chosen, provenance, calls, cache, logger
+
+
+def test_resume_keeps_probe_safe_checkpoint_multi_scale(monkeypatch, tmp_path):
+    # 4 GB probe peak is well under the safe cap (10 * 0.68 = 6.8 GB) -> kept.
+    chosen, provenance, calls, cache, logger = run_resume_calibrate(monkeypatch, tmp_path, (2.0, 4.0, 1.0))
+    assert provenance == "resume-calibrated"
+    assert len(calls) == 1
+    assert calls[0]["multi_scale"] == 0.5
+    assert calls[0]["workers"] == 4
+    assert chosen["multi_scale"] == 0.5
+    assert chosen["mosaic"] == 1.0
+
+
+def test_resume_resets_multi_scale_when_probe_unsafe(monkeypatch, tmp_path):
+    # 9 GB reserved > 6.8 GB cap -> multi_scale reset, rest of the aug kept.
+    chosen, provenance, calls, cache, logger = run_resume_calibrate(monkeypatch, tmp_path, (6.0, 9.0, 1.0))
+    assert len(calls) == 1
+    assert chosen["multi_scale"] == 0.0
+    assert chosen["mosaic"] == 1.0
+    assert chosen["mixup"] == 0.15
+    assert chosen["copy_paste"] == 0.3
+
+
+def test_resume_resets_multi_scale_when_probe_not_possible(monkeypatch, tmp_path):
+    # No dataset yaml (or CPU device) -> unverified -> multi_scale reset to 0.
+    chosen, provenance, calls, cache, logger = run_resume_calibrate(monkeypatch, tmp_path, (2.0, 4.0, 1.0),
+                                                                     yaml_path=None)
+    assert calls == []
+    assert chosen["multi_scale"] == 0.0
+
+    chosen_cpu, _, calls_cpu, _, _ = run_resume_calibrate(monkeypatch, tmp_path, (2.0, 4.0, 1.0), device="cpu")
+    assert calls_cpu == []
+    assert chosen_cpu["multi_scale"] == 0.0
+
+
+def test_resume_force_unsafe_keeps_checkpoint_multi_scale_unprobed(monkeypatch, tmp_path):
+    chosen, provenance, calls, cache, logger = run_resume_calibrate(
+        monkeypatch, tmp_path, (2.0, 9.0, 1.0), force_unsafe=True)
+    assert calls == []
+    assert chosen["multi_scale"] == 0.5
+    assert provenance == "resume-calibrated"
+
+
+def test_resume_selection_cache_key_carries_intent_marker(monkeypatch, tmp_path):
+    chosen, provenance, calls, cache, logger = run_resume_calibrate(monkeypatch, tmp_path, (2.0, 4.0, 1.0))
+    profile = list(cache["hardware_profiles"].values())[0]
+    keys = list(profile["resume_selections"].keys())
+    assert len(keys) == 1
+    assert "intent:quality-v1" in keys[0]

@@ -4193,8 +4193,17 @@ def ckpt_config_unsafe(ckpt_cfg: dict, native_size, caps: dict) -> list:
     return reasons
 
 
-def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run_dir):
-    """Return (chosen_cfg dict, provenance) for a resume run."""
+def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run_dir,
+                            yaml_path=None, device="0"):
+    """
+    Return (chosen_cfg dict, provenance) for a resume run.
+
+    Quality-first resume parity: the checkpoint's own multi_scale is KEPT when a
+    probe on the current hardware says the checkpoint augmentation combo is safe;
+    it is reset to 0.0 only when the probe says unsafe or cannot verify it
+    (no dataset yaml, CPU device, --no-memory-probe). --force-unsafe skips the
+    probe and keeps the checkpoint values unvalidated (explicit opt-in).
+    """
     native_size = ds_fp.get("median_img_size")
     # Resolve architecture model for probes/supervisor; actual training still resumes from last.pt.
     model_name = _infer_resume_architecture_model(run_dir, ckpt_cfg, task=ds_fp.get("task", "detect"))
@@ -4211,7 +4220,10 @@ def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run
     workers = ckpt_cfg.get("workers", 2)
     # workers cap
     workers = min(int(workers), 4)
-    multi_scale = 0.0  # always start 0 for resume
+    try:
+        multi_scale = float(ckpt_cfg.get("multi_scale", 0.0) or 0.0)
+    except Exception:
+        multi_scale = 0.0
     mosaic = ckpt_cfg.get("mosaic", 1.0)
     try:
         mosaic = float(mosaic)
@@ -4225,15 +4237,14 @@ def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run
     except Exception:
         mixup, copy_paste = 0.15, 0.3
 
-    # unsafe reasons from original ckpt config
+    # unsafe reasons from original ckpt config (pre-probe flags; multi_scale is
+    # probe-verified below instead of being zeroed unconditionally)
     unsafe_reasons = ckpt_config_unsafe(ckpt_cfg, native_size, {})
     # also if imgsz capped
     if ckpt_cfg.get("imgsz") != imgsz:
         unsafe_reasons.append(f"imgsz capped {ckpt_cfg.get('imgsz')} -> {imgsz}")
-    if float(ckpt_cfg.get("multi_scale", 0.0) or 0.0) > 0.0:
-        unsafe_reasons.append("multi_scale reset to 0.0 for resume")
     if unsafe_reasons:
-        logger.log("[RESUME CALIBRATE] original checkpoint config unsafe: " + "; ".join(unsafe_reasons))
+        logger.log("[RESUME CALIBRATE] original checkpoint config flagged for verification: " + "; ".join(unsafe_reasons))
 
     chosen = build_chosen(model_name, imgsz, batch, workers, multi_scale, mosaic,
                           mixup=mixup, copy_paste=copy_paste)
@@ -4281,8 +4292,63 @@ def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run
                 logger.log("[Resume Calibrate] using cached resume selection.")
             return cached, "cache"
 
-    if args.force_unsafe:
-        logger.log("[Resume Calibrate] --force-unsafe: keeping calibrated-down config without probe validation.")
+    # --- probe-verify the checkpoint's augmentation combo (multi_scale) on the
+    # current hardware; keep it when measured safe, reset only when unsafe or
+    # unverifiable (supervisor's pre-attempt probe guards the rest).
+    if multi_scale > 0.0:
+        if args.force_unsafe:
+            logger.log(f"[Resume Calibrate] --force-unsafe: keeping checkpoint multi_scale {multi_scale} without probe validation (explicit opt-in).")
+        elif getattr(args, "no_memory_probe", False):
+            chosen["multi_scale"] = 0.0
+            logger.log(f"[Resume Calibrate] --no-memory-probe: cannot verify checkpoint multi_scale {multi_scale}; reset to 0.0 (probes explicitly disabled).")
+        elif yaml_path is None or not Path(yaml_path).exists():
+            chosen["multi_scale"] = 0.0
+            logger.log(f"[Resume Calibrate] no dataset yaml available to probe; cannot verify checkpoint multi_scale {multi_scale}; reset to 0.0.")
+        elif not cuda_available_for(device):
+            chosen["multi_scale"] = 0.0
+            logger.log(f"[Resume Calibrate] device '{device}' is not CUDA: cannot probe checkpoint multi_scale {multi_scale}; reset to 0.0 (CPU resume stays conservative).")
+        else:
+            verified = False
+            try:
+                image_count = 100
+                try:
+                    data = yaml.safe_load(Path(yaml_path).read_text(encoding="utf-8"))
+                    tp = resolve_yaml_split_path(Path(yaml_path), str(data["train"]))
+                    image_count = count_images(tp)
+                except Exception:
+                    pass
+                fraction = probe_fraction(image_count)
+                logger.log(
+                    f"[Resume Calibrate] probing checkpoint augmentation: model={model_name} "
+                    f"imgsz={chosen['imgsz']} batch={chosen['batch']} workers={chosen['workers']} "
+                    f"multi_scale={multi_scale} mosaic={mosaic} mixup={mixup} copy_paste={copy_paste} "
+                    f"fraction={fraction:.3f}"
+                )
+                peaks = probe_train_once(
+                    model_name, device, Path(yaml_path), chosen["imgsz"], chosen["batch"],
+                    multi_scale, mosaic, mixup, copy_paste, fraction, cuda_index_for(device),
+                    workers=chosen["workers"],
+                )
+                profile = GUARD_PROFILE_CAPS.get(args.memory_profile, GUARD_PROFILE_CAPS["safe"])
+                gpu_cap = (hw.get("vram_gb") or 0.0) * profile["gpu"]
+                cpu_cap = (hw.get("ram_gb") or 0.0) * profile["cpu"]
+                alloc, res, rss = peaks
+                reasons = []
+                if res is not None and res > gpu_cap:
+                    reasons.append(f"GPU peak reserved {res:.2f} GB > {args.memory_profile} cap {gpu_cap:.2f} GB")
+                if rss is not None and rss > cpu_cap:
+                    reasons.append(f"CPU peak RSS {rss:.2f} GB > {args.memory_profile} cap {cpu_cap:.2f} GB")
+                if reasons:
+                    logger.log("[Resume Calibrate] checkpoint augmentation probe UNSAFE: " + "; ".join(reasons) + f"; resetting multi_scale {multi_scale} -> 0.0.")
+                else:
+                    verified = True
+                    logger.log(f"[Resume Calibrate] checkpoint augmentation probe SAFE (GPU reserved {res} GB, CPU RSS {rss} GB); keeping multi_scale {multi_scale}.")
+            except Exception as e:
+                logger.log(f"[Resume Calibrate] checkpoint augmentation probe failed ({_short(str(e))}); resetting multi_scale {multi_scale} -> 0.0.")
+            if not verified:
+                chosen["multi_scale"] = 0.0
+    elif args.force_unsafe:
+        logger.log("[Resume Calibrate] --force-unsafe: calibrated-down resume config kept without probe validation.")
 
     # record cache
     try:
@@ -4951,7 +5017,8 @@ def resume_training(args):
                 logger.log(f"[Resume] dataset fingerprint failed: {e}")
 
         cache = load_memory_cache(logger)
-        chosen, prov = calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run_dir)
+        chosen, prov = calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run_dir,
+                                               yaml_path=yaml_path, device=device)
         logger.log(f"[Resume] calibrated config provenance: {prov}")
 
         target_epochs = args.epochs if args.epochs else 600
