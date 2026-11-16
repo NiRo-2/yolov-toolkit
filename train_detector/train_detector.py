@@ -98,11 +98,27 @@ from ultralytics.models.yolo.detect.train import DetectionTrainer
 from ultralytics.models.yolo.segment.train import SegmentationTrainer
 from ultralytics.models.yolo.pose.train import PoseTrainer
 
+# Repo-root sys.path shim so ``common.hardware`` resolves when running this
+# script directly (``python train_detector/train_detector.py``). The shared
+# hardware module lives in common/ and is imported by both scripts.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from common.hardware import (  # noqa: E402  (re-export; see below)
+    BATCH_LADDER,
+    MEMORY_PROFILES,
+    PSUTIL_AVAILABLE,
+    detect_hardware,
+    looks_like_oom,
+    process_rss_bytes,
+)
+
+# psutil is still imported directly here because a few training-only call
+# sites use psutil.virtual_memory() inline (not routed through the helper).
 try:
-    import psutil
-    PSUTIL_AVAILABLE = True
+    import psutil  # type: ignore[import-untyped]
 except Exception:
-    PSUTIL_AVAILABLE = False
+    psutil = None  # type: ignore[assignment]
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -119,17 +135,11 @@ ANSI_RE = re.compile(
     r"|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"      # remaining control chars (keeps \n and \t)
 )
 
-# Memory safety profiles: maximum allowed measured peak as a fraction of total memory.
-# safe @16GB VRAM -> ~10.9 GB peak reserved ceiling.
-MEMORY_PROFILES = {
-    "safe":       {"gpu": 0.68, "cpu": 0.38},
-    "balanced":   {"gpu": 0.75, "cpu": 0.45},
-    "aggressive": {"gpu": 0.85, "cpu": 0.55},
-}
+# Memory safety profiles (safe/balanced/aggressive) and the batch ladder live in
+# common/hardware.py and are re-exported above so existing imports keep working.
 
 PREFERRED_AUTO_BATCH = 8   # auto batch target; nbs=64 gradient accumulation keeps effective batch at 64
 MIN_AUTO_BATCH = 4         # auto batch floor; batch 2 is only usable with an explicit --force-unsafe run
-BATCH_LADDER = [2, 4, 8, 16, 32, 64]
 STANDARD_IMGSZ = [320, 416, 512, 640, 768, 1024, 1280, 1536]
 
 # Task-aware model chains (plan: detect / -seg / -pose per size).
@@ -259,32 +269,9 @@ def resolve_pretrained_weights(model: str) -> Path:
 
 
 # -- Hardware Detection ----------------------------------------------------------
-
-def detect_hardware():
-    """Detect GPU VRAM, CPU cores and RAM."""
-    info = {
-        "vram_gb":   None,
-        "cpu_cores": os.cpu_count() or 4,
-        "ram_gb":    None,
-        "gpu_name":  "CPU",
-    }
-
-    try:
-        if torch.cuda.is_available():
-            props = torch.cuda.get_device_properties(0)
-            info["vram_gb"] = props.total_memory / (1024 ** 3)
-            info["gpu_name"] = props.name
-    except Exception:
-        pass
-
-    if PSUTIL_AVAILABLE:
-        try:
-            info["ram_gb"] = psutil.virtual_memory().total / (1024 ** 3)
-        except Exception:
-            pass
-
-    return info
-
+# detect_hardware / process_rss_bytes / looks_like_oom are defined in
+# common/hardware.py and re-exported above; this block keeps the training-only
+# device helpers (canonical_device, cuda_index_for, cuda_available_for) here.
 
 def cuda_available_for(device: str) -> bool:
     if str(device).strip().lower() == "cpu":
@@ -563,27 +550,7 @@ class RunLogger:
 
 
 # -- Runtime Memory Monitoring ----------------------------------------------------
-
-def process_rss_bytes():
-    """Recursive process RSS in bytes, or None when psutil is unavailable/fails."""
-    if not PSUTIL_AVAILABLE:
-        return None
-    try:
-        proc = psutil.Process()
-        total = proc.memory_info().rss
-        try:
-            children = proc.children(recursive=True)
-        except (psutil.AccessDenied, psutil.Error):
-            children = []
-        for child in children:
-            try:
-                total += child.memory_info().rss
-            except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ProcessLookupError):
-                continue
-        return total
-    except Exception:
-        return None
-
+# process_rss_bytes is defined in common/hardware.py and re-exported above.
 
 class MemoryGuard:
     """
@@ -1721,11 +1688,7 @@ class ProbeUnverifiedError(Exception):
     """Probe run failed for a non-OOM reason; candidate safety is unverified."""
 
 
-def looks_like_oom(exc: Exception) -> bool:
-    if isinstance(exc, torch.cuda.OutOfMemoryError):
-        return True
-    text = str(exc).lower()
-    return "out of memory" in text or "cannot allocate" in text or "cannot allocate memory" in text
+# looks_like_oom is defined in common/hardware.py and re-exported above.
 
 
 def probe_fraction(image_count: int) -> float:

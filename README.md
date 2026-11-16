@@ -556,29 +556,67 @@ python detect_images/detect_images.py --images /path/to/images --model best.pt \
 python detect_images/detect_images.py --images /path/to/images --model best.pt --no-tiles
 ```
 
-### Performance: batched inference + threaded post-processing (default ON)
+### Performance: hardware-aware parallel inference (default ON)
 
-The script runs two complementary speed-ups out of the box:
+The script measures host hardware at startup and sizes the whole pipeline from
+that profile: GPU VRAM, CPU cores and host RAM drive the decode pool, the
+inference batch, the post-processing workers, the precision and the device.
+A `[Hardware]` block is printed before the `[Config]` block on every run.
 
-1. **Batched GPU inference** (`--batch`) — a single `model([img1, img2, ...])` call per chunk, so the GPU processes multiple images in one forward pass instead of one at a time.
-2. **Threaded post-inference I/O** (`--workers`) — a `ThreadPoolExecutor` runs sidecar JSON export, ExifTool metadata extract / copy, and Pillow image saves in parallel while the main thread reads the next batch and runs the next inference call.
+1. **Batched GPU inference** (`--batch`) — a single `model([item1, item2, ...])`
+   call per chunk. In tiled mode the items are tiles accumulated **across
+   source images**; in non-tiled mode they are whole images. Tiles from
+   different images are never mixed into one result: per-image merge/NMS still
+   runs once per image after its last tile lands.
+2. **Threaded post-inference I/O** (`--workers`) — a `ThreadPoolExecutor` runs
+   sidecar JSON export, ExifTool metadata extract / copy, and Pillow image
+   saves in parallel while the main thread reads the next batch and runs the
+   next inference call.
+3. **Decode prefetch** (`--decode-workers`) — a small thread pool decodes
+   images (`cv2.imread`) and pushes them onto a bounded queue ahead of the
+   main thread, overlapping disk reads with inference.
 
 Auto-sizing rules:
 
-- `--workers auto` -> `min(8, os.cpu_count())`. Pass an integer to override (e.g. `--workers 4`).
-- `--batch auto` -> `8` if CUDA is available, else `1`. Pass an integer to override (e.g. `--batch 16`).
+- `--workers auto` -> `min(8, cpu_cores - decode_workers + 1)`. Override with
+  an integer (e.g. `--workers 4`).
+- `--batch auto` -> ladder-clamped from a VRAM budget
+  `min(free_now * 0.9, total * profile.gpu)` divided by a measured per-item
+  inference cost. Override with an integer (e.g. `--batch 16`).
+- `--decode-workers auto` -> `clamp(cpu_count // 6, 1, 6)`.
+- `--device auto` -> `cuda:0` when CUDA is available, else `cpu`.
+- `--half auto` -> `on` for CUDA, `off` for CPU. `--half off` restores FP32.
+- `--memory-profile` -> `balanced` (GPU 0.75, CPU 0.45 of totals); `safe`
+  (0.68/0.38) and `aggressive` (0.85/0.55) are selectable. `--vram-frac`
+  overrides the GPU fraction.
 
-To disable both and get the previous fully sequential behaviour:
+Safety ceilings:
+
+| Resource | Ceiling | Guard |
+|---|---|---|
+| VRAM | `min(free_now * 0.9, total * profile.gpu)` | warmup probe sizes the first batch; mid-run free-VRAM check downshifts; OOM halving ladder (max 4); hard fail at batch 1 |
+| Host RAM | `min(total * profile.cpu, available * 0.5)` | byte budget acquired before decode, released after post-processing |
+| CPU | `decode_workers + workers <= cpu_count + 2` | explicit caps; `cv2.setNumThreads(1)` when decode workers > 1; `torch.set_num_threads()` only on CPU |
+
+To reproduce the previous fully sequential, single-image-at-a-time behaviour
+byte-for-byte:
 
 ```bash
-python detect_images/detect_images.py --images /path/to/images --model best.pt --workers 1 --batch 1
+python detect_images/detect_images.py --images /path/to/images --model best.pt --workers 1 --batch 1 --half off
 ```
 
 Notes:
 
-- Inference itself stays single-threaded on the main thread (one GPU); threads accelerate the surrounding I/O work, which is dominated by ExifTool subprocess startup when annotated images are exported.
-- Per-image progress lines may print slightly out of order across worker threads, but the `[i/N]` index and final summary remain accurate.
-- Memory cost grows with batch size: roughly `batch * imgsz^2 * 3 * 4 bytes` on host plus a similar amount of GPU RAM. With `--batch 8` at imgsz 640 this is well under 100 MB.
+- Inference itself stays single-threaded on one GPU; threads accelerate the
+  surrounding I/O work, which is dominated by ExifTool subprocess startup when
+  annotated images are exported.
+- Per-image progress lines may print slightly out of order across worker
+  threads, but the `[i/N]` index and final summary remain accurate.
+- Memory cost grows with batch size: roughly `batch * imgsz^2 * 3 * 4 bytes`
+  on host plus a similar amount of GPU RAM.
+- `--half auto` may shift boxes by small amounts vs FP32; `--half off`
+  restores exact numerics.
+- `--only-detections` was a no-op flag and is now rejected by argparse.
 
 JSON format:
 ```json
@@ -641,8 +679,14 @@ python detect_images/detect_images.py --images ... --model ... --verify-b3dm
 | `--verify-b3dm` | `False` | After each JSON sidecar write, verify Ortho-Tag georeference keys; exit `1` if any file fails |
 | `--recursive` | `True` | Walk subdirectories of `--images` for input files; outputs stay flat with relative-subpath prefixes |
 | `--no-recursive` | `False` | Only scan the top-level of `--images` |
-| `--workers` | `auto` | Worker threads for post-inference I/O (JSON + ExifTool + image save). `auto` = `min(8, os.cpu_count())`; pass an integer or `1` to disable threading |
-| `--batch` | `auto` | GPU inference batch size. `auto` = `8` if CUDA is available, else `1`; pass an integer or `1` to disable batching |
+| `--workers` | `auto` | Worker threads for post-inference I/O (JSON + ExifTool + image save). `auto` = hardware-aware; pass an integer or `1` to disable threading |
+| `--batch` | `auto` | Inference items per `model()` call (tiles across images in tiled mode, whole images otherwise). `auto` = VRAM-budget ladder-clamped; pass an integer or `1` to disable batching |
+| `--decode-workers` | `auto` | Threads for `cv2.imread` + tile prep. `auto` = `clamp(cpu_count // 6, 1, 6)` |
+| `--device` | `auto` | Inference device: `auto` \| `cpu` \| `0`. `auto` picks `cuda:0` when CUDA is available |
+| `--half` | `auto` | FP16 precision: `auto` \| `on` \| `off`. `auto` = `on` for CUDA, `off` for CPU. `--half off` restores exact FP32 numerics |
+| `--memory-profile` | `balanced` | Memory ceiling profile: `safe` (0.68/0.38) \| `balanced` (0.75/0.45) \| `aggressive` (0.85/0.55) of total GPU/host RAM |
+| `--vram-frac` | unset | Advanced: override the GPU memory fraction used by the memory profile |
+| `--exiftool-stay-open` | `False` | Run ExifTool as persistent `-stay_open` daemons (`min(4, workers)`) instead of spawning one process per image |
 | `--tiles` | `True` | Tile images before inference; tile detections are merged with class-wise NMS |
 | `--no-tiles` | `False` | Disable tiled inference and process each whole image |
 | `--tile-imgsz` | `1024` | Tile size in pixels |
@@ -657,6 +701,28 @@ If ExifTool is missing at save time, the script exits with guidance to download 
 Use `--allow-missing-exiftool` only if you accept limited Pillow-only metadata copy.
 
 Supported formats: `.jpg` `.jpeg` `.png` `.bmp` `.tiff` `.tif` `.webp`
+
+### Windows batch helper (detect)
+
+`detect_images/_Run_detect_images_template.bat` is a fill-in template that wraps the
+above flags. Copy it to `detect_images/_Run_detect_images_personal.bat` (gitignored)
+and edit the `set` lines:
+
+| Variable | Default | Flag |
+|---|---|---|
+| `imagesDirPath` | `_YOUR_IMAGES_DIR_HERE_` | `--images` |
+| `modelPath` | `_YOUR_MODEL_PATH_HERE_` | `--model` |
+| `confidence` | `0.3` | `--conf` |
+| `exportAnnotatedImages` | `true` | `--no-export-annotated-images` when `false` |
+| `recursive` | `true` | `--no-recursive` when `false` |
+| `workers` | `auto` | `--workers` |
+| `batch` | `auto` | `--batch` |
+| `decodeWorkers` | `auto` | `--decode-workers` |
+| `device` | `auto` | `--device` |
+| `half` | `auto` | `--half` |
+| `memoryProfile` | `balanced` | `--memory-profile` |
+| `useTiles` | `true` | `--no-tiles` when `false` |
+| `exiftoolStayOpen` | `false` | `--exiftool-stay-open` when `true` |
 
 ---
 

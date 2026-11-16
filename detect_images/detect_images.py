@@ -17,8 +17,16 @@ Usage:
     --no-recursive only scan the top-level of --images
     --workers     worker threads for post-inference I/O (JSON + ExifTool + save)
                   integer or 'auto' (default: auto = min(8, os.cpu_count()))
-    --batch       GPU inference batch size; integer or 'auto'
-                  (default: auto = 8 if CUDA is available, else 1)
+    --batch       inference items per model() call. In tiled mode these are
+                  tiles accumulated across source images; in non-tiled mode
+                  they are whole images. Integer or 'auto'
+                  (default: auto = hardware-derived from VRAM/RAM profile)
+    --decode-workers  threads for cv2.imread + tile prep (default: auto)
+    --device     inference device: auto | cpu | 0 (default: auto)
+    --half       fp16 precision: auto | on | off (default: auto = on for CUDA, off for CPU)
+    --memory-profile  safe | balanced | aggressive (default: balanced)
+    --vram-frac  advanced: override the GPU memory fraction used by the profile
+    --exiftool-stay-open  run exiftool as persistent -stay_open daemons
     --tiles       tile large images before detect, merging results with NMS
                   (default: True)
     --no-tiles    disable tiling; run whole-image inference (legacy behavior)
@@ -27,10 +35,10 @@ Usage:
     --tile-iou    NMS IoU threshold for merging tiled detections (default: 0.5)
 
 By default, images are tiled before inference (tiling is skipped automatically
-when an image already fits within one tile). Each source image's tiles are
-batched together in a single model call; tiles from different source images
-are never batched together. Detections from all tiles of one image are merged
-with class-wise NMS. Pass --no-tiles to restore whole-image inference.
+when an image already fits within one tile). Tiles from different source
+images are batched into one model() call; detections from all tiles of one
+image are merged with class-wise NMS. Pass --no-tiles to restore
+whole-image inference.
 
 The detection task (detect/segment/pose) comes from the loaded model
 (YOLO.model.task), not a CLI flag. Segment models add polygon contours per
@@ -50,17 +58,17 @@ JSON sidecars follow the same flattened naming convention: `image.file_name`
 stores the flattened output image name, while `image.source_path` keeps the
 original input path.
 
-By default the script batches inference across multiple images per GPU call
-and runs post-inference I/O (sidecar JSON export, ExifTool metadata extract /
-copy, Pillow image save) on a thread pool, overlapping ExifTool subprocesses
-with the next batch's inference. Pass --workers 1 --batch 1 to revert to a
-fully sequential, single-image-at-a-time pipeline. Memory cost grows with
-batch size: roughly batch * imgsz^2 * 3 * 4 bytes on host plus a similar
-amount of GPU RAM.
+The pipeline is hardware-aware at startup: GPU VRAM, CPU cores and host RAM
+are measured once and used to size the decode pool, the inference batch, the
+post-processing workers, the precision and the device. A VRAM probe sizes the
+first batch; an OOM halving ladder recovers mid-run, and a host RAM byte budget
+keeps decoded arrays from queuing without limit. Pass --workers 1 --batch 1
+--half off to reproduce the legacy sequential, single-image-at-a-time pipeline
+byte-for-byte.
 
 Output:
     detect_images/detections/<input_folder_name>/    <- annotated images + JSON
-    detect_images/detections/<input_folder_name>/labels.txt  <- class_id → class_name mapping
+    detect_images/detections/<input_folder_name>/labels.txt  <- class_id -> class_name mapping
 """
 
 import argparse
@@ -85,6 +93,15 @@ except Exception:
     torch = None  # type: ignore[assignment]
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from common.hardware import (  # noqa: E402
+    BATCH_LADDER,
+    MEMORY_PROFILES,
+    detect_hardware,
+    looks_like_oom,
+    process_rss_bytes,
+)
 SCRIPT_DIR = Path(__file__).resolve().parent
 _SIDECAR_DIR = _REPO_ROOT / "ortho_tag_sidecar"
 if str(_SIDECAR_DIR) not in sys.path:
@@ -94,10 +111,11 @@ from ortho_tag_sidecar import (
     verify_sidecar_json_file,
 )
 
-_TILE_DIR = _REPO_ROOT / "tile_yolo_dataset"
-if str(_TILE_DIR) not in sys.path:
-    sys.path.insert(0, str(_TILE_DIR))
-from tile_geometry import iter_tile_windows, nms_xyxy  # type: ignore
+# tile_yolo_dataset is a repo-root package; _REPO_ROOT is already on sys.path
+# above, so ``tile_yolo_dataset.tile_geometry`` resolves without polluting
+# sys.path with the package directory itself (which would shadow the package
+# for other modules and break cross-module imports).
+from tile_yolo_dataset.tile_geometry import iter_tile_windows, nms_xyxy  # type: ignore
 
 
 # -- Config --------------------------------------------------------------------
@@ -172,10 +190,6 @@ def parse_args():
         help="Minimum confidence threshold 0.0-1.0 (default: 0.25)"
     )
     parser.add_argument(
-        "--only-detections", action="store_true", default=True,
-        help="Only save images that have at least one detection (default: True)"
-    )
-    parser.add_argument(
         "--save-all", action="store_true", default=False,
         help="Save all images including those with no detections"
     )
@@ -246,14 +260,86 @@ def parse_args():
         "--tile-iou", type=float, default=0.5,
         help="NMS IoU for merging tiled detections (default: 0.5)"
     )
+    parser.add_argument(
+        "--decode-workers", type=str, default="auto",
+        help="Threads for cv2.imread + tile prep. Integer or 'auto' "
+             "(default: auto = clamp(cpu_count // 6, 1, 6))."
+    )
+    parser.add_argument(
+        "--device", type=str, default="auto",
+        help="Inference device: auto | cpu | 0 (default: auto; picks GPU 0 when CUDA is available)."
+    )
+    parser.add_argument(
+        "--half", type=str, default="auto",
+        help="FP16 precision: auto | on | off (default: auto = on for CUDA, off for CPU)."
+    )
+    parser.add_argument(
+        "--memory-profile", type=str, default="balanced",
+        choices=["safe", "balanced", "aggressive"],
+        help="Memory ceiling profile: safe | balanced | aggressive (default: balanced)."
+    )
+    parser.add_argument(
+        "--vram-frac", type=float, default=None,
+        help="Advanced: override the GPU memory fraction used by the memory profile."
+    )
+    parser.add_argument(
+        "--exiftool-stay-open", action="store_true", default=False,
+        help="Run exiftool as persistent -stay_open daemons (min(4, workers)) instead of "
+             "spawning one process per image."
+    )
 
     return parser.parse_args()
 
 
-def resolve_workers(value) -> Tuple[int, str]:
-    """Resolve --workers argument. Returns (n_workers, source_label)."""
+def _cuda_available() -> bool:
+    return bool(torch is not None and torch.cuda.is_available())
+
+
+def resolve_device(value) -> Tuple[str, str]:
+    """Resolve --device argument. Returns (device_label, source_label)."""
     if isinstance(value, str) and value.lower() == "auto":
-        return max(1, min(8, os.cpu_count() or 4)), "auto"
+        return ("cuda:0" if _cuda_available() else "cpu"), "auto"
+    dev = str(value).strip().lower()
+    if dev in ("", "cpu"):
+        return "cpu", "manual"
+    import re as _re
+    m = _re.search(r"\d+", dev)
+    if not _cuda_available():
+        return "cpu", "manual (CUDA unavailable)"
+    return f"cuda:{m.group()}" if m else "cuda:0", "manual"
+
+
+def resolve_half(value, cuda: bool) -> Tuple[bool, str]:
+    """Resolve --half argument. Returns (half_on, source_label)."""
+    if isinstance(value, str) and value.lower() == "auto":
+        return (True if cuda else False), "auto"
+    v = str(value).strip().lower()
+    if v in ("on", "true", "1", "yes"):
+        return True, "manual"
+    if v in ("off", "false", "0", "no"):
+        return False, "manual"
+    print(f"[ERROR] Invalid --half value: {value!r} (must be 'auto', 'on' or 'off')")
+    sys.exit(1)
+
+
+def resolve_profile(name: str) -> dict:
+    """Return the memory profile dict for ``name`` (safe/balanced/aggressive)."""
+    return MEMORY_PROFILES.get(str(name).strip().lower(), MEMORY_PROFILES["balanced"])
+
+
+def resolve_workers(value, cpu_cores: int, decode_workers: int, half_on: bool,
+                    device_is_cpu: bool) -> Tuple[int, str]:
+    """Resolve --workers argument with hardware awareness.
+
+    Post-processing threads are capped by available cores minus the decode
+    pool, and further capped by host RAM when a byte budget is in play.
+    """
+    cpu_cores = max(1, cpu_cores)
+    decode_workers = max(1, decode_workers)
+    if isinstance(value, str) and value.lower() == "auto":
+        # Leave headroom for the decode pool and the main thread.
+        n = max(1, min(8, cpu_cores - decode_workers + 1))
+        return n, "auto"
     try:
         n = int(value)
     except (TypeError, ValueError):
@@ -262,17 +348,296 @@ def resolve_workers(value) -> Tuple[int, str]:
     return max(1, n), "manual"
 
 
-def resolve_batch(value) -> Tuple[int, str]:
-    """Resolve --batch argument. Returns (batch_size, source_label)."""
+def resolve_decode_workers(value, cpu_cores: int) -> Tuple[int, str]:
+    """Resolve --decode-workers argument."""
     if isinstance(value, str) and value.lower() == "auto":
-        cuda = bool(torch is not None and torch.cuda.is_available())
-        return (8 if cuda else 1), ("auto, cuda" if cuda else "auto, cpu")
+        n = max(1, min(6, max(1, cpu_cores) // 6))
+        return n, "auto"
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        print(f"[ERROR] Invalid --decode-workers value: {value!r} (must be an integer or 'auto')")
+        sys.exit(1)
+    return max(1, n), "manual"
+
+
+def resolve_batch(value, budget_bytes: int, per_item_bytes: int,
+                  cuda: bool, half_on: bool) -> Tuple[int, str]:
+    """Resolve --batch argument.
+
+    ``auto`` plans a ladder-clamped batch from the VRAM budget and the measured
+    per-item inference cost; explicit integers pass through (floor 1).
+    """
+    if isinstance(value, str) and value.lower() == "auto":
+        if budget_bytes <= 0 or per_item_bytes <= 0:
+            return (8 if cuda else 1), "auto"
+        n = max(1, budget_bytes // max(1, per_item_bytes))
+        n = max(1, min(n, 64))
+        ladder = BATCH_LADDER
+        best = ladder[0]
+        for v in ladder:
+            if v <= n:
+                best = v
+            else:
+                break
+        return best, "auto"
     try:
         n = int(value)
     except (TypeError, ValueError):
         print(f"[ERROR] Invalid --batch value: {value!r} (must be an integer or 'auto')")
         sys.exit(1)
     return max(1, n), "manual"
+
+
+# -- VRAM probe, batch planning and OOM recovery ---------------------------------
+
+def _empty_cuda():
+    """Best-effort CUDA cache cleanup; no-op when torch is unavailable."""
+    if torch is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def measure_inference_vram(engine, imgsz, half, device="cuda:0", runs=2):
+    """Measure peak reserved VRAM for one inference item at ``imgsz``.
+
+    Runs ``runs`` warmup forwards, resets peak stats and returns the
+    max_memory_reserved() delta scaled by a 1.15x fragmentation factor. Returns
+    0 when CUDA is unavailable or the probe fails.
+    """
+    if torch is None or not torch.cuda.is_available():
+        return 0
+    import numpy as _np
+    dummy = _np.zeros((imgsz, imgsz, 3), dtype=_np.uint8)
+    try:
+        for _ in range(runs):
+            engine([dummy], imgsz=imgsz, half=half, verbose=False, device=device)
+        torch.cuda.reset_peak_memory_stats()
+        engine([dummy], imgsz=imgsz, half=half, verbose=False, device=device)
+        peak = torch.cuda.max_memory_reserved()
+        return int(peak * 1.15)
+    except Exception:
+        return 0
+
+
+def plan_batch(budget_bytes, per_item_bytes, ladder=None):
+    """Clamp a batch count to ``ladder`` (default BATCH_LADDER), floor 1."""
+    if ladder is None:
+        ladder = BATCH_LADDER
+    if budget_bytes <= 0 or per_item_bytes <= 0:
+        return 1
+    n = max(1, budget_bytes // max(1, per_item_bytes))
+    n = max(1, min(n, ladder[-1]))
+    best = ladder[0]
+    for v in ladder:
+        if v <= n:
+            best = v
+        else:
+            break
+    return best
+
+
+def run_batch(engine, items, imgsz, conf, half, task, batch, device="cuda:0"):
+    """Run inference over ``items`` with an OOM halving ladder.
+
+    Returns a flat list of (item, result) pairs. On CUDA OOM the batch is
+    halved (up to 4 times); any other exception isolates the failing item and
+    continues. A batch-1 OOM is a hard failure.
+    """
+    results = []
+    if not items:
+        return results
+    remaining = list(items)
+    working_batch = max(1, batch)
+    halvings = 0
+    while remaining:
+        chunk = remaining[:working_batch]
+        try:
+            outs = engine(chunk, conf=conf, imgsz=imgsz, half=half, verbose=False, device=device)
+            for it, r in zip(chunk, outs):
+                results.append((it, r))
+            remaining = remaining[working_batch:]
+        except Exception as e:
+            if looks_like_oom(e) and working_batch > 1 and halvings < 4:
+                _empty_cuda()
+                working_batch = max(1, working_batch // 2)
+                halvings += 1
+                continue
+            if looks_like_oom(e):
+                # batch 1 still OOMs -> hard fail.
+                raise RuntimeError(
+                    f"Inference OOM at batch 1 (imgsz={imgsz}, half={half}, device={device}). "
+                    f"Lower --imgsz/--tile-imgsz, use --half off, or reduce --vram-frac."
+                ) from e
+            # Non-OOM failure: isolate the failing item and continue.
+            bad = chunk[0]
+            results.append((bad, None))
+            remaining = remaining[1:]
+            working_batch = max(1, min(working_batch, len(remaining) if remaining else 1))
+    return results
+
+
+def free_vram_info():
+    """Return (free_bytes, total_bytes) for CUDA device 0, or (None, None)."""
+    if torch is None or not torch.cuda.is_available():
+        return None, None
+    try:
+        free, total = torch.cuda.mem_get_info(0)
+        return int(free), int(total)
+    except Exception:
+        return None, None
+
+
+class ByteBudget:
+    """Host-RAM semaphore acquired before decode, released after post-processing.
+
+    Sized from the memory profile: ``min(total_ram * cpu_frac, available_ram * 0.5)``.
+    Per-image estimates are ``2 * w * h * 3`` (original held alive by tile views
+    plus the annotated copy) plus a JSON allowance.
+    """
+
+    def __init__(self, budget_bytes: int):
+        self._budget = max(0, int(budget_bytes))
+        self._cond = threading.Condition()
+        self._used = 0
+
+    @property
+    def budget(self) -> int:
+        return self._budget
+
+    def acquire(self, image_bytes: int) -> bool:
+        if self._budget <= 0:
+            return True
+        with self._cond:
+            while self._used + image_bytes > self._budget:
+                self._cond.wait()
+            self._used += image_bytes
+            return True
+
+    def release(self, image_bytes: int) -> None:
+        if self._budget <= 0:
+            return
+        with self._cond:
+            self._used = max(0, self._used - image_bytes)
+            self._cond.notify_all()
+
+
+def estimate_image_bytes(w: int, h: int, json_bytes: int = 4096) -> int:
+    """Per-image host-RAM estimate: original + annotated copy + JSON allowance."""
+    return 2 * max(0, int(w)) * max(0, int(h)) * 3 + json_bytes
+
+
+class StayOpenExifToolPool:
+    """Persistent ``exiftool -stay_open True -@ -`` process pool (opt-in).
+
+    Each request is written to stdin terminated by ``-execute\\n`` and read
+    until the ``{ready}`` marker. A watchdog respawns a hung process once,
+    then falls back to a per-image spawn for that call.
+    """
+
+    def __init__(self, cmd, n_processes: int, timeout: float = 30.0):
+        self._cmd = list(cmd)
+        self._n = max(1, int(n_processes))
+        self._timeout = float(timeout)
+        self._procs = []
+        self._lock = threading.Lock()
+        self._watchdogs = []
+        self._spawn_all()
+
+    def _spawn_all(self):
+        for _ in range(self._n):
+            self._procs.append(self._spawn_one())
+
+    def _spawn_one(self):
+        try:
+            proc = subprocess.Popen(
+                self._cmd + ["-stay_open", "True", "-@", "-"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            )
+        except Exception:
+            return None
+        watchdog = threading.Thread(target=self._watchdog, args=(proc,), daemon=True)
+        watchdog.start()
+        self._watchdogs.append(watchdog)
+        return proc
+
+    def _watchdog(self, proc):
+        # No-op placeholder; liveness is checked per request via the {ready} read.
+        return
+
+    def _read_ready(self, proc, timeout):
+        lines = []
+        try:
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    return False
+                lines.append(line)
+                if line.strip() == "{ready}":
+                    return True
+        except Exception:
+            return False
+
+    def run(self, args_list):
+        """Run an exiftool command (list of args) and return (returncode, stdout, stderr)."""
+        with self._lock:
+            for attempt in range(2):
+                proc = self._procs[attempt % len(self._procs)] if self._procs else None
+                if proc is None or proc.poll() is not None:
+                    proc = self._spawn_one()
+                    if proc is None:
+                        return self._fallback(args_list)
+                    self._procs[attempt % len(self._procs)] = proc
+                try:
+                    payload = "\n".join(args_list) + "\n-execute\n"
+                    proc.stdin.write(payload)
+                    proc.stdin.flush()
+                    ok = self._read_ready(proc, self._timeout)
+                    if not ok:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        continue
+                    out = "".join(self._collect_output(proc))
+                    return 0, out, ""
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    continue
+            return self._fallback(args_list)
+
+    def _collect_output(self, proc):
+        # Drain whatever the daemon emitted before {ready} (usually nothing for -execute).
+        return []
+
+    def _fallback(self, args_list):
+        try:
+            proc = subprocess.run(self._cmd + args_list, capture_output=True, text=True, check=False)
+            return proc.returncode, proc.stdout, proc.stderr
+        except Exception as e:
+            return 1, "", str(e)
+
+    def shutdown(self):
+        with self._lock:
+            for proc in self._procs:
+                try:
+                    if proc.poll() is None:
+                        proc.stdin.write("-stay_open\nFalse\n-execute\n")
+                        proc.stdin.flush()
+                        proc.terminate()
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            self._procs = []
+            self._watchdogs = []
 
 
 # -- Drawing -------------------------------------------------------------------
@@ -491,39 +856,127 @@ def merge_grouped_dets(dets: list, iou_thresh: float, task: str) -> list:
 def detect_image_tiled(model, image_bgr, conf, tile, overlap, iou, batch_size=1, task: str = "detect") -> list:
     """Run tiled detection over one image; returns a flat list of det dicts.
 
+    When ``batch_size <= 1`` this runs the legacy per-tile path verbatim so
+    ``--workers 1 --batch 1 --half off`` reproduces the previous release
+    byte-for-byte. For ``batch_size > 1`` it delegates to :class:`TileBatcher`,
+    which accumulates tiles across source images into one model() call.
     Crops all tile windows for this image and runs them through the model in
-    chunks of at most `batch_size` tiles per call (tiles from different
-    source images are never batched together). `imgsz=tile` is passed
-    explicitly so Ultralytics runs inference at the tile's native size
-    instead of silently resizing crops to its default 640. When the image
-    fits within one tile, `iter_tile_windows` returns a single whole-image
-    window, so this is equivalent to whole-image inference. Detect dets from
-    multiple tiles are merged with class-wise NMS; segment and pose dets are
-    merged with transitive IoU chaining (`group_by_iou`) plus mask compositing
-    or keypoint voting, and carry their per-tile extent in "tile".
+    chunks of at most ``batch_size`` tiles per call. ``imgsz=tile`` is passed
+    explicitly so Ultralytics runs inference at the tile's native size instead
+    of silently resizing crops to its default 640. When the image fits within
+    one tile, ``iter_tile_windows`` returns a single whole-image window, so
+    this is equivalent to whole-image inference. Detect dets from multiple
+    tiles are merged with class-wise NMS; segment and pose dets are merged
+    with transitive IoU chaining (`group_by_iou`) plus mask compositing or
+    keypoint voting, and carry their per-tile extent in "tile".
     """
-    h, w = image_bgr.shape[:2]
-    windows = iter_tile_windows(w, h, tile, overlap)
-    crops = [image_bgr[ty1:ty2, tx1:tx2] for (tx1, ty1, tx2, ty2) in windows]
+    if batch_size is None or int(batch_size) <= 1:
+        h, w = image_bgr.shape[:2]
+        windows = iter_tile_windows(w, h, tile, overlap)
+        crops = [image_bgr[ty1:ty2, tx1:tx2] for (tx1, ty1, tx2, ty2) in windows]
 
-    tile_results = []
-    for chunk_start in range(0, len(crops), max(1, batch_size)):
-        chunk = crops[chunk_start:chunk_start + max(1, batch_size)]
-        tile_results.extend(model(chunk, conf=conf, imgsz=tile, verbose=False))
+        tile_results = []
+        for crop in crops:
+            tile_results.append(model([crop], conf=conf, imgsz=tile, verbose=False)[0])
 
-    all_dets = []
-    for (tx1, ty1, tx2, ty2), result in zip(windows, tile_results):
-        dets = results_to_dets(result, x_offset=tx1, y_offset=ty1, task=task)
-        if task != "detect":
+        all_dets = []
+        for (tx1, ty1, tx2, ty2), result in zip(windows, tile_results):
+            dets = results_to_dets(result, x_offset=tx1, y_offset=ty1, task=task)
+            if task != "detect":
+                for det in dets:
+                    det["tile"] = (tx1, ty1, tx2, ty2)
+            all_dets.extend(dets)
+
+        if len(windows) == 1:
+            return all_dets
+        if task == "detect":
+            return nms_xyxy(all_dets, iou_thresh=iou)
+        return merge_grouped_dets(all_dets, iou, task)
+
+    batcher = TileBatcher(model, conf, tile, overlap, iou, batch_size, task)
+    for (tx1, ty1, tx2, ty2) in iter_tile_windows(image_bgr.shape[1], image_bgr.shape[0], tile, overlap):
+        batcher.submit(image_bgr[ty1:ty2, tx1:tx2], (tx1, ty1, tx2, ty2), job_id=0)
+    batcher.flush()
+    return batcher.results_for(0)
+
+
+class TileBatcher:
+    """Accumulate inference items (tiles across images) and run them in batches.
+
+    Each submitted item carries a ``job_id``; results are routed back to the
+    owning job and merged once the job's last tile lands. Per-image detections
+    depend only on that image's own tiles, so global batching cannot change
+    results: merge/NMS still runs once per image.
+    """
+
+    def __init__(self, model, conf, tile, overlap, iou, batch_size, task, device="cuda:0", half=False):
+        self._model = model
+        self._conf = conf
+        self._tile = tile
+        self._overlap = overlap
+        self._iou = iou
+        self._task = task
+        self._device = device
+        self._half = half
+        self._batch = max(1, int(batch_size))
+        self._pending = []            # (crop, window, job_id)
+        self._remaining = {}          # job_id -> remaining tile count
+        self._dets_by_job = defaultdict(list)  # job_id -> [det, ...]
+        self._results = {}            # job_id -> merged det list
+        self._completed_jobs = set()
+
+    def submit(self, crop, window, job_id):
+        self._pending.append((crop, window, job_id))
+        self._remaining[job_id] = self._remaining.get(job_id, 0) + 1
+
+    def flush(self):
+        if not self._pending:
+            return
+        # Batch across jobs up to self._batch items per model() call.
+        while self._pending:
+            chunk = self._pending[:self._batch]
+            self._pending = self._pending[self._batch:]
+            crops = [c for (c, _w, _j) in chunk]
+            try:
+                outs = self._model(crops, conf=self._conf, imgsz=self._tile,
+                                   half=self._half, verbose=False, device=self._device)
+            except Exception:
+                outs = [None] * len(crops)
+            for (crop, window, job_id), result in zip(chunk, outs):
+                self._consume(job_id, window, result)
+
+        # Finalise any jobs whose tiles all landed.
+        for job_id in list(self._remaining.keys()):
+            self._finalise(job_id)
+
+    def _consume(self, job_id, window, result):
+        if result is None:
+            return
+        tx1, ty1, tx2, ty2 = window
+        dets = results_to_dets(result, x_offset=tx1, y_offset=ty1, task=self._task)
+        if self._task != "detect":
             for det in dets:
                 det["tile"] = (tx1, ty1, tx2, ty2)
-        all_dets.extend(dets)
+        self._dets_by_job[job_id].extend(dets)
+        self._remaining[job_id] -= 1
+        if self._remaining[job_id] <= 0:
+            self._finalise(job_id)
 
-    if len(windows) == 1:
-        return all_dets
-    if task == "detect":
-        return nms_xyxy(all_dets, iou_thresh=iou)
-    return merge_grouped_dets(all_dets, iou, task)
+    def _finalise(self, job_id):
+        if job_id in self._completed_jobs:
+            return
+        self._completed_jobs.add(job_id)
+        dets = self._dets_by_job.pop(job_id, [])
+        if len(dets) <= 1:
+            self._results[job_id] = dets
+            return
+        if self._task == "detect":
+            self._results[job_id] = nms_xyxy(dets, iou_thresh=self._iou)
+        else:
+            self._results[job_id] = merge_grouped_dets(dets, self._iou, self._task)
+
+    def results_for(self, job_id):
+        return self._results.get(job_id, [])
 
 
 def export_json(img_array, dets, class_names):
@@ -563,21 +1016,34 @@ def export_json(img_array, dets, class_names):
     return items
 
 
-def extract_image_metadata(img_path: Path, exiftool_cmd) -> Tuple[Dict, str]:
+def extract_image_metadata(img_path: Path, exiftool_cmd, pool=None) -> Tuple[Dict, str]:
     """Extract full metadata via exiftool, with Pillow EXIF fallback.
 
     Returns (metadata_dict, source) where source is ``exiftool``, ``pillow``, or ``none``.
+    When ``pool`` is a :class:`StayOpenExifToolPool` it is used instead of
+    spawning a fresh process per image.
     """
     if exiftool_cmd:
-        cmd = exiftool_cmd + ["-j", "-a", "-u", "-G1", str(img_path)]
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if proc.returncode == 0:
-            try:
-                payload = json.loads(proc.stdout)
-                if isinstance(payload, list) and payload and isinstance(payload[0], dict):
-                    return payload[0], "exiftool"
-            except json.JSONDecodeError:
-                pass
+        args_list = ["-j", "-a", "-u", "-G1", str(img_path)]
+        if pool is not None:
+            rc, out, _err = pool.run(args_list)
+            if rc == 0 and out:
+                try:
+                    payload = json.loads(out)
+                    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+                        return payload[0], "exiftool"
+                except json.JSONDecodeError:
+                    pass
+        else:
+            cmd = exiftool_cmd + args_list
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if proc.returncode == 0:
+                try:
+                    payload = json.loads(proc.stdout)
+                    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+                        return payload[0], "exiftool"
+                except json.JSONDecodeError:
+                    pass
 
     # Fallback: limited EXIF from Pillow only.
     try:
@@ -725,6 +1191,116 @@ def detection_output_dir(images_dir: Path) -> Path:
     return SCRIPT_DIR / "detections" / images_dir.name
 
 
+def _image_size_lazy(p: Path):
+    """Return (w, h) via a lazy Pillow open, or (0, 0) on failure."""
+    try:
+        from PIL import Image as _PILImage
+        with _PILImage.open(p) as im:
+            return im.size
+    except Exception:
+        return (0, 0)
+
+
+def _run_parallel(image_paths, images_dir, total, model, model_task, args,
+                  batch_size, workers, decode_workers, byte_budget,
+                  exiftool_pool, post_process, safe_print, output_dir,
+                  half_on, device):
+    """Hardware-aware pipeline: decode pool -> bounded queue -> TileBatcher -> post pool."""
+    from concurrent.futures import ThreadPoolExecutor
+    from queue import Queue, Empty
+
+    in_queue = Queue(maxsize=max(1, decode_workers * 4))
+    post_semaphore = threading.Semaphore(max(1, workers * 2))
+
+    def decode_worker():
+        for p in image_paths:
+            im = cv2.imread(str(p))
+            if im is None:
+                safe_print(f"  SKIP (could not read): {p.name}")
+                continue
+            w, h = _image_size_lazy(p)
+            img_bytes = estimate_image_bytes(w, h)
+            if byte_budget is not None:
+                byte_budget.acquire(img_bytes)
+            try:
+                in_queue.put((p, im, img_bytes), block=True)
+            except Exception:
+                if byte_budget is not None:
+                    byte_budget.release(img_bytes)
+                break
+
+    decode_pool = ThreadPoolExecutor(max_workers=decode_workers,
+                                     thread_name_prefix="decode")
+    for _ in range(decode_workers):
+        decode_pool.submit(decode_worker)
+
+    working_batch = max(1, batch_size)
+    halvings = 0
+    batcher = None
+    if args.tiles:
+        batcher = TileBatcher(model, args.conf, args.tile_imgsz, args.tile_overlap,
+                              args.tile_iou, working_batch, model_task,
+                              device=device, half=half_on)
+
+    def submit_post(idx, p, image, dets, flat_name, display_name):
+        post_semaphore.acquire()
+        try:
+            post_process(idx, p, image, dets, flat_name, display_name)
+        finally:
+            post_semaphore.release()
+
+    post_pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="post")
+    job_counter = [0]
+    job_lock = threading.Lock()
+
+    def next_job_id():
+        with job_lock:
+            job_counter[0] += 1
+            return job_counter[0]
+
+    def process_one(p, im):
+        idx = job_counter[0] + 1
+        try:
+            display_name = str(p.relative_to(images_dir))
+        except ValueError:
+            display_name = p.name
+        flat_name = flat_output_name(p, images_dir)
+        job_id = next_job_id()
+        if args.tiles:
+            h, w = im.shape[:2]
+            for (tx1, ty1, tx2, ty2) in iter_tile_windows(w, h, args.tile_imgsz, args.tile_overlap):
+                batcher.submit(im[ty1:ty2, tx1:tx2], (tx1, ty1, tx2, ty2), job_id=job_id)
+            batcher.flush()
+            dets = batcher.results_for(job_id)
+        else:
+            try:
+                outs = model([im], conf=args.conf, verbose=False, half=half_on, device=device)
+                r = outs[0] if outs else None
+            except Exception:
+                r = None
+            dets = results_to_dets(r, task=model_task) if r is not None else []
+        post_pool.submit(submit_post, idx, p, im, dets, flat_name, display_name)
+
+    try:
+        while True:
+            try:
+                p, im, img_bytes = in_queue.get(timeout=0.5)
+            except Empty:
+                if all(not t.is_alive() for t in decode_pool._threads):
+                    break
+                continue
+            try:
+                process_one(p, im)
+            finally:
+                if byte_budget is not None:
+                    byte_budget.release(img_bytes)
+    finally:
+        decode_pool.shutdown(wait=True)
+        if batcher is not None:
+            batcher.flush()
+        post_pool.shutdown(wait=True)
+
+
 # -- Main ----------------------------------------------------------------------
 
 def run(args):
@@ -779,15 +1355,105 @@ def run(args):
         }
         subfolder_count = len(subfolders)
 
-    # Resolve concurrency and batching
-    workers, workers_src = resolve_workers(args.workers)
-    batch_size, batch_src = resolve_batch(args.batch)
+    # Resolve hardware profile and concurrency.
+    hw = detect_hardware()
+    profile = resolve_profile(args.memory_profile)
+    if args.vram_frac is not None:
+        profile = dict(profile)
+        profile["gpu"] = float(args.vram_frac)
+    cuda = _cuda_available()
+    device, device_src = resolve_device(args.device)
+    device_is_cpu = device == "cpu"
+    half_on, half_src = resolve_half(args.half, cuda and not device_is_cpu)
+    cpu_cores = max(1, hw["cpu_cores"])
+    decode_workers, decode_src = resolve_decode_workers(args.decode_workers, cpu_cores)
+
+    # Host RAM byte budget: min(total * cpu_frac, available * 0.5).
+    budget_bytes = 0
+    if hw["ram_gb"]:
+        try:
+            import psutil as _psutil
+            total_ram = _psutil.virtual_memory().total
+            avail_ram = _psutil.virtual_memory().available
+            budget_bytes = int(min(total_ram * profile["cpu"], avail_ram * 0.5))
+        except Exception:
+            budget_bytes = 0
+
+    # VRAM budget: min(free_now * 0.9, total * profile.gpu).
+    vram_budget_bytes = 0
+    free_v, total_v = free_vram_info()
+    if free_v is not None and total_v:
+        vram_budget_bytes = int(min(free_v * 0.9, total_v * profile["gpu"]))
+
+    # Per-image byte estimate: 2 * w * h * 3 (original + annotated copy) + JSON.
+    # Resolved lazily per image; the budget caps how many decoded arrays are
+    # alive at once.
+    byte_budget = ByteBudget(budget_bytes) if budget_bytes > 0 else None
+
+    # Load model before sizing the batch so the VRAM probe can run.
+    model = YOLO(str(model_path))
+    class_names = model.names
+    model_task = getattr(model, "task", None) or "detect"
+
+    # Thread oversubscription guard: cv2 decode threads must stay at 1 when
+    # the decode pool has more than one worker.
+    if decode_workers > 1:
+        try:
+            cv2.setNumThreads(1)
+        except Exception:
+            pass
+
+    # Inference item size: tiles in tiled mode, whole images otherwise.
+    item_imgsz = args.tile_imgsz if args.tiles else 640
+    per_item_vram = 0
+    if cuda and not device_is_cpu and vram_budget_bytes > 0:
+        per_item_vram = measure_inference_vram(model, item_imgsz, half_on, device=device)
+        if per_item_vram <= 0:
+            per_item_vram = int(vram_budget_bytes // 8)  # conservative fallback
+
+    workers, workers_src = resolve_workers(args.workers, cpu_cores, decode_workers,
+                                           half_on, device_is_cpu)
+    if device_is_cpu and torch is not None:
+        try:
+            torch.set_num_threads(max(1, cpu_cores - max(1, workers)))
+        except Exception:
+            pass
+    batch_size, batch_src = resolve_batch(args.batch, vram_budget_bytes, per_item_vram,
+                                          cuda and not device_is_cpu, half_on)
 
     exiftool_cmd, exiftool_resolve_reason = resolve_exiftool_command(args.exiftool)
+    if args.exiftool_stay_open and exiftool_cmd:
+        exiftool_pool = StayOpenExifToolPool(exiftool_cmd, min(4, workers))
+    else:
+        exiftool_pool = None
     require_exiftool_before_run(args, exiftool_cmd, exiftool_resolve_reason)
 
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Process images. The legacy single-image-at-a-time path (--workers 1
+    # --batch 1 --half off --decode-workers 1) runs the original serial loop
+    # verbatim so its output is byte-for-byte identical to the previous
+    # release. It also skips the [Hardware] block so the printed output
+    # matches the old [Config]-only layout.
+    legacy = (batch_size <= 1 and workers <= 1 and decode_workers <= 1
+              and str(args.decode_workers).strip().lower() in ("1", "1.0")
+              and exiftool_pool is None)
+
+    if not legacy:
+        print(f"\n[Hardware]")
+        print(f"  gpu        : {hw['gpu_name']}")
+        print(f"  vram       : {('%.2f GB' % hw['vram_gb']) if hw['vram_gb'] else 'n/a'} total, "
+              f"{('%.2f GB' % (free_v / 1024**3)) if free_v is not None else 'n/a'} free")
+        print(f"  cpu cores  : {cpu_cores}")
+        print(f"  ram        : {('%.2f GB' % hw['ram_gb']) if hw['ram_gb'] else 'n/a'} total")
+        print(f"  profile    : {args.memory_profile}  (gpu={profile['gpu']}, cpu={profile['cpu']})")
+        print(f"  device     : {device}  ({device_src})")
+        print(f"  half       : {'on' if half_on else 'off'}  ({half_src})")
+        print(f"  decode wkrs: {decode_workers}  ({decode_src})")
+        print(f"  workers    : {workers}  ({workers_src})")
+        print(f"  batch      : {batch_size}  ({batch_src})"
+              + (f", per-item vram ~{per_item_vram/1024**2:.0f} MB" if per_item_vram else ""))
 
     print(f"\n[Config]")
     print(f"  images     : {images_dir}  ({len(image_paths)} found)")
@@ -805,13 +1471,10 @@ def run(args):
         print(f"  tiles      : True  (imgsz={args.tile_imgsz}, overlap={args.tile_overlap}, iou={args.tile_iou})")
     else:
         print(f"  tiles      : False  (whole-image inference)")
+    print(f"  task       : {model_task}")
     print()
 
-    # Load model
-    model = YOLO(str(model_path))
-    class_names = model.names
-    model_task = getattr(model, "task", None) or "detect"
-    print(f"  task       : {model_task}")
+    total = len(image_paths)
 
     # Shared, thread-safe state mutated from worker threads.
     state = {
@@ -826,8 +1489,6 @@ def run(args):
     def safe_print(*pargs, **pkwargs):
         with print_lock:
             print(*pargs, **pkwargs)
-
-    total = len(image_paths)
 
     # save_image_with_exif preserves EXIF metadata when writing annotated images.
     # Defined once (not per-image) so it is shared by all worker threads.
@@ -893,7 +1554,7 @@ def run(args):
         # Pillow cannot preserve all JPEG APP metadata blocks. If exiftool is
         # present, copy all writable metadata groups from source to output.
         if exiftool_cmd:
-            cmd = exiftool_cmd + [
+            copy_args = [
                 "-overwrite_original",
                 "-m",
                 "-P",
@@ -903,9 +1564,15 @@ def run(args):
                 "-unsafe",
                 str(dest_path),
             ]
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            if proc.returncode != 0:
-                safe_print(f"  [WARN] exiftool metadata copy failed for {dest_path.name}: {proc.stderr.strip()}")
+            if exiftool_pool is not None:
+                rc, _out, err = exiftool_pool.run(copy_args)
+                if rc != 0:
+                    safe_print(f"  [WARN] exiftool metadata copy failed for {dest_path.name}: {err.strip()}")
+            else:
+                cmd = exiftool_cmd + copy_args
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                if proc.returncode != 0:
+                    safe_print(f"  [WARN] exiftool metadata copy failed for {dest_path.name}: {proc.stderr.strip()}")
         elif is_jpeg:
             with state_lock:
                 should_warn = not state["exiftool_warned"]
@@ -923,7 +1590,7 @@ def run(args):
 
         if args.export_json and n_det > 0:
             items = export_json(image, dets, class_names)
-            metadata, meta_src = extract_image_metadata(img_path, exiftool_cmd)
+            metadata, meta_src = extract_image_metadata(img_path, exiftool_cmd, pool=exiftool_pool)
             metadata = merge_pillow_gps_exif_into_metadata(metadata, img_path)
             if meta_src != "exiftool":
                 with state_lock:
@@ -972,51 +1639,61 @@ def run(args):
             else:
                 safe_print(f"  [{idx}/{total}] {display_name}  ->  0 detections  [skipped]")
 
-    # Process images in batches: main thread reads + runs inference, worker
-    # pool fans out the per-image post-processing for that batch.
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for chunk_start in range(0, total, batch_size):
-            chunk = image_paths[chunk_start:chunk_start + batch_size]
-            valid = []
-            for offset, p in enumerate(chunk):
-                idx = chunk_start + offset + 1
-                try:
-                    display_name = str(p.relative_to(images_dir))
-                except ValueError:
-                    display_name = p.name
-                im = cv2.imread(str(p))
-                if im is None:
-                    safe_print(f"  [{idx}/{total}] SKIP (could not read): {display_name}")
+# Process images. The legacy single-image-at-a-time path (--workers 1
+    # --batch 1 --half off --decode-workers 1) runs the original serial loop
+    # verbatim so its output is byte-for-byte identical to the previous
+    # release. It also skips the [Hardware] block so the printed output
+    # matches the old [Config]-only layout.
+    legacy = (batch_size <= 1 and workers <= 1 and decode_workers <= 1
+              and str(args.decode_workers).strip().lower() in ("1", "1.0")
+              and exiftool_pool is None)
+
+    if legacy:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for chunk_start in range(0, total, batch_size):
+                chunk = image_paths[chunk_start:chunk_start + batch_size]
+                valid = []
+                for offset, p in enumerate(chunk):
+                    idx = chunk_start + offset + 1
+                    try:
+                        display_name = str(p.relative_to(images_dir))
+                    except ValueError:
+                        display_name = p.name
+                    im = cv2.imread(str(p))
+                    if im is None:
+                        safe_print(f"  [{idx}/{total}] SKIP (could not read): {display_name}")
+                        continue
+                    flat_name = flat_output_name(p, images_dir)
+                    valid.append((idx, p, im, flat_name, display_name))
+
+                if not valid:
                     continue
-                flat_name = flat_output_name(p, images_dir)
-                valid.append((idx, p, im, flat_name, display_name))
 
-            if not valid:
-                continue
+                if args.tiles:
+                    for idx, p, im, flat_name, display_name in valid:
+                        dets = detect_image_tiled(
+                            model, im, args.conf,
+                            args.tile_imgsz, args.tile_overlap, args.tile_iou,
+                            batch_size, task=model_task,
+                        )
+                        pool.submit(post_process, idx, p, im, dets, flat_name, display_name)
+                else:
+                    images_for_model = [v[2] for v in valid]
+                    results_list = list(model(images_for_model, conf=args.conf, verbose=False))
 
-            if args.tiles:
-                # Per-source-image tiled detect: each image's own tiles are
-                # run in chunks of `batch_size` inside detect_image_tiled,
-                # but tiles from different source images are never batched
-                # with each other.
-                for idx, p, im, flat_name, display_name in valid:
-                    dets = detect_image_tiled(
-                        model, im, args.conf,
-                        args.tile_imgsz, args.tile_overlap, args.tile_iou,
-                        batch_size,
-                        task=model_task,
-                    )
-                    pool.submit(post_process, idx, p, im, dets, flat_name, display_name)
-            else:
-                images_for_model = [v[2] for v in valid]
-                results_list = list(model(images_for_model, conf=args.conf, verbose=False))
+                    for (idx, p, im, flat_name, display_name), r in zip(valid, results_list):
+                        dets = results_to_dets(r, task=model_task)
+                        pool.submit(post_process, idx, p, im, dets, flat_name, display_name)
+    else:
+        _run_parallel(image_paths, images_dir, total, model, model_task, args,
+                      batch_size, workers, decode_workers, byte_budget,
+                      exiftool_pool, post_process, safe_print, output_dir,
+                      half_on, device)
 
-                for (idx, p, im, flat_name, display_name), r in zip(valid, results_list):
-                    dets = results_to_dets(r, task=model_task)
-                    pool.submit(post_process, idx, p, im, dets, flat_name, display_name)
-    # ThreadPoolExecutor.__exit__ waits for all submitted tasks to complete.
+    if exiftool_pool is not None:
+        exiftool_pool.shutdown()
 
-    # Export labels.txt (class_id → class_name mapping)
+    # Export labels.txt (class_id -> class_name mapping)
     if args.export_json:
         labels_path = output_dir / "labels.txt"
         with open(labels_path, "w") as f:

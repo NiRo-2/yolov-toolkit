@@ -27,6 +27,12 @@ set exportAnnotatedImages=true
 set recursive=true
 set workers=auto
 set batch=auto
+set decodeWorkers=auto
+set device=auto
+set half=auto
+set memoryProfile=balanced
+set useTiles=true
+set exiftoolStayOpen=false
 
 if "%imagesDirPath%"=="" (
     echo ERROR: imagesDirPath cannot be empty.
@@ -67,7 +73,13 @@ if /I "%exportAnnotatedImages%"=="false" set annotatedFlag=--no-export-annotated
 set recursiveFlag=
 if /I "%recursive%"=="false" set recursiveFlag=--no-recursive
 
-python "%scriptPath%" --images %imagesDirPath% --model %modelPath% --conf %confidence% %annotatedFlag% %recursiveFlag% --workers %workers% --batch %batch%
+set tilesFlag=
+if /I "%useTiles%"=="false" set tilesFlag=--no-tiles
+
+set exiftoolStayOpenFlag=
+if /I "%exiftoolStayOpen%"=="true" set exiftoolStayOpenFlag=--exiftool-stay-open
+
+python "%scriptPath%" --images %imagesDirPath% --model %modelPath% --conf %confidence% %annotatedFlag% %recursiveFlag% --workers %workers% --batch %batch% --decode-workers %decodeWorkers% --device %device% --half %half% --memory-profile %memoryProfile% %tilesFlag% %exiftoolStayOpenFlag%
 set "exitCode=%ERRORLEVEL%"
 if not "%exitCode%"=="0" (
     pause
