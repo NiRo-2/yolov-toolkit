@@ -175,7 +175,9 @@ STABLE_STEP_UP_GPU_FRACTION = 0.55
 ADAPTIVE_EPOCH_ATTEMPT_CAP = 1     # provisional config: 1 epoch per attempt
 MAX_ADAPTIVE_CONFIG_DOWNGRADES = 12
 AUG_LADDER = [
-    # (mosaic, copy_paste, mixup, multi_scale)
+    # (mosaic, copy_paste, mixup, multi_scale) — quality-first: rung 0 is the
+    # heaviest combo; each rung is strictly lighter, probe-failure fallback only.
+    (1.0, 0.3, 0.15, 0.5),
     (1.0, 0.3, 0.15, 0.0),
     (1.0, 0.3, 0.0,  0.0),
     (1.0, 0.0, 0.0,  0.0),
@@ -1830,12 +1832,12 @@ def _short(s: str) -> str:
     return s if len(s) <= 300 else s[:300] + " ..."
 
 
-def build_chosen(model, imgsz, batch, workers, multi_scale, mosaic):
+def build_chosen(model, imgsz, batch, workers, multi_scale, mosaic, mixup=0.15, copy_paste=0.3):
     """Canonical chosen-config dict used for cache keys and training kwargs."""
     return {
         "model": model, "imgsz": int(imgsz), "batch": int(batch), "workers": int(workers),
         "multi_scale": float(multi_scale), "mosaic": float(mosaic),
-        "mixup": 0.15, "copy_paste": 0.3,
+        "mixup": float(mixup), "copy_paste": float(copy_paste),
     }
 
 
@@ -1986,18 +1988,32 @@ def calibrate_training_config(args, logger, cache, hw_fp, hw, device, data_yaml,
                     continue
 
             # Augmentation ladder (probe workers 0 so comparison with the base
-            # probe is batch/memory apples-to-apples).
-            multi_scale, mosaic = 0.0, 1.0
-            _, ms_safe = run_probe(build_chosen(model, imgsz, safe_batch, 0, 0.5, 0.5),
-                                   "multi-scale upgrade (ms 0.5, mosaic 0.5)")
-            if ms_safe:
-                multi_scale, mosaic = 0.5, 0.5
+            # batch probe is batch/memory apples-to-apples): attempt the
+            # heaviest rung first, step down only on measured-unsafe rungs.
+            # The base batch probe already covered rung (1.0, 0.3, 0.15, 0.0),
+            # so that rung resolves from the probe memo.
+            chosen_aug = None
+            for rung, (mosaic, copy_paste, mixup, multi_scale) in enumerate(AUG_LADDER):
+                _, aug_safe = run_probe(
+                    build_chosen(model, imgsz, safe_batch, 0, multi_scale, mosaic,
+                                 mixup=mixup, copy_paste=copy_paste),
+                    f"aug ladder rung {rung} (mosaic {mosaic}, copy_paste {copy_paste}, mixup {mixup}, multi_scale {multi_scale})",
+                )
+                if aug_safe:
+                    chosen_aug = build_chosen(model, imgsz, safe_batch, 0, multi_scale, mosaic,
+                                              mixup=mixup, copy_paste=copy_paste)
+                    break
+            if chosen_aug is None:
+                logger.log(f"[Calibrate] {model}@{imgsz}px batch {safe_batch}: no probe-safe augmentation rung; trying next candidate.")
+                continue
 
             # Final verification probe with the REAL dataloader worker count
             # (dataloader subprocesses count toward measured CPU RSS).
             chosen_cfg = None
             if args.workers is not None:
-                cfg = build_chosen(model, imgsz, safe_batch, base_workers, multi_scale, mosaic)
+                cfg = build_chosen(model, imgsz, safe_batch, base_workers,
+                                   chosen_aug["multi_scale"], chosen_aug["mosaic"],
+                                   mixup=chosen_aug["mixup"], copy_paste=chosen_aug["copy_paste"])
                 _, safe = run_probe(cfg, f"final verify: workers {base_workers} (explicit)")
                 if safe:
                     chosen_cfg = cfg
@@ -2013,7 +2029,9 @@ def calibrate_training_config(args, logger, cache, hw_fp, hw, device, data_yaml,
                 for w in sorted({base_workers, 2, 0}, reverse=True):
                     if w > base_workers:
                         continue
-                    cfg = build_chosen(model, imgsz, safe_batch, w, multi_scale, mosaic)
+                    cfg = build_chosen(model, imgsz, safe_batch, w,
+                                       chosen_aug["multi_scale"], chosen_aug["mosaic"],
+                                       mixup=chosen_aug["mixup"], copy_paste=chosen_aug["copy_paste"])
                     _, safe = run_probe(cfg, f"final verify: workers {w}")
                     if safe:
                         chosen_cfg = cfg
@@ -2041,8 +2059,9 @@ def calibrate_training_config(args, logger, cache, hw_fp, hw, device, data_yaml,
 
     raise CalibrateFail(
         "No probe-safe configuration found. Tried: " + ", ".join(tried) + ".\n"
-        "Suggestions: lower --imgsz (e.g. 416 or 320), a smaller model (--model yolo26m.pt), "
-        "--memory-profile balanced/aggressive, more free RAM, or --force-unsafe to train anyway (not recommended)."
+        "Suggestions: try --memory-profile balanced or aggressive first, then lower --imgsz "
+        "(e.g. 416 or 320) or a smaller model (--model yolo26m.pt), more free RAM, "
+        "or --force-unsafe to train anyway (not recommended)."
     )
 
 
