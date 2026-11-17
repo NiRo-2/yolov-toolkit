@@ -78,8 +78,8 @@ def make_calibrate_args():
     )
 
 
-def run_calibrate(monkeypatch, probe_peaks):
-    """Run calibrate_training_config with fake hardware + fake probes; return (chosen, calls)."""
+def run_calibrate(monkeypatch, probe_peaks, args=None, calc_batch_override=None):
+    """Run calibrate_training_config with fake hardware + fake probes; return (chosen, provenance, calls, cache)."""
     calls = []
 
     def fake_probe(model_name, device, data_yaml, imgsz, batch, multi_scale, mosaic, mixup,
@@ -96,15 +96,17 @@ def run_calibrate(monkeypatch, probe_peaks):
     monkeypatch.setattr(td, "probe_train_once", fake_probe)
     monkeypatch.setattr(td, "get_vram_per_image", lambda model: 0.3)
     monkeypatch.setattr(td, "save_memory_cache", lambda cache, logger: True)
+    if calc_batch_override is not None:
+        monkeypatch.setattr(td, "calc_batch", lambda *a, **k: calc_batch_override)
 
     hw = {"vram_gb": 4.0, "ram_gb": 16.0, "cpu_cores": 8, "gpu_name": "FakeGPU"}
     ds_fp = {"image_count": 1000, "median_img_size": None}
     cache = {"version": 3, "hardware_profiles": {}}
     chosen, provenance = td.calibrate_training_config(
-        make_calibrate_args(), FakeCalibrateLogger(), cache, {"fake": 1}, hw, "0",
+        args or make_calibrate_args(), FakeCalibrateLogger(), cache, {"fake": 1}, hw, "0",
         Path("fake/data.yaml"), Path("fake/train/images"), ds_fp,
     )
-    return chosen, provenance, calls
+    return chosen, provenance, calls, cache
 
 
 def heavy_unsafe(cfg):
@@ -119,7 +121,7 @@ def heavy_safe(cfg):
 
 
 def test_calibrate_attempts_heaviest_aug_rung_first(monkeypatch):
-    chosen, provenance, calls = run_calibrate(monkeypatch, heavy_safe)
+    chosen, provenance, calls, cache = run_calibrate(monkeypatch, heavy_safe)
     # The batch-sizing ladder probes run with rung (1.0, 0.3, 0.15, 0.0) first by
     # design. The first probe that attempts any multi_scale must be the heaviest
     # rung (mosaic 1.0, copy_paste 0.3, mixup 0.15, ms 0.5) — not the old
@@ -138,7 +140,7 @@ def test_calibrate_attempts_heaviest_aug_rung_first(monkeypatch):
 
 
 def test_calibrate_steps_down_ladder_when_heaviest_unsafe(monkeypatch):
-    chosen, provenance, calls = run_calibrate(monkeypatch, heavy_unsafe)
+    chosen, provenance, calls, cache = run_calibrate(monkeypatch, heavy_unsafe)
     assert provenance == "measured"
     # Heaviest rung attempted and failed; selection lands on the next safe rung
     # (mosaic 1.0, mixup 0.15, ms 0.0), not the old ms 0.5 + mosaic 0.5 combo.
@@ -214,7 +216,7 @@ RESUME_CKPT_CFG = {
 
 
 def run_resume_calibrate(monkeypatch, tmp_path, peaks, yaml_path="use_tmp", device="0",
-                         force_unsafe=False, no_memory_probe=False):
+                         force_unsafe=False, no_memory_probe=False, cache=None):
     calls = []
 
     def fake_probe(model_name, device, data_yaml, imgsz, batch, multi_scale, mosaic, mixup,
@@ -235,7 +237,7 @@ def run_resume_calibrate(monkeypatch, tmp_path, peaks, yaml_path="use_tmp", devi
     if yaml_path == "use_tmp":
         ds_dir = tmp_path / "ds"
         imgs = ds_dir / "train" / "images"
-        imgs.mkdir(parents=True)
+        imgs.mkdir(parents=True, exist_ok=True)
         (imgs / "a.jpg").write_bytes(b"\xff\xd8\xff")
         (ds_dir / "data.yaml").write_text(
             "train: train/images\nval: val/images\nnc: 1\nnames: [a]\n", encoding="utf-8")
@@ -246,7 +248,8 @@ def run_resume_calibrate(monkeypatch, tmp_path, peaks, yaml_path="use_tmp", devi
     logger = FakeCalibrateLogger()
     hw = {"vram_gb": 10.0, "ram_gb": 32.0, "cpu_cores": 8, "gpu_name": "FakeGPU"}
     ds_fp = {"median_img_size": 1280, "image_count": 1000, "task": "detect"}
-    cache = {"version": 3, "hardware_profiles": {}}
+    if cache is None:
+        cache = {"version": 3, "hardware_profiles": {}}
     chosen, provenance = td.calibrate_resume_config(
         make_resume_args(force_unsafe=force_unsafe, no_memory_probe=no_memory_probe),
         logger, cache, hw, {"fp": 1}, ds_fp, dict(RESUME_CKPT_CFG), tmp_path / "run",
@@ -381,7 +384,7 @@ class FakeGuard:
         pass
 
 
-def run_supervisor_stepup(monkeypatch, tmp_path, start_aug, unsafe_rungs):
+def run_supervisor_stepup(monkeypatch, tmp_path, start_aug, unsafe_rungs, cuda_available=True):
     """Drive run_adaptive_supervisor with stubbed attempts/probes; return (attempt_cfgs, probe_cfgs, status)."""
     attempt_cfgs = []
     probe_cfgs = []
@@ -408,7 +411,7 @@ def run_supervisor_stepup(monkeypatch, tmp_path, start_aug, unsafe_rungs):
         return tracker
 
     monkeypatch.setattr(td, "probe_train_once", fake_probe)
-    monkeypatch.setattr(td, "cuda_available_for", lambda d: True)
+    monkeypatch.setattr(td, "cuda_available_for", lambda d: cuda_available)
     monkeypatch.setattr(td, "cuda_index_for", lambda d: 0)
     monkeypatch.setattr(td, "run_attempt", fake_run_attempt)
 
@@ -443,3 +446,95 @@ def test_supervisor_keeps_aug_when_step_up_probe_rejects(monkeypatch, tmp_path):
         unsafe_rungs={(1.0, 0.0, 0.0, 0.0)})
     assert (1.0, 0.0, 0.0, 0.0, 8) in probe_cfgs  # candidate was attempted
     assert all(c[0] == 0.5 for c in attempt_cfgs)  # ...and never adopted
+
+
+# ---------------------------------------------------------------------------
+# Final-review fixes (Important findings I1-I5)
+# ---------------------------------------------------------------------------
+
+def test_resume_force_unsafe_entry_is_not_reused_by_later_plain_resume(monkeypatch, tmp_path):
+    # I1: --force-unsafe keeps the checkpoint multi_scale UNVALIDATED; the stored
+    # resume_selections entry must be marked unverified, and a later plain resume
+    # must re-probe instead of silently inheriting the unverified value as "cache".
+    chosen, provenance, calls, cache, logger = run_resume_calibrate(
+        monkeypatch, tmp_path, (2.0, 9.0, 1.0), force_unsafe=True)
+    assert chosen["multi_scale"] == 0.5  # kept unvalidated (explicit opt-in)
+    profile = list(cache["hardware_profiles"].values())[0]
+    entry = list(profile["resume_selections"].values())[0]
+    assert entry["config"]["multi_scale"] == 0.5
+    assert entry.get("verified") is False
+
+    # Second, plain resume against the SAME cache: must NOT hit "cache".
+    chosen2, provenance2, calls2, _, _ = run_resume_calibrate(
+        monkeypatch, tmp_path, (2.0, 4.0, 1.0), cache=cache)
+    assert provenance2 != "cache"
+    assert len(calls2) == 1 and calls2[0]["multi_scale"] == 0.5  # re-probed
+    assert chosen2["multi_scale"] == 0.5  # fresh probe says safe -> kept
+    # the verified entry replaces the unverified one for future resumes
+    profile2 = list(cache["hardware_profiles"].values())[0]
+    entry2 = list(profile2["resume_selections"].values())[0]
+    assert entry2.get("verified") is True
+
+
+def test_fresh_force_unsafe_workers_probe_not_recorded_as_measured_safe(monkeypatch):
+    # I2: when the final explicit-workers verification probe is UNSAFE and
+    # --force-unsafe accepts it for THIS run, the config must not be recorded
+    # as a measured-safe selection (a later unforced run would otherwise train
+    # it believing it was probe-verified).
+    def workers4_unsafe(cfg):
+        if cfg["workers"] >= 4:
+            return (1.0, 9.0, 0.5)  # 9 GB reserved > 4 GB * 0.68 = 2.72 GB cap
+        return (1.0, 1.2, 0.5)      # batch/rung probes (workers 0) pass
+
+    args = argparse.Namespace(
+        model=None, imgsz=640, batch=None, workers=4,
+        memory_profile="safe", no_memory_probe=False, force_unsafe=True,
+    )
+    chosen, provenance, calls, cache = run_calibrate(monkeypatch, workers4_unsafe, args=args)
+    assert provenance == "force-unsafe"
+    assert chosen["workers"] == 4
+    assert chosen["multi_scale"] == 0.5  # heavy rung survived into the accepted config
+    profile = list(cache["hardware_profiles"].values())[0]
+    # no selection entry may claim safe=True for this config
+    assert not any(sel.get("safe") is True for sel in profile.get("selections", {}).values())
+
+
+def test_supervisor_probes_each_config_at_most_once_per_memory_state(monkeypatch, tmp_path):
+    # I3: 12 single-epoch attempts climbing the whole aug ladder: each distinct
+    # config must be measured once — the pre-attempt probe must reuse the
+    # verdict that just validated the step-up candidate instead of re-running
+    # an identical full probe run.
+    attempt_cfgs, probe_cfgs, status = run_supervisor_stepup(
+        monkeypatch, tmp_path, start_aug=(0.5, 0.0, 0.0, 0.0), unsafe_rungs=set())
+    assert status == "completed-target"
+    assert len(probe_cfgs) == len(set(probe_cfgs))  # no identical config probed twice
+    assert len(probe_cfgs) == 7  # 1 initial validation + 6 ladder climbs to the top rung
+
+
+def test_calibrate_retries_heaviest_rung_at_smaller_batch_before_descending(monkeypatch):
+    # I4: heaviest rung unsafe at batch 8 but safe at batch 4 — with nbs=64 the
+    # effective batch is equalized, so batch 4 + full aug is the higher-quality
+    # config; the scan must retry the heaviest rung at the smaller batch before
+    # settling for a lighter rung at the bigger batch.
+    def ms_heavy_only_safe_at_small_batch(cfg):
+        if cfg["multi_scale"] > 0.0 and cfg["batch"] >= 8:
+            return (1.0, 9.0, 0.5)  # > 2.72 GB safe cap
+        return (1.0, 1.2, 0.5)      # safe elsewhere
+
+    chosen, provenance, calls, cache = run_calibrate(
+        monkeypatch, ms_heavy_only_safe_at_small_batch, calc_batch_override=8)
+    assert provenance == "measured"
+    assert chosen["batch"] == 4
+    assert chosen["multi_scale"] == 0.5
+    assert chosen["mosaic"] == 1.0
+
+
+def test_supervisor_skips_step_up_when_probing_unavailable(monkeypatch, tmp_path):
+    # I5: CPU / --no-memory-probe cannot measure, so no step-up may be adopted
+    # there ("step-ups happen only on measured probe signals").
+    attempt_cfgs, probe_cfgs, status = run_supervisor_stepup(
+        monkeypatch, tmp_path, start_aug=(0.5, 0.0, 0.0, 0.0), unsafe_rungs=set(),
+        cuda_available=False)
+    assert status == "completed-target"
+    assert probe_cfgs == []  # no probes possible
+    assert all(c[0] == 0.5 for c in attempt_cfgs)  # augmentation never climbed

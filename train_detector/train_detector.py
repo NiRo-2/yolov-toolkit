@@ -2014,19 +2014,30 @@ def calibrate_training_config(args, logger, cache, hw_fp, hw, device, data_yaml,
 
             # Augmentation ladder (probe workers 0 so comparison with the base
             # batch probe is batch/memory apples-to-apples): attempt the
-            # heaviest rung first, step down only on measured-unsafe rungs.
+            # heaviest rung first; a rung that is unsafe at the current safe
+            # batch is retried at the next-smaller probe batch before the
+            # ladder descends (nbs=64 equalizes effective batch, so batch 4 +
+            # full aug is the higher-quality pick over batch 8 + lighter aug).
             # The base batch probe already covered rung (1.0, 0.3, 0.15, 0.0),
             # so that rung resolves from the probe memo.
             chosen_aug = None
             for rung, (mosaic, copy_paste, mixup, multi_scale) in enumerate(AUG_LADDER):
-                _, aug_safe = run_probe(
-                    build_chosen(model, imgsz, safe_batch, 0, multi_scale, mosaic,
-                                 mixup=mixup, copy_paste=copy_paste),
-                    f"aug ladder rung {rung} (mosaic {mosaic}, copy_paste {copy_paste}, mixup {mixup}, multi_scale {multi_scale})",
-                )
-                if aug_safe:
-                    chosen_aug = build_chosen(model, imgsz, safe_batch, 0, multi_scale, mosaic,
-                                              mixup=mixup, copy_paste=copy_paste)
+                rung_cfg = None
+                for b in [safe_batch] + [b for b in probe_batches if b < safe_batch]:
+                    _, aug_safe = run_probe(
+                        build_chosen(model, imgsz, b, 0, multi_scale, mosaic,
+                                     mixup=mixup, copy_paste=copy_paste),
+                        f"aug ladder rung {rung} (mosaic {mosaic}, copy_paste {copy_paste}, mixup {mixup}, multi_scale {multi_scale}) at batch {b}",
+                    )
+                    if aug_safe:
+                        rung_cfg = build_chosen(model, imgsz, b, 0, multi_scale, mosaic,
+                                                mixup=mixup, copy_paste=copy_paste)
+                        break
+                if rung_cfg is not None:
+                    if rung_cfg["batch"] != safe_batch:
+                        logger.log(f"[Calibrate] heaviest probe-safe augmentation kept at smaller batch {rung_cfg['batch']} instead of a lighter rung at batch {safe_batch} (quality-first, effective batch held by nbs=64).")
+                    safe_batch = rung_cfg["batch"]
+                    chosen_aug = rung_cfg
                     break
             if chosen_aug is None:
                 logger.log(f"[Calibrate] {model}@{imgsz}px batch {safe_batch}: no probe-safe augmentation rung; trying next candidate.")
@@ -2035,6 +2046,7 @@ def calibrate_training_config(args, logger, cache, hw_fp, hw, device, data_yaml,
             # Final verification probe with the REAL dataloader worker count
             # (dataloader subprocesses count toward measured CPU RSS).
             chosen_cfg = None
+            final_probe_safe = False
             if args.workers is not None:
                 cfg = build_chosen(model, imgsz, safe_batch, base_workers,
                                    chosen_aug["multi_scale"], chosen_aug["mosaic"],
@@ -2042,8 +2054,9 @@ def calibrate_training_config(args, logger, cache, hw_fp, hw, device, data_yaml,
                 _, safe = run_probe(cfg, f"final verify: workers {base_workers} (explicit)")
                 if safe:
                     chosen_cfg = cfg
+                    final_probe_safe = True
                 elif args.force_unsafe:
-                    logger.log("[Calibrate] --force-unsafe: accepting explicit workers despite unsafe final probe.")
+                    logger.log("[Calibrate] --force-unsafe: accepting explicit workers despite UNSAFE final verification probe (this config is NOT recorded as measured-safe).")
                     chosen_cfg = cfg
                 else:
                     raise CalibrateFail(
@@ -2060,6 +2073,7 @@ def calibrate_training_config(args, logger, cache, hw_fp, hw, device, data_yaml,
                     _, safe = run_probe(cfg, f"final verify: workers {w}")
                     if safe:
                         chosen_cfg = cfg
+                        final_probe_safe = True
                         break
             if chosen_cfg is None:
                 logger.log(f"[Calibrate] {model}@{imgsz}px batch {safe_batch}: dataloader workers unsafe at every level; trying next candidate.")
@@ -2067,7 +2081,11 @@ def calibrate_training_config(args, logger, cache, hw_fp, hw, device, data_yaml,
 
             key = config_signature(**chosen_cfg)
             peaks = probe_memo[key][0]
-            record_calibration(cache, logger, hw_fp, ds_fp, sel_key, chosen_cfg, peaks, safe=True, measured=True, make_selection=True)
+            record_calibration(cache, logger, hw_fp, ds_fp, sel_key, chosen_cfg, peaks, safe=final_probe_safe, measured=True, make_selection=final_probe_safe)
+            if not final_probe_safe:
+                logger.log(f"[Calibrate] SELECTED --force-unsafe config (final verification probe UNSAFE): {key}")
+                print(f"[Calibration] Force-unsafe config: {chosen_cfg['model']} @ {chosen_cfg['imgsz']}px batch {chosen_cfg['batch']} workers {chosen_cfg['workers']} multi_scale {chosen_cfg['multi_scale']} mosaic {chosen_cfg['mosaic']}")
+                return chosen_cfg, "force-unsafe"
             logger.log(f"[Calibrate] SELECTED measured-safe config: {key}")
             print(f"[Calibration] Safe config: {chosen_cfg['model']} @ {chosen_cfg['imgsz']}px batch {chosen_cfg['batch']} workers {chosen_cfg['workers']} multi_scale {chosen_cfg['multi_scale']} mosaic {chosen_cfg['mosaic']}")
             return chosen_cfg, "measured"
@@ -4272,7 +4290,9 @@ def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run
         rsel = profile.get(cache_key, {}).get(ds_key)
     if rsel:
         entry = rsel.get("config") if isinstance(rsel, dict) else None
-        if isinstance(entry, dict):
+        if isinstance(entry, dict) and rsel.get("verified") is not True:
+            logger.log("[Resume Calibrate] cached resume selection was stored unverified (--force-unsafe); re-probing to revalidate.")
+        elif isinstance(entry, dict):
             cached = dict(entry)
             cached_model = str(cached.get("model") or "")
             stale_checkpoint_model = (
@@ -4295,6 +4315,7 @@ def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run
                     profile2.setdefault("resume_selections", {})
                     profile2["resume_selections"][ds_key] = {
                         "config": dict(cached),
+                        "verified": True,  # conservative inferred caps + multi_scale 0.0
                         "updated_at": local_iso(),
                     }
                     cache["updated_at"] = local_iso()
@@ -4308,6 +4329,7 @@ def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run
     # --- probe-verify the checkpoint's augmentation combo (multi_scale) on the
     # current hardware; keep it when measured safe, reset only when unsafe or
     # unverifiable (supervisor's pre-attempt probe guards the rest).
+    probe_verified = False
     if multi_scale > 0.0:
         if args.force_unsafe:
             logger.log(f"[Resume Calibrate] --force-unsafe: keeping checkpoint multi_scale {multi_scale} without probe validation (explicit opt-in).")
@@ -4321,7 +4343,6 @@ def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run
             chosen["multi_scale"] = 0.0
             logger.log(f"[Resume Calibrate] device '{device}' is not CUDA: cannot probe checkpoint multi_scale {multi_scale}; reset to 0.0 (CPU resume stays conservative).")
         else:
-            verified = False
             try:
                 image_count = 100
                 try:
@@ -4354,11 +4375,11 @@ def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run
                 if reasons:
                     logger.log("[Resume Calibrate] checkpoint augmentation probe UNSAFE: " + "; ".join(reasons) + f"; resetting multi_scale {multi_scale} -> 0.0.")
                 else:
-                    verified = True
+                    probe_verified = True
                     logger.log(f"[Resume Calibrate] checkpoint augmentation probe SAFE (GPU reserved {res} GB, CPU RSS {rss} GB); keeping multi_scale {multi_scale}.")
             except Exception as e:
                 logger.log(f"[Resume Calibrate] checkpoint augmentation probe failed ({_short(str(e))}); resetting multi_scale {multi_scale} -> 0.0.")
-            if not verified:
+            if not probe_verified:
                 chosen["multi_scale"] = 0.0
     elif args.force_unsafe:
         logger.log("[Resume Calibrate] --force-unsafe: calibrated-down resume config kept without probe validation.")
@@ -4369,6 +4390,11 @@ def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run
         profile2.setdefault("resume_selections", {})
         profile2["resume_selections"][ds_key] = {
             "config": dict(chosen),
+            # verified: safe to reuse without re-probing. True when the config was
+            # probe-measured safe, or its multi_scale is 0.0 (kept checkpoint value,
+            # probe-proven unsafe fallback, or conservative unprobed cap fallback).
+            # False only when --force-unsafe kept an unvalidated multi_scale > 0.
+            "verified": bool(chosen.get("multi_scale", 0.0) == 0.0 or probe_verified),
             "updated_at": local_iso(),
         }
         cache["updated_at"] = local_iso()
@@ -4696,6 +4722,8 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
             return new, "workers"
         return None, None
 
+    probe_cache = {}
+
     def probe_config_safe(cfg):
         # quick probe validation; reuse probe_train_once if possible
         probe_model = cfg.get("model")
@@ -4713,6 +4741,11 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
         if not use_gpu:
             logger.log(f"[Probe] non-GPU device '{dev}'; skipping probe for {probe_model}.")
             return True
+        sig = config_signature(**cfg)
+        if sig in probe_cache:
+            verdict = probe_cache[sig]
+            logger.log(f"[Probe] reusing measured verdict for {probe_model} @ {cfg.get('imgsz')}px batch {cfg.get('batch')} (no new probe run).")
+            return verdict
         cuda_index = cuda_index_for(dev)
         image_count = 100
         try:
@@ -4741,18 +4774,26 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
             alloc, res, rss = peaks
             if res is not None and res > gpu_cap:
                 logger.log(f"[Probe] UNSAFE {probe_model}: reserved {res:.2f} GB > cap {gpu_cap:.2f} GB")
+                probe_cache[sig] = False
                 return False
             if rss is not None and rss > cpu_cap:
                 logger.log(f"[Probe] UNSAFE {probe_model}: CPU RSS {rss:.2f} GB > cap {cpu_cap:.2f} GB")
+                probe_cache[sig] = False
                 return False
             logger.log(
                 f"[Probe] SAFE {probe_model}: alloc={alloc} reserved={res} rss={rss} "
                 f"(caps gpu={gpu_cap:.2f} cpu={cpu_cap:.2f})"
             )
+            probe_cache[sig] = True
             return True
         except Exception as e:
             logger.log(f"[Probe] FAILED for {probe_model}: {type(e).__name__}: {_short(str(e))}")
+            probe_cache[sig] = False
             return False
+
+    # Augmentation/batch step-ups are only meaningful where a real probe can
+    # measure them; on CPU or --no-memory-probe there is no measured verdict.
+    step_up_probing_ok = (not getattr(args, "no_memory_probe", False)) and cuda_available_for(device)
 
     current_ckpt = last_pt
     attempt_no = 0
@@ -4810,6 +4851,8 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
                     logger.log("[Adaptive] config proven after 1 stable epoch; lifting 1-epoch cap.")
                 else:
                     state["provisional"] = True
+                    if tracker.oom_auto_reduced:
+                        probe_cache.clear()  # attempt halved batch mid-run; measurements stale
             state["stable_epochs"] = state.get("stable_epochs", 0) + (1 if not tracker.adaptive_triggered and not tracker.emergency_triggered else 0)
             write_adaptive_state(run_dir, state)
             # if target reached?
@@ -4820,31 +4863,34 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
             if (state.get("stable_epochs", 0) >= STABLE_EPOCHS_BEFORE_STEP_UP
                     and guard.peak_reserved() < (hw.get("vram_gb", 0) * STABLE_STEP_UP_GPU_FRACTION)
                     and tracker.oom_auto_reduced is False):
-                # Quality-first step-up: batch first, then climb one rung up the
-                # AUG_LADDER (mosaic 0.5->1.0, ms 0->0.5 etc.); every candidate
-                # must pass probe_config_safe before it is adopted.
-                stepped = False
-                if current_cfg["batch"] < 8:
-                    new_batch = next((b for b in (1, 2, 4, 8) if b > current_cfg["batch"]), None)
-                    if new_batch is not None:
-                        cand = dict(current_cfg)
-                        cand["batch"] = new_batch
-                        if probe_config_safe(cand):
-                            logger.log(f"[Adaptive] step-up approved (batch): {current_cfg['batch']} -> {new_batch}")
+                if not step_up_probing_ok:
+                    logger.log("[Adaptive] step-up skipped: probing unavailable (CPU device or --no-memory-probe); step-ups require measured probe verdicts.")
+                else:
+                    # Quality-first step-up: batch first, then climb one rung up the
+                    # AUG_LADDER (mosaic 0.5->1.0, ms 0->0.5 etc.); every candidate
+                    # must pass probe_config_safe before it is adopted.
+                    stepped = False
+                    if current_cfg["batch"] < 8:
+                        new_batch = next((b for b in (1, 2, 4, 8) if b > current_cfg["batch"]), None)
+                        if new_batch is not None:
+                            cand = dict(current_cfg)
+                            cand["batch"] = new_batch
+                            if probe_config_safe(cand):
+                                logger.log(f"[Adaptive] step-up approved (batch): {current_cfg['batch']} -> {new_batch}")
+                                current_cfg = cand
+                                stepped = True
+                            else:
+                                logger.log(f"[Adaptive] batch step-up to {new_batch} probe-rejected; trying augmentation step-up.")
+                    if not stepped:
+                        cand = aug_step_up_candidate(current_cfg)
+                        if cand is not None and probe_config_safe(cand):
+                            cur_a = (current_cfg['mosaic'], current_cfg['copy_paste'], current_cfg['mixup'], current_cfg['multi_scale'])
+                            new_a = (cand['mosaic'], cand['copy_paste'], cand['mixup'], cand['multi_scale'])
+                            logger.log(f"[Adaptive] step-up approved (augmentation ladder): {cur_a} -> {new_a}")
                             current_cfg = cand
                             stepped = True
-                        else:
-                            logger.log(f"[Adaptive] batch step-up to {new_batch} probe-rejected; trying augmentation step-up.")
-                if not stepped:
-                    cand = aug_step_up_candidate(current_cfg)
-                    if cand is not None and probe_config_safe(cand):
-                        cur_a = (current_cfg['mosaic'], current_cfg['copy_paste'], current_cfg['mixup'], current_cfg['multi_scale'])
-                        new_a = (cand['mosaic'], cand['copy_paste'], cand['mixup'], cand['multi_scale'])
-                        logger.log(f"[Adaptive] step-up approved (augmentation ladder): {cur_a} -> {new_a}")
-                        current_cfg = cand
-                        stepped = True
-                if not stepped:
-                    logger.log("[Adaptive] step-up not approved (unsafe or not eligible).")
+                    if not stepped:
+                        logger.log("[Adaptive] step-up not approved (unsafe or not eligible).")
             # continue loop (next attempt runs more)
             mode = "resume"
             continue
@@ -4852,6 +4898,7 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
         if st == "stopped-adaptive":
             # clean epoch boundary; downgrade config then continue
             logger.log("[Adaptive] adaptive pressure; downgrading config.")
+            probe_cache.clear()  # runtime pressure invalidates earlier measured verdicts
             res = downgrade_config(current_cfg)
             if res[0] is None:
                 final_status = "stopped-adaptive"
@@ -4866,6 +4913,7 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
         if st == "partial-emergency":
             # restore already done in run_attempt; downgrade config
             logger.log("[Adaptive] emergency partial epoch; downgrading config.")
+            probe_cache.clear()  # emergency means an earlier verdict just failed in practice
             res = downgrade_config(current_cfg)
             if res[0] is None:
                 final_status = "partial-emergency"
@@ -4880,6 +4928,7 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
         if st == "crashed":
             # OOM or other crash; downgrade
             logger.log("[Adaptive] crash; downgrading config.")
+            probe_cache.clear()  # crash invalidates earlier measured verdicts
             res = downgrade_config(current_cfg)
             if res[0] is None:
                 final_status = "crashed"
