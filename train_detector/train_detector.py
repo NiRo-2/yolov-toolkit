@@ -182,7 +182,6 @@ GUARD_SAMPLE_INTERVAL_SECONDS = 2.0
 GUARD_POLL_EVERY_BATCHES = 16
 STABLE_EPOCHS_BEFORE_STEP_UP = 3
 STABLE_STEP_UP_GPU_FRACTION = 0.55
-ADAPTIVE_EPOCH_ATTEMPT_CAP = 1     # provisional config: 1 epoch per attempt
 MAX_ADAPTIVE_CONFIG_DOWNGRADES = 12
 AUG_LADDER = [
     # (mosaic, copy_paste, mixup, multi_scale) — quality-first: rung 0 is the
@@ -200,6 +199,7 @@ BATCH_LADDER_DOWN = [8, 4, 2, 1]
 IMGSZ_LADDER_DOWN = None  # computed from native cap at runtime
 ADAPTIVE_DIRNAME = ".adaptive"
 ADAPTIVE_STATE_FILE = "state.json"
+RESUMABLE_LAST_NAME = "resumable_last.pt"  # hidden unstripped snapshot: <run_dir>/.adaptive/resumable_last.pt
 
 
 # -- Local Timestamps ------------------------------------------------------------
@@ -1196,6 +1196,7 @@ class AttemptTracker:
         self.completed_epoch = None
         self.actual_cfg = None
         self.crash_exc = None
+        self.resumable_ckpt = None
         self._stop_handled = False
 
     def callbacks(self):
@@ -1272,10 +1273,21 @@ class AttemptTracker:
 
     def on_fit_epoch_end(self, trainer):
         epoch = getattr(trainer, "epoch", None)
-        if isinstance(epoch, int):
-            self.completed_epoch = epoch + 1
-        if self.guard.consume_adaptive():
+        # Ultralytics fires this callback a SECOND time from final_eval() after the
+        # epoch loop exits. Once an adaptive stop has fired, freeze the real epoch
+        # count (kills the 11 -> 12 re-fire artifact); clamp so a clean run can never
+        # overshoot the target (kills the 600 -> 601 artifact).
+        if isinstance(epoch, int) and not self.adaptive_triggered:
+            self.completed_epoch = min(epoch + 1, self.target_epochs)
+        # Short-circuit on the re-fire: a re-armed guard flag is never consumed here
+        # (harmless — the next attempt's guard.start() reset clears it).
+        if not self.adaptive_triggered and self.guard.consume_adaptive():
             self.adaptive_triggered = True
+            # Ultralytics saves this epoch's unstripped last.pt BEFORE this callback
+            # fires and only finalizes it (epoch = -1) in final_eval() after the loop
+            # exits. Copying here preserves a resumable snapshot of the clean epoch
+            # boundary so the supervisor can downgrade and continue the same run.
+            save_resumable_snapshot(self.run_dir, trainer, self, self.logger)
             try:
                 trainer.stop = True
             except Exception:
@@ -1286,8 +1298,10 @@ class AttemptTracker:
         # classify
         try:
             final_epoch = getattr(trainer, "epoch", None)
-            if isinstance(final_epoch, int):
-                self.completed_epoch = final_epoch + 1
+            # Same freeze/clamp rule as on_fit_epoch_end: an adaptive-triggered attempt
+            # keeps its real stop epoch; a clean run is clamped to the target.
+            if isinstance(final_epoch, int) and not self.adaptive_triggered:
+                self.completed_epoch = min(final_epoch + 1, self.target_epochs)
         except Exception:
             pass
         if self.emergency_triggered:
@@ -1382,6 +1396,70 @@ def restore_backups(run_dir: Path, logger=None) -> bool:
     return restored
 
 
+def save_resumable_snapshot(run_dir, trainer, tracker, logger) -> Path | None:
+    """Preserve the unstripped Ultralytics checkpoint before final_eval() finalizes it.
+
+    Ultralytics writes the full resumable last.pt inside the epoch loop before
+    on_fit_epoch_end fires; final_eval()/strip_optimizer() then rewrites
+    weights/last.pt with epoch = -1. A copy taken at the clean epoch boundary keeps a
+    hidden snapshot (.adaptive/resumable_last.pt) the supervisor can resume from after
+    a memory-guard adaptive stop. The snapshot is pending-only: state.json must carry
+    resume_pending for it to be used (see pending_resumable_checkpoint).
+    """
+    run_dir = Path(run_dir)
+    # Idempotency (defense-in-depth, independent of the callback gating): final_eval()
+    # re-fires on_fit_epoch_end; a snapshot already taken in this attempt must never
+    # be re-copied from the file after final_eval() strips it.
+    if tracker.resumable_ckpt is not None:
+        return tracker.resumable_ckpt
+    tracker.resumable_ckpt = None
+    src = Path(getattr(trainer, "last", None) or (run_dir / "weights" / "last.pt"))
+    if not src.is_file():
+        if logger is not None:
+            logger.log(f"[Adaptive] resumable snapshot skipped: checkpoint {src} not found.")
+        tracker.state["hidden_checkpoint_invalid"] = True
+        write_adaptive_state(run_dir, tracker.state)
+        return None
+    if ckpt_completed_epoch(src) == -1:
+        # Source was already finalized by a previous final_eval; a stripped checkpoint
+        # cannot resume anything. The destination is NOT touched, so the good hidden
+        # snapshot from the first firing survives; resume_pending stays as-is.
+        if logger is not None:
+            logger.log("[Adaptive] resumable snapshot skipped: source checkpoint already finalized (epoch -1).")
+        return None
+    dst = adaptive_dir(run_dir) / RESUMABLE_LAST_NAME
+    try:
+        adaptive_dir(run_dir).mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_name(dst.name + ".tmp")
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+    except Exception as e:
+        if logger is not None:
+            logger.log(f"[Adaptive] resumable snapshot copy failed: {e}")
+        tracker.state["hidden_checkpoint_invalid"] = True
+        write_adaptive_state(run_dir, tracker.state)
+        return None
+    if ckpt_completed_epoch(dst) == -1:
+        # tmp-integrity backup only: a write that lands finalized cannot resume anything.
+        if logger is not None:
+            logger.log("[Adaptive] resumable snapshot skipped: copied checkpoint is finalized (epoch -1).")
+        try:
+            dst.unlink(missing_ok=True)
+        except OSError:
+            pass
+        tracker.state["hidden_checkpoint_invalid"] = True
+        write_adaptive_state(run_dir, tracker.state)
+        return None
+    tracker.resumable_ckpt = dst
+    tracker.state["resumable_ckpt"] = f"{ADAPTIVE_DIRNAME}/{RESUMABLE_LAST_NAME}"
+    tracker.state["resumable_epoch"] = tracker.completed_epoch
+    tracker.state["resume_pending"] = True
+    write_adaptive_state(run_dir, tracker.state)
+    if logger is not None:
+        logger.log(f"[Adaptive] saved hidden resumable checkpoint from completed_epoch={tracker.completed_epoch} -> {ADAPTIVE_DIRNAME}/{RESUMABLE_LAST_NAME}")
+    return dst
+
+
 def trim_results_csv(run_dir: Path, completed_epoch: int, logger=None) -> None:
     """Keep header + first `completed_epoch` rows; back up original first."""
     csv_path = Path(run_dir) / "results.csv"
@@ -1426,6 +1504,163 @@ def ckpt_completed_epoch(ckpt_path: Path) -> int:
         return 0
     except Exception:
         return 0
+
+
+# -- Resumable checkpoint selection (.adaptive/) ------------------------------------
+TERMINAL_EARLY_STATUSES = ("stopped-adaptive", "partial-emergency", "crashed", "interrupted")
+
+
+def valid_resume_checkpoint(path) -> bool:
+    """A checkpoint is resumable only if it exists and is not finalized (epoch >= 0)."""
+    return bool(path) and Path(path).is_file() and ckpt_completed_epoch(Path(path)) >= 0
+
+
+def pending_resumable_checkpoint(run_dir, state) -> Path | None:
+    """Return the hidden .adaptive/resumable_last.pt only while state marks it pending.
+
+    Hidden snapshots are pending-only: they are valid continuation points only while
+    state.json explicitly carries resume_pending (set by a clean adaptive stop that
+    saved the snapshot) and the snapshot epoch has not regressed below resumable_epoch.
+    Completed/terminal runs clear the pending flag, so old snapshots are never reused.
+    """
+    if not state or not state.get("resume_pending") or state.get("hidden_checkpoint_invalid"):
+        return None
+    raw = state.get("resumable_ckpt")
+    if not raw or Path(str(raw)).name != RESUMABLE_LAST_NAME:
+        return None
+    path = adaptive_dir(run_dir) / RESUMABLE_LAST_NAME
+    if not path.is_file():
+        return None
+    epoch = ckpt_completed_epoch(path)
+    if epoch < 0:
+        return None
+    resumable_epoch = state.get("resumable_epoch")
+    if isinstance(resumable_epoch, int) and resumable_epoch >= 0 and epoch < resumable_epoch:
+        return None
+    # Staleness cross-check: the snapshot must not predate the run's known progress.
+    # The completed < target bound keeps an uncorrected inflated legacy value from
+    # rejecting a legitimate hidden (the supervisor init correction runs first anyway).
+    completed = state.get("completed_epoch")
+    target = state.get("target_epochs")
+    if isinstance(completed, int) and completed >= 0 \
+            and (target is None or completed < target) and epoch < completed:
+        return None
+    return path
+
+
+def adaptive_history_last_entry(state) -> tuple:
+    """(completed_epoch, status) of the newest history entry that recorded an epoch."""
+    for entry in reversed((state or {}).get("history") or []):
+        ce = entry.get("completed_epoch")
+        if isinstance(ce, int) and ce >= 0:
+            return ce, entry.get("status")
+    return None, None
+
+
+def results_csv_row_count(run_dir) -> int | None:
+    """Completed-epoch count from results.csv (header + one row per completed epoch)."""
+    csv_path = Path(run_dir) / "results.csv"
+    if not csv_path.is_file():
+        return None
+    try:
+        lines = csv_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    rows = sum(1 for line in lines if line.strip()) - 1
+    return rows if rows > 0 else None
+
+
+def derive_actual_epoch(run_dir, state, tracker=None, ckpt_epoch=None, target_epochs=None) -> int:
+    """Best-supported completed-epoch count from per-attempt evidence.
+
+    Evidence wins over the legacy top-level state['completed_epoch']: old buggy runs
+    stored target_epochs there even when an adaptive/patience stop finalized the
+    checkpoint early. The terminal-early override fires only against target-level
+    inflation (a legacy "completed_epoch = target" lie): genuine mid-run evidence
+    (e.g. a hidden checkpoint at epoch 14 with a stale history entry at 11) wins,
+    because 14 < target means nothing claims the schedule finished.
+    """
+    evidence = []
+    tracker_epoch = getattr(tracker, "completed_epoch", None) if tracker is not None else None
+    if isinstance(tracker_epoch, int) and tracker_epoch >= 0:
+        evidence.append(tracker_epoch)
+    if isinstance(ckpt_epoch, int) and ckpt_epoch >= 0:
+        evidence.append(ckpt_epoch)
+    hist_epoch, hist_status = adaptive_history_last_entry(state)
+    if hist_epoch is not None:
+        evidence.append(hist_epoch)
+    csv_rows = results_csv_row_count(run_dir)
+    if csv_rows is not None:
+        evidence.append(csv_rows)
+    if evidence:
+        actual = max(evidence)
+    else:
+        legacy = (state or {}).get("completed_epoch")
+        actual = legacy if isinstance(legacy, int) and legacy >= 0 else 0
+    if hist_epoch is not None and hist_status in TERMINAL_EARLY_STATUSES \
+            and actual > hist_epoch and (target_epochs is None or actual >= target_epochs):
+        # The evidence claims the target was reached, but the newest terminal-early
+        # history entry says the run actually stopped there. The history wins.
+        actual = hist_epoch
+    return max(0, int(actual))
+
+
+def choose_resume_checkpoint(run_dir, weights_last, target_epochs=None) -> tuple:
+    """Pick the checkpoint a resume should load. Returns (path_or_None, info).
+
+    Candidate order:
+      1. weights/last.pt when it is not finalized (epoch >= 0)
+      2. .adaptive/resumable_last.pt only while resume_pending is explicitly set
+      3. .adaptive/backup_last.pt only while resume_pending is set (legacy fallback)
+
+    When nothing is resumable, info carries finalized/stopped_after evidence so the
+    caller can report an accurate "stopped after N epochs" message instead of claiming
+    the full schedule already finished.
+    """
+    run_dir = Path(run_dir)
+    if weights_last is not None and valid_resume_checkpoint(weights_last):
+        return Path(weights_last), {"source": "weights/last.pt", "finalized": False,
+                                    "epoch": ckpt_completed_epoch(Path(weights_last))}
+    state = load_adaptive_state(run_dir)
+    hidden = pending_resumable_checkpoint(run_dir, state)
+    if hidden is not None:
+        return hidden, {"source": f"{ADAPTIVE_DIRNAME}/{RESUMABLE_LAST_NAME}", "finalized": False,
+                        "epoch": ckpt_completed_epoch(hidden)}
+    if state.get("resume_pending"):
+        legacy = adaptive_dir(run_dir) / "backup_last.pt"
+        if valid_resume_checkpoint(legacy):
+            return legacy, {"source": f"{ADAPTIVE_DIRNAME}/backup_last.pt", "finalized": False,
+                            "epoch": ckpt_completed_epoch(legacy)}
+    weights_epoch = ckpt_completed_epoch(Path(weights_last)) if (weights_last and Path(weights_last).is_file()) else None
+    finalized = weights_epoch == -1
+    info = {"source": None, "finalized": finalized, "epoch": weights_epoch}
+    if finalized:
+        info["stopped_after"] = derive_actual_epoch(run_dir, state, tracker=None,
+                                                    ckpt_epoch=None, target_epochs=target_epochs)
+    return None, info
+
+
+def report_run_outcome(run_dir, state, status, target, run_name, logger) -> None:
+    """Print the honest post-run outcome block (shared by fresh and resume paths).
+
+    Branch order: a pending hidden snapshot first (the run is resumable from it), then
+    a finalized/invalid weights/last.pt (report the real stop, never target), and only
+    then the plain 'resume again' case.
+    """
+    run_dir = Path(run_dir)
+    print(f"\n  Training {status} after {state.get('completed_epoch', 0)}/{target} epochs. "
+          f"Checkpoint state preserved in {run_dir / 'weights'}.")
+    hidden = pending_resumable_checkpoint(run_dir, state)
+    if state.get("resume_pending") and hidden is not None:
+        print("  The run is resumable: --resume will continue from "
+              f"{ADAPTIVE_DIRNAME}/{RESUMABLE_LAST_NAME} with the last downgraded safe config.")
+    elif state.get("last_checkpoint_finalized") or not valid_resume_checkpoint(run_dir / "weights" / "last.pt"):
+        print("  last.pt is finalized (epoch marker -1) and not resumable;")
+        print(f"  start a new run from {run_dir / 'weights' / 'best.pt'} with lower workers/batch if continuation is desired.")
+    else:
+        print(f"  Resume again with: python train_detector/train_detector.py --resume --name {run_name}")
+    print(f"  Run log: {logger.log_path}")
+    print()
 
 
 def _infer_resume_architecture_model(run_dir, ckpt_cfg=None, task: str = "detect"):
@@ -4444,18 +4679,16 @@ def run_attempt(args, logger, run_dir, last_pt, chosen, target_epochs, device, g
         resume_pt = last_pt if (last_pt and Path(last_pt).is_file()) else (weights_dir / "last.pt")
         if not (resume_pt and Path(resume_pt).is_file()):
             resume_pt = None
-    # Terminal Ultralytics checkpoint (epoch == -1) cannot be resumed.
+    # Terminal Ultralytics checkpoint (epoch == -1) cannot be resumed. Do NOT claim the
+    # target schedule completed here; the supervisor classifies the real stop epoch.
     if resume_pt is not None and ckpt_completed_epoch(resume_pt) == -1:
-        logger.log(f"[Attempt {attempt_no}] checkpoint {resume_pt} is finished by Ultralytics; nothing to resume.")
+        logger.log(f"[Attempt {attempt_no}] checkpoint {resume_pt} is finalized by Ultralytics; nothing to resume.")
         tracker = AttemptTracker(
             logger=logger, guard=guard, run_dir=run_dir, target_epochs=target_epochs,
             intended_cfg=dict(chosen), state=state,
             on_emergency=None, on_adaptive=None, on_complete=None, on_crash=None,
         )
-        tracker.status = "completed-target"
-        tracker.completed_epoch = target_epochs
-        state["completed_epoch"] = target_epochs
-        write_adaptive_state(run_dir, state)
+        tracker.status = "attempt-terminal"
         return tracker
 
     # Build forced_args for the guarded trainer
@@ -4500,24 +4733,11 @@ def run_attempt(args, logger, run_dir, last_pt, chosen, target_epochs, device, g
         on_emergency=None, on_adaptive=None, on_complete=None, on_crash=None,
     )
 
-    # epochs for this attempt
-    if state.get("provisional", True):
-        attempt_epochs = min(target_epochs, ckpt_completed_epoch(resume_pt) + 1) if (resume_pt and ckpt_completed_epoch(resume_pt) >= 0) else 1
-        # ensure at least 1 and not exceeding target
-        attempt_epochs = max(1, min(target_epochs, attempt_epochs if attempt_epochs > 0 else 1))
-        # For fresh first attempt with no checkpoint, 1 epoch provisional
-        if resume_pt is None:
-            attempt_epochs = 1
-    else:
-        # proven: run to target from current epoch
-        ce = ckpt_completed_epoch(resume_pt) if resume_pt else 0
-        if ce == -1:
-            attempt_epochs = target_epochs  # finished? shouldn't happen
-        else:
-            attempt_epochs = target_epochs
-    # never run 0 or negative
-    if attempt_epochs < 1:
-        attempt_epochs = 1
+    # Every attempt targets the full schedule. Mid-run stops (adaptive pressure,
+    # emergency, crash) are handled by the tracker + supervisor downgrade/resume
+    # cycle — not by a per-attempt epoch cap. The old provisional attempt_epochs
+    # logic was dead on resumes anyway: guarded forced_args pins Ultralytics'
+    # args.epochs to target_epochs in check_resume.
 
     # build trainer via partial (task-correct: -seg/-pose weights need SegmentationTrainer/PoseTrainer;
     # the detect trainer on seg/pose models crashes its own val NMS with tuple predictions)
@@ -4553,7 +4773,7 @@ def run_attempt(args, logger, run_dir, last_pt, chosen, target_epochs, device, g
         else:
             train_kwargs["data"] = str(yaml_path) if yaml_path is not None else forced_args.get("data")
             train_kwargs["model"] = str(resolve_pretrained_weights(chosen["model"]))
-            train_kwargs["epochs"] = attempt_epochs
+            train_kwargs["epochs"] = int(target_epochs)
             train_kwargs["imgsz"] = int(chosen["imgsz"])
             train_kwargs["batch"] = int(chosen["batch"])
             train_kwargs["workers"] = int(chosen["workers"])
@@ -4569,17 +4789,9 @@ def run_attempt(args, logger, run_dir, last_pt, chosen, target_epochs, device, g
             train_kwargs.update(chosen_augmentation(chosen))
 
         if resume_pt is not None:
-            # when resuming, epochs must be passed to extend
-            ce = ckpt_completed_epoch(resume_pt)
-            if ce == -1:
-                ce = target_epochs
-            if state.get("provisional", True):
-                attempt_epochs = max(ce + 1 if ce >= 0 else 1, 1)
-                if attempt_epochs > target_epochs:
-                    attempt_epochs = target_epochs
-            else:
-                attempt_epochs = target_epochs
-            train_kwargs["epochs"] = attempt_epochs
+            # Resume extends from the checkpoint epoch to the full target schedule;
+            # guarded forced_args pin args.epochs to the same value after check_resume.
+            train_kwargs["epochs"] = int(target_epochs)
 
         # Inject trainer class via model.train(trainer=...)
         # callbacks attach via model.add_callback; trainer class passed separately below
@@ -4666,9 +4878,23 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
                             device, hw, guard, state, yaml_path, ckpt_cfg, mode):
     run_dir = Path(run_dir)
     state = state or {}
-    state.setdefault("completed_epoch", ckpt_completed_epoch(last_pt) if (last_pt and Path(last_pt).is_file()) else 0)
-    if state["completed_epoch"] == -1:
-        state["completed_epoch"] = target_epochs
+    initial_ckpt_epoch = ckpt_completed_epoch(last_pt) if (last_pt and Path(last_pt).is_file()) else 0
+    state.setdefault("completed_epoch", initial_ckpt_epoch if initial_ckpt_epoch >= 0 else 0)
+    # Evidence is the source of truth at init: legacy runs stored target_epochs in
+    # completed_epoch when an adaptive/patience stop finalized the checkpoint early
+    # (the epoch == -1 bug), and stale foreign state files can carry the same lie.
+    derived = derive_actual_epoch(
+        run_dir, state,
+        ckpt_epoch=initial_ckpt_epoch if initial_ckpt_epoch >= 0 else None,
+        target_epochs=target_epochs,
+    )
+    stored = state.get("completed_epoch")
+    if derived != stored:
+        state["completed_epoch"] = derived
+        if isinstance(stored, int):
+            logger.log(f"[Supervisor] corrected completed_epoch {stored} -> {derived} from run evidence "
+                       "(tracker/history/results.csv).")
+    state.setdefault("target_epochs", target_epochs)
     state.setdefault("provisional", True)
     state.setdefault("stable_epochs", 0)
     state.setdefault("downgrade_count", 0)
@@ -4796,10 +5022,39 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
     step_up_probing_ok = (not getattr(args, "no_memory_probe", False)) and cuda_available_for(device)
 
     current_ckpt = last_pt
+    initial_hidden = pending_resumable_checkpoint(run_dir, state)
+    if initial_hidden is not None and not valid_resume_checkpoint(current_ckpt):
+        current_ckpt = initial_hidden
+        mode = "resume"
+        logger.log("[Supervisor] weights/last.pt is not resumable (finalized); continuing from hidden .adaptive/resumable_last.pt.")
     attempt_no = 0
     max_attempts = 1 + MAX_ADAPTIVE_CONFIG_DOWNGRADES
     current_cfg = dict(chosen)
     final_status = "no-safe-config"
+
+    def finish_completed_run():
+        """Target schedule really reached: finalize state and drop the hidden snapshot."""
+        state["completed_epoch"] = target_epochs
+        state["provisional"] = False
+        state["resume_pending"] = False
+        state.pop("last_checkpoint_finalized", None)
+        hidden_path = adaptive_dir(run_dir) / RESUMABLE_LAST_NAME
+        try:
+            hidden_path.unlink(missing_ok=True)
+        except OSError as e:
+            # Windows busy-file safety: keep the file but make resume ignore it.
+            state["hidden_checkpoint_invalid"] = True
+            logger.log(f"[Adaptive] hidden snapshot cleanup failed ({e}); marked invalid, resume will ignore it.")
+
+    def finish_terminal_run(ckpt_epoch, actual_epoch, status_name):
+        """Terminal stop below target: record the real epoch, never target_epochs."""
+        state["completed_epoch"] = max(0, int(actual_epoch))
+        if ckpt_epoch == -1:
+            state["last_checkpoint_finalized"] = True
+        state["resume_pending"] = False
+        logger.log(f"[Supervisor] {status_name} after {max(0, int(actual_epoch))}/{target_epochs} epochs "
+                   f"(target schedule not reached).")
+
     while attempt_no < max_attempts:
         attempt_no += 1
         # ensure safe config before attempt (probe validate)
@@ -4814,51 +5069,85 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
                 logger.log(f"[Adaptive] pre-attempt downgrade ({reason}): {current_cfg}")
                 steps += 1
             if not probe_config_safe(current_cfg) and not getattr(args, "force_unsafe", False):
+                hidden_pre = pending_resumable_checkpoint(run_dir, state)
+                if hidden_pre is not None:
+                    # A valid hidden snapshot is a real continuation point: do NOT
+                    # terminalize the run; manual --resume will use the hidden ckpt
+                    # with the last downgraded safe config.
+                    he = ckpt_completed_epoch(hidden_pre)
+                    state["completed_epoch"] = max(0, derive_actual_epoch(
+                        run_dir, state,
+                        ckpt_epoch=he if isinstance(he, int) and he >= 0 else None,
+                        target_epochs=target_epochs))
+                    final_status = "no-safe-config"
+                    write_adaptive_state(run_dir, state)
+                    logger.log("[Supervisor] no safe config for current hardware; run stays resumable "
+                               f"from {ADAPTIVE_DIRNAME}/{RESUMABLE_LAST_NAME}.")
+                    break
                 logger.log("[Adaptive] no safe config found after downgrades.")
+                weights_last = run_dir / "weights" / "last.pt"
+                wl_epoch = ckpt_completed_epoch(weights_last) if weights_last.is_file() else None
+                actual_pre = derive_actual_epoch(
+                    run_dir, state,
+                    ckpt_epoch=wl_epoch if isinstance(wl_epoch, int) and wl_epoch >= 0 else None,
+                    target_epochs=target_epochs)
+                finish_terminal_run(wl_epoch, actual_pre, "no-safe-config")
                 final_status = "no-safe-config"
+                write_adaptive_state(run_dir, state)
                 break
 
         # provisional handling
         state["provisional"] = state.get("stable_epochs", 0) < 1
         tracker = run_attempt(args, logger, run_dir, current_ckpt, current_cfg, target_epochs,
                               device, guard, yaml_path, ckpt_cfg, mode, attempt_no, state)
-        current_ckpt = run_dir / "weights" / "last.pt"
         st = tracker.status
-        terminal_ckpt_epoch = ckpt_completed_epoch(current_ckpt) if current_ckpt.exists() else 0
-        if terminal_ckpt_epoch == -1:
-            logger.log(f"[Supervisor] checkpoint marked finished by Ultralytics after attempt {attempt_no} (status={st}); stopping.")
-            state["completed_epoch"] = target_epochs
-            final_status = "early-stopped"
-            write_adaptive_state(run_dir, state)
-            break
         logger.log(f"[Supervisor] attempt {attempt_no} status={st}")
 
-        if st == "completed-target":
+        # Resolve the checkpoint the NEXT attempt resumes from. A clean adaptive stop
+        # keeps a hidden unstripped snapshot; the public weights/last.pt was finalized
+        # (epoch = -1) by final_eval(), so it must not be the continuation point.
+        hidden_ckpt = pending_resumable_checkpoint(run_dir, state)
+        if st == "stopped-adaptive" and hidden_ckpt is not None:
+            current_ckpt = hidden_ckpt
+        else:
+            current_ckpt = run_dir / "weights" / "last.pt"
+        ckpt_epoch = ckpt_completed_epoch(current_ckpt) if current_ckpt.is_file() else None
+        # actual_epoch is derived from tracker/history/results.csv evidence;
+        # epoch == -1 NEVER maps to "completed the target schedule".
+        actual_epoch = derive_actual_epoch(run_dir, state, tracker=tracker, ckpt_epoch=ckpt_epoch,
+                                           target_epochs=target_epochs)
+
+        if st == "completed-target" or (actual_epoch >= target_epochs
+                                        and st not in ("partial-emergency", "crashed", "interrupted", "attempt-terminal")):
             final_status = "completed-target"
-            # mark proven
-            state["provisional"] = False
             state["stable_epochs"] = state.get("stable_epochs", 0) + 1
+            finish_completed_run()
+            write_adaptive_state(run_dir, state)
+            logger.log(f"[Supervisor] target schedule reached ({actual_epoch}/{target_epochs} epochs) after attempt {attempt_no}.")
+            break
+
+        if st == "completed-attempt" and ckpt_epoch == -1:
+            # Patience/early stop: Ultralytics finalized last.pt; this is NOT target completion.
+            final_status = "early-stopped"
+            finish_terminal_run(ckpt_epoch, actual_epoch, "early-stopped")
             write_adaptive_state(run_dir, state)
             break
+
         if st in ("completed-attempt",):
-            # provisional attempt completed 1 epoch successfully
-            ce = state.get("completed_epoch", 0)
+            # attempt completed cleanly with a still-resumable checkpoint
+            state["completed_epoch"] = max(0, actual_epoch)
             if state.get("provisional", True):
                 # mark proven if no adaptive/emergency/oom
                 if not tracker.adaptive_triggered and not tracker.emergency_triggered and not tracker.oom_auto_reduced:
                     state["provisional"] = False
                     state["stable_epochs"] = 1
-                    logger.log("[Adaptive] config proven after 1 stable epoch; lifting 1-epoch cap.")
+                    logger.log("[Adaptive] config proven after a clean attempt; step-up eligibility enabled.")
                 else:
                     state["provisional"] = True
                     if tracker.oom_auto_reduced:
                         probe_cache.clear()  # attempt halved batch mid-run; measurements stale
             state["stable_epochs"] = state.get("stable_epochs", 0) + (1 if not tracker.adaptive_triggered and not tracker.emergency_triggered else 0)
             write_adaptive_state(run_dir, state)
-            # if target reached?
-            if state.get("completed_epoch", 0) >= target_epochs:
-                final_status = "completed-target"
-                break
             # step-up check
             if (state.get("stable_epochs", 0) >= STABLE_EPOCHS_BEFORE_STEP_UP
                     and guard.peak_reserved() < (hw.get("vram_gb", 0) * STABLE_STEP_UP_GPU_FRACTION)
@@ -4891,24 +5180,53 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
                             stepped = True
                     if not stepped:
                         logger.log("[Adaptive] step-up not approved (unsafe or not eligible).")
-            # continue loop (next attempt runs more)
+            # continue loop (next attempt resumes and runs on)
             mode = "resume"
             continue
 
         if st == "stopped-adaptive":
-            # clean epoch boundary; downgrade config then continue
-            logger.log("[Adaptive] adaptive pressure; downgrading config.")
-            probe_cache.clear()  # runtime pressure invalidates earlier measured verdicts
-            res = downgrade_config(current_cfg)
-            if res[0] is None:
-                final_status = "stopped-adaptive"
-                break
-            current_cfg, reason = res
-            state["downgrade_count"] = state.get("downgrade_count", 0) + 1
-            state["provisional"] = True
+            if hidden_ckpt is not None:
+                # Clean epoch-boundary stop with a pending hidden snapshot: downgrade,
+                # then resume the SAME run from the hidden checkpoint.
+                logger.log("[Adaptive] adaptive pressure; downgrading config and resuming from hidden .adaptive/resumable_last.pt.")
+                probe_cache.clear()  # runtime pressure invalidates earlier measured verdicts
+                res = downgrade_config(current_cfg)
+                if res[0] is None:
+                    # No safe downgrade remains. Manual --resume must not silently retry
+                    # the config that already caused memory pressure.
+                    final_status = "stopped-adaptive"
+                    finish_terminal_run(ckpt_epoch, actual_epoch, "stopped-adaptive")
+                    write_adaptive_state(run_dir, state)
+                    logger.log("[Supervisor] no safe downgrade remains; the run is finished.")
+                    break
+                current_cfg, reason = res
+                state["downgrade_count"] = state.get("downgrade_count", 0) + 1
+                state["provisional"] = True
+                # resume_pending stays True: the hidden checkpoint is the continuation
+                # point for the next (downgraded) attempt.
+                write_adaptive_state(run_dir, state)
+                mode = "resume"
+                continue
+            # No hidden snapshot (legacy run or failed snapshot save): classify the
+            # evidence honestly, never as a fake completed-target.
+            final_status = "stopped-adaptive"
+            finish_terminal_run(ckpt_epoch, actual_epoch, "stopped-adaptive")
             write_adaptive_state(run_dir, state)
-            mode = "resume"
-            continue
+            logger.log("[Supervisor] no hidden resumable checkpoint; cannot continue automatically.")
+            break
+
+        if st == "attempt-terminal":
+            # run_attempt was handed a finalized checkpoint; try a pending hidden one more time.
+            if hidden_ckpt is not None:
+                current_ckpt = hidden_ckpt
+                mode = "resume"
+                logger.log("[Supervisor] finalized last.pt; continuing from hidden .adaptive/resumable_last.pt instead.")
+                continue
+            _, hist_status = adaptive_history_last_entry(state)
+            final_status = hist_status if hist_status in TERMINAL_EARLY_STATUSES else "early-stopped"
+            finish_terminal_run(ckpt_epoch, actual_epoch, final_status)
+            write_adaptive_state(run_dir, state)
+            break
 
         if st == "partial-emergency":
             # restore already done in run_attempt; downgrade config
@@ -4917,6 +5235,8 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
             res = downgrade_config(current_cfg)
             if res[0] is None:
                 final_status = "partial-emergency"
+                finish_terminal_run(ckpt_epoch, actual_epoch, "partial-emergency")
+                write_adaptive_state(run_dir, state)
                 break
             current_cfg, reason = res
             state["downgrade_count"] = state.get("downgrade_count", 0) + 1
@@ -4932,6 +5252,8 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
             res = downgrade_config(current_cfg)
             if res[0] is None:
                 final_status = "crashed"
+                finish_terminal_run(ckpt_epoch, actual_epoch, "crashed")
+                write_adaptive_state(run_dir, state)
                 break
             current_cfg, reason = res
             state["downgrade_count"] = state.get("downgrade_count", 0) + 1
@@ -4942,14 +5264,37 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
 
         if st in ("interrupted",):
             final_status = "interrupted"
+            finish_terminal_run(ckpt_epoch, actual_epoch, "interrupted")
+            write_adaptive_state(run_dir, state)
             break
 
         # unknown
         final_status = st
         break
+    else:
+        # Attempt budget exhausted without any terminal status. With a pending hidden
+        # snapshot the run is still resumable: keep resume_pending, record the real
+        # epoch, and tell the user --resume will continue from the hidden checkpoint.
+        # (finish_terminal_run is deliberately NOT called — it clears the pending flag.)
+        hidden_fin = pending_resumable_checkpoint(run_dir, state)
+        if state.get("resume_pending") and hidden_fin is not None:
+            weights_last = run_dir / "weights" / "last.pt"
+            wl_epoch = ckpt_completed_epoch(weights_last) if weights_last.is_file() else None
+            state["completed_epoch"] = max(0, derive_actual_epoch(
+                run_dir, state,
+                ckpt_epoch=wl_epoch if isinstance(wl_epoch, int) and wl_epoch >= 0 else None,
+                target_epochs=target_epochs))
+            final_status = "stopped-adaptive"
+            write_adaptive_state(run_dir, state)
+            logger.log("[Supervisor] attempt budget exhausted; --resume will continue from "
+                       f"{ADAPTIVE_DIRNAME}/{RESUMABLE_LAST_NAME}.")
 
     if final_status == "no-safe-config":
-        logger.log("[Adaptive] no safe config available; aborting.")
+        if state.get("resume_pending"):
+            logger.log("[Adaptive] no safe config available for a fresh attempt; the pending hidden "
+                       f"snapshot stays available — {ADAPTIVE_DIRNAME}/{RESUMABLE_LAST_NAME} remains resumable.")
+        else:
+            logger.log("[Adaptive] no safe config available; aborting.")
     state["final_status"] = final_status
     write_adaptive_state(run_dir, state)
     return final_status
@@ -5006,20 +5351,52 @@ def resume_training(args):
         ckpt_meta = log_resume_checkpoint_info(logger, last_pt)
 
         ckpt_epoch = ckpt_meta.get("epoch") if isinstance(ckpt_meta, dict) else None
-        if isinstance(ckpt_epoch, (int, float)) and ckpt_epoch < 0:
-            train_args = ckpt_meta.get("train_args") if isinstance(ckpt_meta, dict) else None
-            total = train_args.get("epochs") if isinstance(train_args, dict) else None
-            total_txt = f"its full {total}-epoch schedule" if total else "its full training schedule"
-            msg = (f"[Resume] Run '{run_name}' already finished {total_txt}; "
-                   "last.pt is the final checkpoint (epoch marker -1), so there is nothing to resume.")
-            logger.log(msg)
-            log_results_csv(logger, run_dir)
-            best_pt = last_pt.parent / "best.pt"
-            resume_log_path = str(logger.log_path)
-            logger.close()
-            print(f"\n[Resume] {msg}")
-            print(f"  Run log: {resume_log_path}")
-            return best_pt, run_name, "already-finished"
+        state = load_adaptive_state(run_dir)
+        target_hint = int(args.epochs) if args.epochs else 600
+        if isinstance(run_args, dict) and run_args.get("epochs"):
+            try:
+                target_hint = int(run_args["epochs"])
+            except (TypeError, ValueError):
+                pass
+
+        if not (isinstance(ckpt_epoch, (int, float)) and ckpt_epoch >= 0):
+            # weights/last.pt is finalized (epoch -1) or unreadable: look for a pending
+            # hidden snapshot before declaring anything finished.
+            alt_ckpt, resume_info = choose_resume_checkpoint(run_dir, last_pt, target_epochs=target_hint)
+            if alt_ckpt is not None:
+                logger.log(f"[Resume] weights/last.pt is finalized (epoch marker -1); using hidden adaptive snapshot "
+                           f"{alt_ckpt} (epoch {resume_info.get('epoch')}) for the pending adaptive continuation.")
+                last_pt = alt_ckpt
+                ckpt_meta = log_resume_checkpoint_info(logger, last_pt)
+                ckpt_epoch = ckpt_meta.get("epoch") if isinstance(ckpt_meta, dict) else None
+            else:
+                train_args = ckpt_meta.get("train_args") if isinstance(ckpt_meta, dict) else None
+                total = train_args.get("epochs") if isinstance(train_args, dict) else None
+                total = int(total) if isinstance(total, (int, float)) and total else target_hint
+                actual = derive_actual_epoch(run_dir, state, tracker=None,
+                                             ckpt_epoch=ckpt_epoch if isinstance(ckpt_epoch, int) else None,
+                                             target_epochs=total)
+                best_pt = run_dir / "weights" / "best.pt"
+                # Claim "finished the full schedule" only when the evidence says so.
+                completed = actual >= total or state.get("final_status") == "completed-target"
+                if completed:
+                    total_txt = f"its full {total}-epoch schedule"
+                    msg = (f"[Resume] Run '{run_name}' already finished {total_txt}; "
+                           "last.pt is the final checkpoint (epoch marker -1), so there is nothing to resume.")
+                    resume_state = "already-finished"
+                else:
+                    msg = (f"[Resume] Run '{run_name}' was stopped after {actual} epochs (target {total}). "
+                           "last.pt is finalized (epoch marker -1) and not resumable; no pending hidden adaptive "
+                           "checkpoint exists for this run. "
+                           f"Start a new run from {best_pt} with lower workers/batch if continuation is desired.")
+                    resume_state = "finalized-not-resumable"
+                logger.log(msg)
+                log_results_csv(logger, run_dir)
+                resume_log_path = str(logger.log_path)
+                logger.close()
+                print(f"\n[Resume] {msg}")
+                print(f"  Run log: {resume_log_path}")
+                return best_pt, run_name, resume_state
 
         if getattr(args, "dry_run", False):
             logger.log("[Resume Dry Run] inspecting checkpoint and calibration plan; no training.")
@@ -5031,11 +5408,10 @@ def resume_training(args):
                     for k in ("model", "imgsz", "batch", "workers", "multi_scale", "mosaic", "mixup", "copy_paste", "epochs"):
                         print(f"  ckpt {k}: {ta.get(k)}")
             logger.log("[Resume Dry Run] done.")
-            best_pt = last_pt.parent / "best.pt"
+            best_pt = run_dir / "weights" / "best.pt"
             logger.close()
             return best_pt, run_name, "dry-run"
 
-        state = load_adaptive_state(run_dir)
         if state.get("last_attempt_partial"):
             logger.log("[Adaptive] prior attempt partial detected; restoring backups.")
             restore_backups(run_dir, logger)
@@ -5118,7 +5494,7 @@ def resume_training(args):
         state["target_epochs"] = target_epochs
         write_adaptive_state(run_dir, state)
 
-        best_pt = last_pt.parent / "best.pt"
+        best_pt = run_dir / "weights" / "best.pt"
 
         status = run_adaptive_supervisor(
             args=args, logger=logger, run_dir=run_dir, run_name=run_name,
@@ -5139,9 +5515,7 @@ def resume_training(args):
             print(f"  last.pt  : {last_pt}")
             print(f"{'='*60}\n")
         else:
-            print(f"\n  Training {status}. Checkpoint state preserved in {run_dir / 'weights'}.")
-            print(f"  Resume again with: python train_detector/train_detector.py --resume --name {run_name}")
-            print(f"  Run log: {logger.log_path}\n")
+            report_run_outcome(run_dir, state, status, target_epochs, run_name, logger)
 
         return best_pt, run_name, status
     except KeyboardInterrupt:
@@ -5294,10 +5668,7 @@ def train(args):
             print()
         else:
             logger.log(f"[Run] Training {status}; partial checkpoint state kept in {run_dir / 'weights'}.")
-            print(f"\n  Training {status}. Your progress so far is saved under {run_dir / 'weights'}.")
-            print(f"  Resume with:  python train_detector/train_detector.py --resume --name {run_name}")
-            print(f"  Run log     : {logger.log_path}")
-            print()
+            report_run_outcome(run_dir, state, status, args.epochs, run_name, logger)
 
         return {"mode": "fresh", "best": best_pt, "run_name": run_name, "status": status, "yaml_path": str(yaml_path)}
     except KeyboardInterrupt:
