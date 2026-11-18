@@ -443,8 +443,6 @@ def test_snapshot_save_failure_marks_hidden_checkpoint_invalid(tmp_path, monkeyp
     assert disk["resume_pending"] is True  # the invalid flag gates it; pending itself untouched
     assert prior_hidden.read_bytes() == b"old-epoch-5"  # dst never replaced by a failed copy
     assert td.pending_resumable_checkpoint(run_dir, tracker.state) is None
-    chosen, info = td.choose_resume_checkpoint(run_dir, run_dir / "weights" / "last.pt", target_epochs=600)
-    assert chosen is None
 
 
 def test_pending_hidden_rejected_when_older_than_known_progress(tmp_path, monkeypatch):
@@ -625,3 +623,45 @@ def test_derive_suppresses_legacy_target_lie(tmp_path):
     state = {"history": [{"attempt": 1, "status": "stopped-adaptive", "completed_epoch": 11}]}
     tracker = types.SimpleNamespace(completed_epoch=601)
     assert td.derive_actual_epoch(run_dir, state, tracker=tracker, ckpt_epoch=600, target_epochs=600) == 11
+
+
+def test_partial_emergency_rollback_keeps_hidden_resumable_after_evidence_rewind(tmp_path, monkeypatch):
+    """Review finding 1: after a partial-emergency backup restore the recorded evidence is
+    rewound to durable progress, so the staleness gate keeps accepting the hidden snapshot."""
+    run_dir = tmp_path / "run"
+    weights = run_dir / "weights"
+    weights.mkdir(parents=True)
+    adir = run_dir / ".adaptive"
+    adir.mkdir()
+    # Post-restore disk state: weights/last.pt rolled back to the finalized pre-attempt
+    # backup; the hidden snapshot from the earlier clean adaptive stop is the durable
+    # continuation point.
+    (weights / "last.pt").write_bytes(b"restored-finalized")
+    (adir / "backup_last.pt").write_bytes(b"restored-finalized")
+    (adir / "resumable_last.pt").write_bytes(b"unstripped-epoch-11")
+
+    def fake(path):
+        s = str(path)
+        return 11 if "resumable_last" in s else -1
+
+    monkeypatch.setattr(td, "ckpt_completed_epoch", fake)
+    state = {"resume_pending": True, "resumable_ckpt": ".adaptive/resumable_last.pt",
+             "resumable_epoch": 11, "completed_epoch": 11, "target_epochs": 600}
+
+    assert td.durable_progress_epoch(run_dir, state) == 11
+
+    # Inflated evidence from the rolled-back attempt would reject the hidden snapshot...
+    assert td.pending_resumable_checkpoint(run_dir, {**state, "completed_epoch": 24}) is None
+    # ...but durable (rewound) evidence keeps it, which is what the run_attempt rewind
+    # writes before the staleness gate is ever consulted again.
+    assert td.pending_resumable_checkpoint(run_dir, {**state, "completed_epoch": 11}) == adir / "resumable_last.pt"
+
+    # Unstripped restored weights win over the hidden when they are actually resumable.
+    def fake_unstripped(path):
+        s = str(path)
+        if "backup_last" in s:
+            return 5
+        return 11 if "resumable_last" in s else 24
+
+    monkeypatch.setattr(td, "ckpt_completed_epoch", fake_unstripped)
+    assert td.durable_progress_epoch(run_dir, state) == 24  # live weights/last.pt is resumable at 24

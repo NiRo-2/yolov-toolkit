@@ -1396,6 +1396,31 @@ def restore_backups(run_dir: Path, logger=None) -> bool:
     return restored
 
 
+def durable_progress_epoch(run_dir, state) -> int | None:
+    """What --resume can actually continue from, based on the on-disk checkpoints.
+
+    Prefers weights/last.pt when it is not finalized (epoch >= 0), then a valid pending
+    hidden snapshot, then the recorded resumable_epoch. Returns None when the disk gives
+    no evidence. Used to rewind evidence after a partial-emergency backup restore: the
+    attempt's in-memory epoch count can describe epochs that the restore just rolled
+    back, and recording it would let the pending-hidden staleness gate reject a hidden
+    that actually matches the durable checkpoint.
+    """
+    run_dir = Path(run_dir)
+    cur = run_dir / "weights" / "last.pt"
+    if cur.is_file():
+        epoch = ckpt_completed_epoch(cur)
+        if epoch >= 0:
+            return epoch
+    hidden = pending_resumable_checkpoint(run_dir, state)
+    if hidden is not None:
+        return ckpt_completed_epoch(hidden)
+    re_epoch = state.get("resumable_epoch")
+    if isinstance(re_epoch, int) and re_epoch >= 0:
+        return re_epoch
+    return None
+
+
 def save_resumable_snapshot(run_dir, trainer, tracker, logger) -> Path | None:
     """Preserve the unstripped Ultralytics checkpoint before final_eval() finalizes it.
 
@@ -4862,12 +4887,22 @@ def run_attempt(args, logger, run_dir, last_pt, chosen, target_epochs, device, g
     if tracker.status == "partial-emergency":
         logger.log("[Adaptive] partial epoch detected; restoring backups to pre-attempt state.")
         restore_backups(run_dir, logger)
-        if isinstance(ce, int) and ce >= 0 and ce < (state.get("completed_epoch") or 0) + 1:
-            # trim to previous completed (ce-1? actually ce is completed before attempt)
-            pass
-        # trim csv to pre-attempt completed epoch (state before)
-        prev_ce = state.get("completed_epoch_before", ce if isinstance(ce,int) else 0)
-        # simpler: trim to max(0, ce) if ce known
+        # The backup restore rolled this attempt's epochs back on disk. Rewind the
+        # recorded evidence to what the disk actually represents, otherwise the
+        # pending-hidden staleness gate (pending_resumable_checkpoint) sees an inflated
+        # completed_epoch and rejects the hidden snapshot that matches the durable
+        # checkpoint, terminalizing an otherwise resumable run.
+        durable = durable_progress_epoch(run_dir, state)
+        if durable is not None and isinstance(ce, int) and ce >= 0 and ce > durable:
+            logger.log(f"[Adaptive] rewinding partial-emergency evidence {ce} -> {durable} "
+                       "(backup restore rolled the attempt's epochs back).")
+            ce = durable
+            state["completed_epoch"] = ce
+            hist = state.get("history") or []
+            if hist and isinstance(hist[-1], dict) and hist[-1].get("attempt") == attempt_no:
+                hist[-1]["completed_epoch"] = ce
+            write_adaptive_state(run_dir, state)
+        # trim csv to the durable completed epoch
         if isinstance(ce, int) and ce >= 0:
             trim_results_csv(run_dir, ce, logger)
 
@@ -5373,9 +5408,13 @@ def resume_training(args):
                 train_args = ckpt_meta.get("train_args") if isinstance(ckpt_meta, dict) else None
                 total = train_args.get("epochs") if isinstance(train_args, dict) else None
                 total = int(total) if isinstance(total, (int, float)) and total else target_hint
-                actual = derive_actual_epoch(run_dir, state, tracker=None,
-                                             ckpt_epoch=ckpt_epoch if isinstance(ckpt_epoch, int) else None,
-                                             target_epochs=total)
+                # choose_resume_checkpoint already derived the honest stopped-after count;
+                # consume it instead of re-deriving (a second call site would drift).
+                actual = resume_info.get("stopped_after")
+                if not isinstance(actual, int):
+                    actual = derive_actual_epoch(run_dir, state, tracker=None,
+                                                 ckpt_epoch=ckpt_epoch if isinstance(ckpt_epoch, int) else None,
+                                                 target_epochs=total)
                 best_pt = run_dir / "weights" / "best.pt"
                 # Claim "finished the full schedule" only when the evidence says so.
                 completed = actual >= total or state.get("final_status") == "completed-target"
