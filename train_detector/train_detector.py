@@ -5,15 +5,15 @@ Every fresh or resumed training invocation writes a per-run text log under <run_
 Memory/model/batch selection is dynamically calibrated with real-dataset probe runs for the
 selected hardware, device, dataset and augmentation config; static estimates are fallback only.
 
-AUTO SELECTION POLICY: quality-first. Fresh runs attempt the largest task model
-(yolo26x / -seg / -pose) first for every dataset size and the heaviest augmentation
-combo (mosaic 1.0, copy_paste 0.3, mixup 0.15, multi_scale 0.5) first, then step down
-the model/imgsz/batch/augmentation ladders only when a dynamic probe or the runtime
-guard says a config is memory-unsafe; a stable run steps back up the ladder. Nothing
-trains unverified unless --force-unsafe or --no-memory-probe is passed explicitly.
-Runs are slower by design; safety guarantees are unchanged (memory-profile safe by
-default). The selection cache (weights/memory_profiles.json) is schema version 3 keyed
- by intent "quality-v1": the first run after this policy change recalibrates fully.
+AUTO SELECTION POLICY: quality-v2. Fresh runs pick the largest task model that fits
+at a healthy batch size (batch >= 16), with task-appropriate augmentation, at an
+imgsz that resolves the objects. Heaviest-safe augmentation is preferred only after
+the healthy-batch floor is met; lighten multi_scale/mosaic before dropping below
+the floor. degrees/flipud default to 0 (opt-in). Nothing trains unverified unless
+--force-unsafe or --no-memory-probe is passed explicitly. Safety guarantees are
+unchanged (memory-profile safe by default). The selection cache
+(weights/memory_profiles.json) is schema version 4 keyed by intent "quality-v2":
+the first run after this policy change recalibrates fully.
 
 Usage:
     # Fresh training run (auto-configures everything, runs dynamic memory calibration)
@@ -70,7 +70,7 @@ Usage:
 
 Output:
     train_detector/weights/<model>.pt                 <- Ultralytics pretrained backbones (cached)
-    train_detector/weights/memory_profiles.json       <- measured dynamic memory cache (schema v3, quality-v1 intent)
+    train_detector/weights/memory_profiles.json       <- measured dynamic memory cache (schema v4, quality-v2 intent)
     train_detector/weights/vram_estimates.json        <- legacy fallback estimates only
     train_detector/runs/detect/<name>/Logs/run-<localtime><offset>.log     <- fresh run log
     train_detector/runs/detect/<name>/Logs/resume-<localtime><offset>.log  <- resume run log
@@ -79,6 +79,11 @@ Output:
     train_detector/runs/detect/<name>/results.png
     train_detector/runs/detect/<name>/confusion_matrix.png
 """
+
+# Expandable CUDA segments reduce fragmentation when available. Set before torch
+# import; unsupported builds/OS variants ignore the value (logged at startup).
+import os as _os_for_cuda_alloc
+_os_for_cuda_alloc.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
 import functools
@@ -148,12 +153,27 @@ ANSI_RE = re.compile(
 # Memory safety profiles (safe/balanced/aggressive) and the batch ladder live in
 # common/hardware.py and are re-exported above so existing imports keep working.
 
-PREFERRED_AUTO_BATCH = 8   # auto batch target; nbs=64 gradient accumulation keeps effective batch at 64
-MIN_AUTO_BATCH = 4         # auto batch floor; batch 2 is only usable with an explicit --force-unsafe run
+MIN_HEALTHY_BATCH = 16      # prefer batch >= 16 for stable BatchNorm; nbs=64 still accumulates
+MIN_AUTO_BATCH = 4          # absolute auto floor; batch 2 only with explicit --force-unsafe
+HEALTHY_BATCH_CANDIDATES = [32, 16]
+DEGRADED_BATCH_CANDIDATES = [8, 4]
 STANDARD_IMGSZ = [320, 416, 512, 640, 768, 1024, 1280, 1536]
 
 # Task-aware model chains (plan: detect / -seg / -pose per size).
 MODEL_TASK_SUFFIXES = {"detect": "", "segment": "-seg", "pose": "-pose"}
+
+MEMORY_CACHE_SCHEMA_VERSION = 4
+SELECTION_INTENT = "quality-v2"
+MEMORY_CACHE_PATH = WEIGHTS_DIR / "memory_profiles.json"
+
+PILOT_DIRNAME = ".pilot"
+PILOT_EPOCHS = 5
+PILOT_TRAIN_IMAGES = 2000
+PILOT_VAL_IMAGES = 200
+LABEL_STATS_SAMPLE_LIMIT = 2000
+MIN_RESOLVED_OBJECT_PX = 16.0
+MIN_RESOLVED_OBJECT_P25_PX = 8.0
+GPU_UTIL_DATALOADER_BOUND = 85.0
 
 
 def model_order_for_task(task: str) -> list:
@@ -161,11 +181,9 @@ def model_order_for_task(task: str) -> list:
     suffix = MODEL_TASK_SUFFIXES.get(task, "")
     return [f"yolo26{size}{suffix}.pt" for size in ("n", "m", "l", "x")]
 
-MEMORY_CACHE_PATH = WEIGHTS_DIR / "memory_profiles.json"
-
 
 # -- Adaptive safe-resume / crash-prevention constants ----------------------------
-# Quality-first: never exceed these fractions of total memory during a run.
+# Quality-v2: never exceed these fractions of total memory during a run.
 ADAPTIVE_GPU_FRACTION = 0.75       # adaptive ceiling fraction of VRAM
 EMERGENCY_GPU_FRACTION = 0.82      # emergency (mid-epoch abort) fraction of VRAM
 ADAPTIVE_CPU_RSS_FRACTION = 0.50   # adaptive ceiling fraction of RAM (RSS)
@@ -183,23 +201,58 @@ GUARD_POLL_EVERY_BATCHES = 16
 STABLE_EPOCHS_BEFORE_STEP_UP = 3
 STABLE_STEP_UP_GPU_FRACTION = 0.55
 MAX_ADAPTIVE_CONFIG_DOWNGRADES = 12
-AUG_LADDER = [
-    # (mosaic, copy_paste, mixup, multi_scale) — quality-first: rung 0 is the
-    # heaviest combo; each rung is strictly lighter, probe-failure fallback only.
-    (1.0, 0.3, 0.15, 0.5),
-    (1.0, 0.3, 0.15, 0.0),
-    (1.0, 0.3, 0.0,  0.0),
-    (1.0, 0.0, 0.0,  0.0),
-    (0.5, 0.3, 0.15, 0.0),
-    (0.5, 0.3, 0.0,  0.0),
-    (0.5, 0.0, 0.0,  0.0),
-    (0.0, 0.0, 0.0,  0.0),
+
+# Task-aware augmentation ladders: (mosaic, copy_paste, mixup, multi_scale).
+# Heaviest rung first. Detect/pose keep copy_paste=0 (CopyPaste is a no-op without
+# polygons). Segment keeps copy_paste. Main levers: multi_scale, then mosaic.
+AUG_LADDER_DETECT = [
+    (1.0, 0.0, 0.0, 0.5),
+    (1.0, 0.0, 0.0, 0.0),
+    (0.5, 0.0, 0.0, 0.0),
+    (0.0, 0.0, 0.0, 0.0),
 ]
-BATCH_LADDER_DOWN = [8, 4, 2, 1]
+AUG_LADDER_SEGMENT = [
+    (1.0, 0.3, 0.15, 0.5),
+    (1.0, 0.3, 0.0, 0.0),
+    (1.0, 0.0, 0.0, 0.0),
+    (0.5, 0.0, 0.0, 0.0),
+    (0.0, 0.0, 0.0, 0.0),
+]
+# Backward-compatible alias (detect / pose default).
+AUG_LADDER = AUG_LADDER_DETECT
+
+BATCH_LADDER_DOWN = [32, 16, 8, 4, 2, 1]
+BATCH_LADDER_UP = [1, 2, 4, 8, 16, 32]
 IMGSZ_LADDER_DOWN = None  # computed from native cap at runtime
 ADAPTIVE_DIRNAME = ".adaptive"
 ADAPTIVE_STATE_FILE = "state.json"
 RESUMABLE_LAST_NAME = "resumable_last.pt"  # hidden unstripped snapshot: <run_dir>/.adaptive/resumable_last.pt
+
+
+def aug_ladder_for_task(task: str):
+    """Heaviest-to-lightest augmentation ladder for the annotation task."""
+    if task == "segment":
+        return AUG_LADDER_SEGMENT
+    return AUG_LADDER_DETECT
+
+
+def default_mixup_for_task(task: str) -> float:
+    """CLI default when --mixup is omitted: segment keeps a small top-ladder value."""
+    return 0.15 if task == "segment" else 0.0
+
+
+def resolve_geometry_aug(args) -> tuple:
+    """degrees/flipud from CLI (defaults 0 / 0 — opt-in geometry)."""
+    degrees = float(getattr(args, "degrees", 0.0) if getattr(args, "degrees", None) is not None else 0.0)
+    flipud = float(getattr(args, "flipud", 0.0) if getattr(args, "flipud", None) is not None else 0.0)
+    return degrees, flipud
+
+
+def resolve_mixup(args, task: str, ladder_mixup: float) -> float:
+    """Explicit --mixup wins; otherwise use the ladder rung's mixup (task-aware)."""
+    if getattr(args, "mixup", None) is not None:
+        return float(args.mixup)
+    return float(ladder_mixup)
 
 
 # -- Local Timestamps ------------------------------------------------------------
@@ -987,6 +1040,179 @@ def hardware_device_fingerprint(device: str) -> dict:
     return fp
 
 
+def _box_wh_from_label_line(parts: list, task: str):
+    """Return (w, h) as fractions of image size, or None if unparseable."""
+    try:
+        nums = [float(x) for x in parts[1:]]
+    except (TypeError, ValueError):
+        return None
+    if len(nums) >= 4 and (task == "detect" or len(nums) == 4 or (task == "pose" and len(nums) >= 4)):
+        # detect: cls cx cy w h; pose: cls cx cy w h + kpts — first 4 after cls are bbox
+        if task in ("detect", "pose") or len(nums) == 4:
+            w, h = abs(nums[2]), abs(nums[3])
+            if 0.0 < w <= 1.5 and 0.0 < h <= 1.5:
+                return w, h
+    if task == "segment" and len(nums) >= 6 and len(nums) % 2 == 0:
+        xs = nums[0::2]
+        ys = nums[1::2]
+        if not xs or not ys:
+            return None
+        w = max(xs) - min(xs)
+        h = max(ys) - min(ys)
+        if w >= 0.0 and h >= 0.0:
+            return abs(w), abs(h)
+    # Ambiguous segment-looking polygon on detect task: treat as polygon bbox
+    if len(nums) >= 6 and len(nums) % 2 == 0:
+        xs = nums[0::2]
+        ys = nums[1::2]
+        return abs(max(xs) - min(xs)), abs(max(ys) - min(ys))
+    if len(nums) >= 4:
+        return abs(nums[2]), abs(nums[3])
+    return None
+
+
+def compute_label_stats(labels_dir: Path, task: str = "detect",
+                        sample_limit: int = LABEL_STATS_SAMPLE_LIMIT) -> dict:
+    """Cheap label-file stats (up to sample_limit files) for object-size policy."""
+    empty = {
+        "label_files_sampled": 0,
+        "boxes_sampled": 0,
+        "median_box_w": None,
+        "median_box_h": None,
+        "p10_box_w": None,
+        "p10_box_h": None,
+        "p25_box_w": None,
+        "p25_box_h": None,
+        "boxes_per_image": None,
+        "empty_label_fraction": None,
+    }
+    if labels_dir is None or not Path(labels_dir).is_dir():
+        return empty
+    files = sorted(Path(labels_dir).glob("*.txt"))
+    if not files:
+        return empty
+    if len(files) > sample_limit:
+        # Evenly spaced sample across the split
+        step = len(files) / float(sample_limit)
+        files = [files[int(i * step)] for i in range(sample_limit)]
+    widths, heights = [], []
+    boxes_per = []
+    empty_count = 0
+    for lp in files:
+        try:
+            lines = [ln.strip() for ln in lp.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+        except OSError:
+            continue
+        if not lines:
+            empty_count += 1
+            boxes_per.append(0)
+            continue
+        n_boxes = 0
+        for ln in lines:
+            parts = ln.split()
+            if len(parts) < 5:
+                continue
+            wh = _box_wh_from_label_line(parts, task)
+            if wh is None:
+                continue
+            widths.append(wh[0])
+            heights.append(wh[1])
+            n_boxes += 1
+        boxes_per.append(n_boxes)
+        if n_boxes == 0:
+            empty_count += 1
+    def _pct(vals, p):
+        if not vals:
+            return None
+        ordered = sorted(vals)
+        idx = max(0, min(len(ordered) - 1, int(round((p / 100.0) * (len(ordered) - 1)))))
+        return round(ordered[idx], 6)
+    n_files = len(boxes_per)
+    return {
+        "label_files_sampled": n_files,
+        "boxes_sampled": len(widths),
+        "median_box_w": round(statistics.median(widths), 6) if widths else None,
+        "median_box_h": round(statistics.median(heights), 6) if heights else None,
+        "p10_box_w": _pct(widths, 10),
+        "p10_box_h": _pct(heights, 10),
+        "p25_box_w": _pct(widths, 25),
+        "p25_box_h": _pct(heights, 25),
+        "boxes_per_image": round(sum(boxes_per) / n_files, 3) if n_files else None,
+        "empty_label_fraction": round(empty_count / n_files, 4) if n_files else None,
+    }
+
+
+def object_px_at_imgsz(box_frac, imgsz):
+    if box_frac is None or imgsz is None:
+        return None
+    return float(box_frac) * float(imgsz)
+
+
+def warn_object_size_vs_imgsz(logger, label_stats: dict, imgsz: int, native_size):
+    """Loud warning when objects remain tiny at the chosen imgsz."""
+    med_w = object_px_at_imgsz(label_stats.get("median_box_w"), imgsz)
+    med_h = object_px_at_imgsz(label_stats.get("median_box_h"), imgsz)
+    p25_w = object_px_at_imgsz(label_stats.get("p25_box_w"), imgsz)
+    p25_h = object_px_at_imgsz(label_stats.get("p25_box_h"), imgsz)
+    if med_w is None or med_h is None:
+        return
+    med = min(med_w, med_h)
+    p25 = min(p25_w, p25_h) if p25_w is not None and p25_h is not None else None
+    if med < MIN_RESOLVED_OBJECT_PX or (p25 is not None and p25 < MIN_RESOLVED_OBJECT_P25_PX):
+        native_note = f", native median {native_size}px" if native_size else ""
+        msg = (
+            f"[WARNING] Objects may be under-resolved at imgsz={imgsz}px{native_note}: "
+            f"median object ~{med:.1f}px (need >= {MIN_RESOLVED_OBJECT_PX:.0f}px)"
+            + (f", p25 ~{p25:.1f}px (need >= {MIN_RESOLVED_OBJECT_P25_PX:.0f}px)" if p25 is not None else "")
+            + ". Prefer a higher memory-safe imgsz up to native resolution."
+        )
+        logger.log(msg)
+        print(msg)
+
+
+def warn_train_val_label_stats(logger, train_stats: dict, val_stats: dict):
+    """Warn when train/val label distributions diverge sharply."""
+    if not train_stats or not val_stats:
+        return
+    tw, vw = train_stats.get("median_box_w"), val_stats.get("median_box_w")
+    th, vh = train_stats.get("median_box_h"), val_stats.get("median_box_h")
+    if tw and vw and min(tw, vw) > 0:
+        ratio = max(tw, vw) / min(tw, vw)
+        if ratio > 2.0:
+            logger.log(f"[WARNING] Train/val median box width differ sharply (train={tw}, val={vw}, ratio={ratio:.2f}).")
+    if th and vh and min(th, vh) > 0:
+        ratio = max(th, vh) / min(th, vh)
+        if ratio > 2.0:
+            logger.log(f"[WARNING] Train/val median box height differ sharply (train={th}, val={vh}, ratio={ratio:.2f}).")
+    te, ve = train_stats.get("empty_label_fraction"), val_stats.get("empty_label_fraction")
+    if te is not None and ve is not None and abs(te - ve) > 0.25:
+        logger.log(f"[WARNING] Train/val empty-label fractions differ sharply (train={te}, val={ve}).")
+
+
+def prefer_imgsz_for_objects(imgsz_list, label_stats: dict, native_size):
+    """
+    If objects look small at the first candidate, prefer higher memory-safe imgsz
+    candidates up to native (never upscale past native unless explicit).
+    """
+    if not imgsz_list:
+        return imgsz_list
+    med_w = label_stats.get("median_box_w")
+    med_h = label_stats.get("median_box_h")
+    p25_w = label_stats.get("p25_box_w")
+    p25_h = label_stats.get("p25_box_h")
+    if med_w is None or med_h is None:
+        return imgsz_list
+    first = imgsz_list[0]
+    med_px = min(object_px_at_imgsz(med_w, first), object_px_at_imgsz(med_h, first))
+    p25_px = None
+    if p25_w is not None and p25_h is not None:
+        p25_px = min(object_px_at_imgsz(p25_w, first), object_px_at_imgsz(p25_h, first))
+    if med_px >= MIN_RESOLVED_OBJECT_PX and (p25_px is None or p25_px >= MIN_RESOLVED_OBJECT_P25_PX):
+        return imgsz_list
+    # Prefer larger sizes first (still capped to native by imgsz_candidates).
+    return sorted(imgsz_list, reverse=True)
+
+
 def dataset_fingerprint(yaml_path: Path, train_path: Path, task: str = "detect") -> dict:
     """Content stats of the dataset used for calibration and cache validity.
     task makes memory-cache / calibration entries task-specific."""
@@ -1025,15 +1251,33 @@ def dataset_fingerprint(yaml_path: Path, train_path: Path, task: str = "detect")
         except Exception:
             continue
 
-    return {
+    task_name = task if task in ("detect", "segment", "pose") else "detect"
+    label_stats = compute_label_stats(labels_dir, task_name) if labels_dir else compute_label_stats(Path("."), task_name)
+    # Val stats when available (for divergence warnings; also folded into fingerprint lightly)
+    val_stats = {}
+    try:
+        val_key = data.get("val")
+        if val_key:
+            val_images = resolve_yaml_split_path(yaml_path, str(val_key))
+            val_labels = val_images.parent / "labels" if val_images is not None else None
+            if val_labels is not None and val_labels.is_dir():
+                val_stats = compute_label_stats(val_labels, task_name)
+    except Exception:
+        val_stats = {}
+
+    fp = {
         "data_yaml": str(yaml_path).replace("\\", "/"),
-        "task": task if task in ("detect", "segment", "pose") else "detect",
+        "task": task_name,
         "image_count": len(files),
         "nc": int(data.get("nc") or 0),
         "median_img_size": int(statistics.median(sizes)) if sizes else None,
         "max_sampled_img_size": int(max(sizes)) if sizes else None,
         "avg_labels_per_sampled_image": round(sum(label_counts) / len(label_counts), 2) if label_counts else None,
+        "label_stats": label_stats,
     }
+    if val_stats:
+        fp["val_label_stats"] = val_stats
+    return fp
 
 
 def fingerprint_hash(fp: dict) -> str:
@@ -1041,27 +1285,31 @@ def fingerprint_hash(fp: dict) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
-# -- Dynamic Memory Cache (memory_profiles.json, schema v2) ------------------------
+# -- Dynamic Memory Cache (memory_profiles.json, schema v4 / quality-v2) ------------
 # Legacy vram_estimates.json is a model-only fallback heuristic; it is NOT final
 # safety truth. Only measured, fingerprint-matched entries in this cache can
-# skip recalibration.
+# skip recalibration. A probe SAFE verdict is a memory estimate only — not a
+# convergence guarantee.
 
 def load_memory_cache(logger=None) -> dict:
     if not MEMORY_CACHE_PATH.exists():
-        return {"version": 3, "hardware_profiles": {}}
+        return {"version": MEMORY_CACHE_SCHEMA_VERSION, "hardware_profiles": {}}
     try:
         with open(MEMORY_CACHE_PATH, encoding="utf-8") as f:
             data = json.load(f)
-        if not isinstance(data, dict) or data.get("version") != 3:
+        if not isinstance(data, dict) or data.get("version") != MEMORY_CACHE_SCHEMA_VERSION:
             if logger:
-                logger.log(f"[Cache] {MEMORY_CACHE_PATH} is not schema version 3; starting fresh (full recalibration).")
-            return {"version": 3, "hardware_profiles": {}}
+                logger.log(
+                    f"[Cache] {MEMORY_CACHE_PATH} is not schema version {MEMORY_CACHE_SCHEMA_VERSION}; "
+                    "starting fresh (full recalibration)."
+                )
+            return {"version": MEMORY_CACHE_SCHEMA_VERSION, "hardware_profiles": {}}
         data.setdefault("hardware_profiles", {})
         return data
     except (OSError, json.JSONDecodeError) as e:
         if logger:
             logger.log(f"[Cache] Ignoring corrupt memory cache {MEMORY_CACHE_PATH}: {e}")
-        return {"version": 3, "hardware_profiles": {}}
+        return {"version": MEMORY_CACHE_SCHEMA_VERSION, "hardware_profiles": {}}
 
 
 def save_memory_cache(cache: dict, logger) -> bool:
@@ -1082,14 +1330,14 @@ def sig_num(v) -> str:
     return str(v)
 
 
-def config_signature(model, imgsz, batch, workers, multi_scale, mosaic=1.0, mixup=0.15,
-                     copy_paste=0.3, degrees=180, close_mosaic=60, flipud=0.5,
-                     cos_lr=True, nbs=64) -> str:
+def config_signature(model, imgsz, batch, workers, multi_scale, mosaic=1.0, mixup=0.0,
+                     copy_paste=0.0, degrees=0.0, close_mosaic=60, flipud=0.0,
+                     cos_lr=True, nbs=64, cache=False, **_extra) -> str:
     """
-    Cache config key: model|imgsz|batch|workers|ms|mosaic|mixup|copy_paste|degrees|close_mosaic.
-    flipud/cos_lr/nbs are accepted so full chosen dicts splat safely; they are fixed
-    policy constants and are not keyed (degrees/close_mosaic vary per rung).
+    Cache config key including every newly varying quality-v2 parameter.
+    cos_lr/nbs stay splat-safe; cache= is keyed when throughput probes enable it.
     """
+    cache_token = "cache0" if not cache else f"cache{cache}"
     return "|".join([
         str(model), str(imgsz), str(batch), str(workers),
         f"ms{sig_num(multi_scale)}",
@@ -1097,7 +1345,9 @@ def config_signature(model, imgsz, batch, workers, multi_scale, mosaic=1.0, mixu
         f"mixup{sig_num(mixup)}",
         f"copy{sig_num(copy_paste)}",
         f"deg{sig_num(degrees)}",
+        f"flipud{sig_num(flipud)}",
         f"cm{sig_num(close_mosaic)}",
+        cache_token,
     ])
 
 
@@ -1105,11 +1355,14 @@ def selection_signature(args, ds_fp: dict) -> str:
     """Which calibration request a cached selection answers."""
     explicit = {k: v for k, v in {
         "model": args.model, "imgsz": args.imgsz, "batch": args.batch, "workers": args.workers,
+        "degrees": getattr(args, "degrees", None),
+        "flipud": getattr(args, "flipud", None),
+        "mixup": getattr(args, "mixup", None),
     }.items() if v is not None}
     sig = json.dumps(explicit, sort_keys=True, separators=(",", ":")) if explicit else "auto"
-    # Intent marker: selections recorded under a different auto-policy (e.g. the
-    # old speed-balanced defaults) never satisfy a post-change run.
-    return f"ds:{fingerprint_hash(ds_fp)}|profile:{args.memory_profile}|intent:quality-v1|{sig}"
+    # Intent marker: selections recorded under a different auto-policy never
+    # satisfy a post-change run (quality-v1 / schema v3 are discarded).
+    return f"ds:{fingerprint_hash(ds_fp)}|profile:{args.memory_profile}|intent:{SELECTION_INTENT}|{sig}"
 
 
 def get_hw_profile(cache: dict, hw_fp: dict):
@@ -1175,9 +1428,104 @@ def record_calibration(cache: dict, logger, hw_fp: dict, ds_fp: dict, sel_key: s
 
 
 # -- Attempt tracker (callbacks + status) ---------------------------------------
+def _metric_from_trainer(trainer, *keys):
+    """Pull a float metric from trainer.metrics / trainer.validator / loss items."""
+    metrics = getattr(trainer, "metrics", None) or {}
+    if isinstance(metrics, dict):
+        for k in keys:
+            if k in metrics:
+                try:
+                    return float(metrics[k])
+                except (TypeError, ValueError):
+                    pass
+        for mk, mv in metrics.items():
+            mk_l = str(mk).lower()
+            for k in keys:
+                if k.lower() in mk_l:
+                    try:
+                        return float(mv)
+                    except (TypeError, ValueError):
+                        pass
+    loss = getattr(trainer, "loss", None)
+    if loss is not None and "train/loss" in keys:
+        try:
+            return float(loss.detach().item() if hasattr(loss, "detach") else loss)
+        except Exception:
+            pass
+    tloss = getattr(trainer, "tloss", None)
+    if tloss is not None and any("loss" in k.lower() for k in keys):
+        try:
+            if hasattr(tloss, "mean"):
+                return float(tloss.mean().item() if hasattr(tloss.mean(), "item") else tloss.mean())
+            return float(tloss)
+        except Exception:
+            pass
+    return None
+
+
+def classify_training_condition(history: list, epoch: int, patience: int = 100) -> str:
+    """
+    Plain-English training condition from recent (loss, score) history.
+    history entries: {"epoch", "loss", "score"} with score ~= mAP50.
+    """
+    if epoch <= 5:
+        return "Still in early learning — scores jump around; this is normal."
+    if len(history) < 2:
+        return "Still gathering the first readings — check back after a few epochs."
+    recent = history[-min(5, len(history)):]
+    losses = [h["loss"] for h in recent if h.get("loss") is not None]
+    scores = [h["score"] for h in recent if h.get("score") is not None]
+    last_score = scores[-1] if scores else None
+    if last_score is not None and epoch >= 10 and last_score < 0.05:
+        return "Struggling — check labels, object size vs image size, or try lighter augmentation."
+    loss_down = len(losses) >= 2 and losses[-1] < losses[0] - 1e-6
+    score_up = len(scores) >= 2 and scores[-1] > scores[0] + 1e-4
+    score_flat = len(scores) >= 2 and abs(scores[-1] - scores[0]) <= 1e-4
+    loss_flat = len(losses) >= 2 and abs(losses[-1] - losses[0]) <= 1e-4
+    if loss_down and score_up:
+        if scores[-1] - scores[0] < 0.01:
+            return "Improving slowly — still worth continuing."
+        return "Learning well — getting better at finding the objects."
+    if loss_down and (score_flat or (len(scores) >= 2 and scores[-1] < scores[0])):
+        return "Fitting the training images, but not improving on the check set yet."
+    if loss_flat and score_flat:
+        return "Looking stable — may stop early if nothing improves for a while."
+    if score_up:
+        return "Improving slowly — still worth continuing."
+    return "Looking stable — may stop early if nothing improves for a while."
+
+
+def format_progress_block(epoch, target, avg_sec, patience, epochs_since_best, condition,
+                          loss=None, score=None) -> str:
+    pct = (100.0 * epoch / target) if target else 0.0
+    lines = [
+        f"[Progress] epoch {epoch}/{target} ({pct:.1f}% of scheduled epochs)",
+        "  note: early stop (patience) or time budget can end sooner — percent is a schedule estimate",
+    ]
+    if avg_sec is not None:
+        eta_full = avg_sec * max(0, target - epoch)
+        lines.append(f"  avg time/epoch : {format_duration(avg_sec)}")
+        lines.append(f"  ETA to schedule end : ~{format_duration(eta_full)}")
+        if patience is not None and epochs_since_best is not None:
+            rem = max(0, int(patience) - int(epochs_since_best))
+            lines.append(
+                f"  if no further gains : ~{format_duration(avg_sec * rem)} "
+                f"(guess from patience remaining {rem}/{patience})"
+            )
+    lines.append(f"  condition : {condition}")
+    extras = []
+    if loss is not None:
+        extras.append(f"train loss {loss:.4g}")
+    if score is not None:
+        extras.append(f"check-set score {score:.4g}")
+    if extras:
+        lines.append(f"  (details: {', '.join(extras)})")
+    return "\n".join(lines)
+
+
 class AttemptTracker:
     def __init__(self, logger, guard, run_dir, target_epochs, intended_cfg, state,
-                 on_emergency, on_adaptive, on_complete, on_crash):
+                 on_emergency, on_adaptive, on_complete, on_crash, patience=100):
         self.logger = logger
         self.guard = guard
         self.run_dir = Path(run_dir)
@@ -1188,6 +1536,7 @@ class AttemptTracker:
         self.on_adaptive = on_adaptive
         self.on_complete = on_complete
         self.on_crash = on_crash
+        self.patience = patience
         self.status = "running"
         self.emergency_triggered = False
         self.adaptive_triggered = False
@@ -1198,6 +1547,11 @@ class AttemptTracker:
         self.crash_exc = None
         self.resumable_ckpt = None
         self._stop_handled = False
+        self._epoch_t0 = None
+        self._epoch_durations = []
+        self._metric_history = []
+        self._best_score = None
+        self._epochs_since_best = 0
 
     def callbacks(self):
         return {
@@ -1243,6 +1597,7 @@ class AttemptTracker:
         self.logger.log(f"[Attempt] training started; start_epoch={self.start_epoch} target_epochs={self.target_epochs}")
 
     def on_train_epoch_start(self, trainer):
+        self._epoch_t0 = time.perf_counter()
         self.guard.reset() if False else None
 
     def on_train_batch_end(self, trainer):
@@ -1279,6 +1634,41 @@ class AttemptTracker:
         # overshoot the target (kills the 600 -> 601 artifact).
         if isinstance(epoch, int) and not self.adaptive_triggered:
             self.completed_epoch = min(epoch + 1, self.target_epochs)
+            # Live progress (skip the final_eval re-fire via adaptive_triggered gate above)
+            if self._epoch_t0 is not None:
+                self._epoch_durations.append(time.perf_counter() - self._epoch_t0)
+                self._epoch_t0 = None
+            loss = _metric_from_trainer(trainer, "train/box_loss", "train/loss", "loss")
+            if loss is None:
+                try:
+                    loss = float(getattr(trainer, "loss", None) or 0) or None
+                except Exception:
+                    loss = None
+            # Prefer box mAP50; fall back to any mAP50-like key
+            score = _metric_from_trainer(
+                trainer,
+                "metrics/mAP50(B)", "metrics/mAP50(M)", "metrics/mAP50",
+                "mAP50", "metrics/fitness",
+            )
+            self._metric_history.append({
+                "epoch": self.completed_epoch, "loss": loss, "score": score,
+            })
+            if score is not None:
+                if self._best_score is None or score > self._best_score + 1e-6:
+                    self._best_score = score
+                    self._epochs_since_best = 0
+                else:
+                    self._epochs_since_best += 1
+            avg_sec = (sum(self._epoch_durations) / len(self._epoch_durations)) if self._epoch_durations else None
+            condition = classify_training_condition(
+                self._metric_history, self.completed_epoch, patience=self.patience,
+            )
+            block = format_progress_block(
+                self.completed_epoch, self.target_epochs, avg_sec, self.patience,
+                self._epochs_since_best, condition, loss=loss, score=score,
+            )
+            self.logger.log(block)
+            print(block)
         # Short-circuit on the re-fire: a re-armed guard flag is never consumed here
         # (harmless — the next attempt's guard.start() reset clears it).
         if not self.adaptive_triggered and self.guard.consume_adaptive():
@@ -1976,17 +2366,20 @@ def probe_fraction(image_count: int) -> float:
 
 
 def probe_train_once(model_name, device, data_yaml, imgsz, batch, multi_scale, mosaic, mixup,
-                     copy_paste, fraction, cuda_index, workers=0):
+                     copy_paste, fraction, cuda_index, workers=0, degrees=0.0, flipud=0.0,
+                     cache=False, sample_gpu_util=False):
     """
     One 1-epoch real-dataset probe run on a representative subset (never a
     synthetic blank image probe). Returns (peak_gpu_allocated_gb,
-    peak_gpu_reserved_gb, peak_cpu_rss_gb). Safety is judged on RESERVED
-    memory, not only allocated memory.
+    peak_gpu_reserved_gb, peak_cpu_rss_gb[, avg_gpu_util]).
+
+    A SAFE peak comparison is a memory estimate only — not a convergence guarantee.
     """
     weights = resolve_pretrained_weights(model_name)
     model = YOLO(str(weights))
 
     peak_rss = [0.0]
+    util_samples = []
     stop_event = threading.Event()
 
     def rss_loop():
@@ -1994,6 +2387,10 @@ def probe_train_once(model_name, device, data_yaml, imgsz, batch, multi_scale, m
             rss = process_rss_bytes()
             if rss is not None:
                 peak_rss[0] = max(peak_rss[0], rss / 2**30)
+            if sample_gpu_util and cuda_index is not None:
+                util = sample_gpu_utilization(cuda_index)
+                if util is not None:
+                    util_samples.append(util)
 
     rss_thread = threading.Thread(target=rss_loop, daemon=True) if PSUTIL_AVAILABLE else None
     if rss_thread:
@@ -2014,15 +2411,15 @@ def probe_train_once(model_name, device, data_yaml, imgsz, batch, multi_scale, m
                 mosaic=float(mosaic),
                 mixup=float(mixup),
                 copy_paste=float(copy_paste),
-                degrees=180,
-                flipud=0.5,
+                degrees=float(degrees),
+                flipud=float(flipud),
                 close_mosaic=0,   # keep mosaic ACTIVE during 1-epoch probes
                 workers=int(workers),
                 val=False,
                 save=False,
                 plots=False,
                 verbose=False,
-                cache=False,
+                cache=cache,
                 device=device,
                 project=str(Path(tmp) / "runs"),
                 name="memory_probe",
@@ -2048,7 +2445,22 @@ def probe_train_once(model_name, device, data_yaml, imgsz, batch, multi_scale, m
         reserved_gb = torch.cuda.max_memory_reserved(cuda_index) / 2**30
         torch.cuda.empty_cache()
 
+    if sample_gpu_util:
+        avg_util = (sum(util_samples) / len(util_samples)) if util_samples else None
+        return alloc_gb, reserved_gb, peak_rss[0], avg_util
     return alloc_gb, reserved_gb, peak_rss[0]
+
+
+def sample_gpu_utilization(cuda_index) -> float | None:
+    """Optional GPU util % via pynvml; None when unavailable."""
+    try:
+        import pynvml  # type: ignore[import-untyped]
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(int(cuda_index))
+        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        return float(util.gpu)
+    except Exception:
+        return None
 
 
 def static_candidate_config(args, hw, image_count, native_size, use_gpu):
@@ -2083,10 +2495,19 @@ def static_candidate_config(args, hw, image_count, native_size, use_gpu):
                         explicit_unsafe = True
                         notes.append(f"explicit batch {batch} exceeds conservative static ceiling {est0} for {model}@{imgsz}px")
                 else:
-                    multi_scale = 0.5 if est_ms >= PREFERRED_AUTO_BATCH else 0.0
-                    batch = min(calc_batch(hw["vram_gb"], model, imgsz, multi_scale, profile["gpu"]), PREFERRED_AUTO_BATCH)
-                    if batch < MIN_AUTO_BATCH:
+                    multi_scale = 0.5 if est_ms >= MIN_HEALTHY_BATCH else 0.0
+                    batch = min(calc_batch(hw["vram_gb"], model, imgsz, multi_scale, profile["gpu"]),
+                                HEALTHY_BATCH_CANDIDATES[0])
+                    # Prefer a healthy batch when the static estimate allows it.
+                    if batch >= MIN_HEALTHY_BATCH:
+                        batch = max(b for b in HEALTHY_BATCH_CANDIDATES if b <= batch)
+                    elif batch < MIN_AUTO_BATCH:
                         continue
+                    else:
+                        notes.append(
+                            f"static estimate only fits batch {batch} (< {MIN_HEALTHY_BATCH}); "
+                            "BN quality may be degraded — dynamic probes will try harder"
+                        )
             else:
                 multi_scale = 0.0
                 explicit_unsafe = False
@@ -2112,17 +2533,20 @@ def _short(s: str) -> str:
     return s if len(s) <= 300 else s[:300] + " ..."
 
 
-def build_chosen(model, imgsz, batch, workers, multi_scale, mosaic, mixup=0.15, copy_paste=0.3):
+def build_chosen(model, imgsz, batch, workers, multi_scale, mosaic, mixup=0.0, copy_paste=0.0,
+                 degrees=0.0, flipud=0.0, cache=False):
     """
     Canonical chosen-config dict used for cache keys and training kwargs.
-    Carries the fixed auto augmentation constants (degrees/flipud/close_mosaic/
-    cos_lr/nbs) so probes, training and the cache all see the same truth.
+    Geometry (degrees/flipud) defaults to 0 (opt-in). close_mosaic/cos_lr/nbs are
+    shared training constants so probes, training and the cache see the same truth.
     """
     return {
         "model": model, "imgsz": int(imgsz), "batch": int(batch), "workers": int(workers),
         "multi_scale": float(multi_scale), "mosaic": float(mosaic),
         "mixup": float(mixup), "copy_paste": float(copy_paste),
-        "degrees": 180, "flipud": 0.5, "close_mosaic": 60, "cos_lr": True, "nbs": 64,
+        "degrees": float(degrees), "flipud": float(flipud),
+        "close_mosaic": 60, "cos_lr": True, "nbs": 64,
+        "cache": cache,
     }
 
 
@@ -2169,7 +2593,14 @@ def calibrate_training_config(args, logger, cache, hw_fp, hw, device, data_yaml,
                 "Static estimate marks the explicit override unsafe: " + "; ".join(cfg["notes"]) +
                 ". Let dynamic probes calibrate instead, or pass --force-unsafe."
             )
-        chosen = build_chosen(cfg["model"], cfg["imgsz"], cfg["batch"], cfg["workers"], cfg["multi_scale"], 1.0)
+        degrees, flipud = resolve_geometry_aug(args)
+        task = getattr(args, "dataset_task", ds_fp.get("task", "detect"))
+        ladder0 = aug_ladder_for_task(task)[0]
+        mix0 = resolve_mixup(args, task, ladder0[2])
+        chosen = build_chosen(
+            cfg["model"], cfg["imgsz"], cfg["batch"], cfg["workers"], cfg["multi_scale"], 1.0,
+            mixup=mix0, copy_paste=ladder0[1], degrees=degrees, flipud=flipud,
+        )
         for note in cfg["notes"]:
             logger.log(f"[Calibrate static] {note}")
         logger.log("[Calibrate] Probes skipped (--no-memory-probe): static conservative config; NOT measured-safe.")
@@ -2179,32 +2610,42 @@ def calibrate_training_config(args, logger, cache, hw_fp, hw, device, data_yaml,
                            safe=not cfg["explicit_unsafe"], measured=False, make_selection=not cfg["explicit_unsafe"])
         return chosen, "static"
 
-    # ---- dynamic probe calibration --------------------------------------------
+    # ---- dynamic probe calibration (quality-v2: batch-floor-first) ------------
     gpu_cap = hw["vram_gb"] * profile["gpu"] if (use_gpu and hw.get("vram_gb")) else None
     cpu_cap = hw["ram_gb"] * profile["cpu"] if hw.get("ram_gb") else None
     cap_str = (f"GPU cap {gpu_cap:.2f} GB" if gpu_cap else "GPU cap n/a") + \
               (f", CPU cap {cpu_cap:.2f} GB" if cpu_cap else ", CPU cap n/a")
     logger.log(f"[Calibrate] Dynamic probes on device '{device}', profile '{profile_name}' ({cap_str}); "
                f"probe fraction {fraction:.3f} of {image_count} train images, 1 epoch, save off.")
+    logger.log(
+        f"[Calibrate] Selection policy quality-v2: largest model that fits batch>={MIN_HEALTHY_BATCH}, "
+        "task-aware aug; lighten aug before dropping below the healthy batch floor. "
+        "SAFE = memory estimate only, not a convergence guarantee."
+    )
     print("[Calibration] Running 1-epoch probe runs on a representative dataset subset to find a measured-safe config (probe weights are discarded)...")
 
+    task = getattr(args, "dataset_task", ds_fp.get("task", "detect"))
+    ladder = aug_ladder_for_task(task)
+    degrees, flipud = resolve_geometry_aug(args)
     models = [args.model] if args.model else model_candidates(
-        image_count, hw.get("vram_gb"), for_cpu=not use_gpu, task=getattr(args, "dataset_task", "detect"))
+        image_count, hw.get("vram_gb"), for_cpu=not use_gpu, task=task)
     if args.imgsz is not None:
         imgszs = [int(args.imgsz)]
         if native_size and int(args.imgsz) > int(native_size):
             logger.log(f"[Calibrate] Note: explicit --imgsz {int(args.imgsz)} exceeds native dataset resolution {int(native_size)}px (override honored).")
     else:
         imgszs = imgsz_candidates(native_size)
+        label_stats = ds_fp.get("label_stats") or {}
+        imgszs = prefer_imgsz_for_objects(imgszs, label_stats, native_size)
 
     base_workers = int(args.workers) if args.workers is not None else min(
         calc_workers(hw.get("cpu_cores") or 4, hw.get("ram_gb")), auto_workers_limit())
-    pinned = bool(args.model or args.imgsz is not None or args.batch is not None or args.workers is not None)
 
     probe_memo = {}
+    last_probe_elapsed = [None]  # mutable cell: sec for final verification probe
 
     def evaluate_peaks(peaks, label):
-        alloc, res, rss = peaks
+        alloc, res, rss = peaks[0], peaks[1], peaks[2]
         safe = True
         reasons = []
         if gpu_cap is not None and res is not None and res > gpu_cap:
@@ -2218,130 +2659,204 @@ def calibrate_training_config(args, logger, cache, hw_fp, hw, device, data_yaml,
         logger.log(f"[Calibrate] {label}: {'SAFE' if safe else 'UNSAFE'} ({'; '.join(reasons) if reasons else peak_str})")
         return safe
 
-    def run_probe(chosen_cfg, label):
+    def run_probe(chosen_cfg, label, sample_gpu_util=False, timed=False):
         key = config_signature(**chosen_cfg)
-        if key in probe_memo:
+        if key in probe_memo and not sample_gpu_util and not timed:
             safe = probe_memo[key][1]
             logger.log(f"[Calibrate] {label}: reusing earlier probe result for {key} ({'SAFE' if safe else 'UNSAFE'})")
             return probe_memo[key]
+        t0 = time.perf_counter()
         try:
             peaks = probe_train_once(
                 chosen_cfg["model"], device, data_yaml, chosen_cfg["imgsz"], chosen_cfg["batch"],
                 chosen_cfg["multi_scale"], chosen_cfg["mosaic"], chosen_cfg["mixup"], chosen_cfg["copy_paste"],
                 fraction, cuda_index, workers=chosen_cfg["workers"],
+                degrees=chosen_cfg.get("degrees", 0.0), flipud=chosen_cfg.get("flipud", 0.0),
+                cache=chosen_cfg.get("cache", False), sample_gpu_util=sample_gpu_util,
             )
         except ProbeOOMError as e:
             logger.log(f"[Calibrate] {label}: OOM ({_short(str(e))})")
-            probe_memo[key] = ((None, None, None), False)
+            probe_memo[key] = ((None, None, None), False, None)
             return probe_memo[key]
         except ProbeUnverifiedError as e:
             raise CalibrateFail(
                 f"Probe for {chosen_cfg['model']} @ {chosen_cfg['imgsz']}px batch {chosen_cfg['batch']} failed for a "
                 f"non-memory reason, so its safety cannot be verified: {_short(str(e))}"
             ) from e
-        safe = evaluate_peaks(peaks, label)
-        record_calibration(cache, logger, hw_fp, ds_fp, sel_key, chosen_cfg, peaks, safe, measured=True, make_selection=False)
-        probe_memo[key] = (peaks, safe)
+        elapsed = time.perf_counter() - t0
+        if timed:
+            last_probe_elapsed[0] = elapsed
+        gpu_util = peaks[3] if sample_gpu_util and len(peaks) > 3 else None
+        mem_peaks = peaks[:3]
+        safe = evaluate_peaks(mem_peaks, label)
+        record_calibration(cache, logger, hw_fp, ds_fp, sel_key, chosen_cfg, mem_peaks, safe, measured=True, make_selection=False)
+        probe_memo[key] = (mem_peaks, safe, gpu_util)
         return probe_memo[key]
+
+    def make_cfg(model, imgsz, batch, workers, mosaic, copy_paste, mixup, multi_scale, cache=False):
+        mix = resolve_mixup(args, task, mixup)
+        return build_chosen(
+            model, imgsz, batch, workers, multi_scale, mosaic,
+            mixup=mix, copy_paste=copy_paste, degrees=degrees, flipud=flipud, cache=cache,
+        )
+
+    def finalize_with_workers(model, imgsz, aug_cfg, degraded=False):
+        """Final verification with real workers; optional throughput bumps."""
+        nonlocal_cfg = None
+        final_safe = False
+        gpu_util = None
+        batch = aug_cfg["batch"]
+        if args.workers is not None:
+            cfg = make_cfg(model, imgsz, batch, base_workers,
+                           aug_cfg["mosaic"], aug_cfg["copy_paste"], aug_cfg["mixup"], aug_cfg["multi_scale"])
+            peaks, safe, gpu_util = run_probe(cfg, f"final verify: workers {base_workers} (explicit)",
+                                              sample_gpu_util=True, timed=True)
+            if safe:
+                nonlocal_cfg, final_safe = cfg, True
+            elif args.force_unsafe:
+                logger.log("[Calibrate] --force-unsafe: accepting explicit workers despite UNSAFE final verification probe (this config is NOT recorded as measured-safe).")
+                nonlocal_cfg = cfg
+            else:
+                raise CalibrateFail(
+                    f"Explicit --workers {base_workers} is unsafe on the final verification probe. "
+                    "Lower --workers or pass --force-unsafe."
+                )
+        else:
+            for w in sorted({base_workers, 2, 0}, reverse=True):
+                if w > base_workers:
+                    continue
+                cfg = make_cfg(model, imgsz, batch, w,
+                               aug_cfg["mosaic"], aug_cfg["copy_paste"], aug_cfg["mixup"], aug_cfg["multi_scale"])
+                peaks, safe, gpu_util = run_probe(cfg, f"final verify: workers {w}",
+                                                  sample_gpu_util=True, timed=True)
+                if safe:
+                    nonlocal_cfg, final_safe = cfg, True
+                    break
+        if nonlocal_cfg is None:
+            return None, False
+
+        # Throughput: if GPU util is low, try more workers / disk cache (probe-gated).
+        if final_safe and args.workers is None and gpu_util is not None and gpu_util < GPU_UTIL_DATALOADER_BOUND:
+            logger.log(f"[Calibrate] GPU util ~{gpu_util:.0f}% < {GPU_UTIL_DATALOADER_BOUND:.0f}% — treating as dataloader-bound.")
+            more_workers = min(auto_workers_limit(), max(nonlocal_cfg["workers"] * 2, nonlocal_cfg["workers"] + 2, base_workers))
+            if more_workers > nonlocal_cfg["workers"]:
+                cand = dict(nonlocal_cfg)
+                cand["workers"] = more_workers
+                _, w_safe, _ = run_probe(cand, f"throughput: workers {more_workers}")
+                if w_safe:
+                    logger.log(f"[Calibrate] throughput: raising workers {nonlocal_cfg['workers']} -> {more_workers}")
+                    nonlocal_cfg = cand
+            # disk cache (ram only if dataset estimate fits comfortably)
+            if not nonlocal_cfg.get("cache"):
+                disk_cand = dict(nonlocal_cfg)
+                disk_cand["cache"] = "disk"
+                _, c_safe, _ = run_probe(disk_cand, "throughput: cache=disk")
+                if c_safe:
+                    logger.log("[Calibrate] throughput: enabling cache=disk (probe-safe)")
+                    nonlocal_cfg = disk_cand
+                else:
+                    # estimate train images bytes roughly; only try ram if << available RAM
+                    try:
+                        avail = (hw.get("ram_gb") or 0) * 0.35
+                        est_gb = (image_count * (nonlocal_cfg["imgsz"] ** 2) * 3) / (2 ** 30)
+                        if est_gb > 0 and est_gb < avail:
+                            ram_cand = dict(nonlocal_cfg)
+                            ram_cand["cache"] = "ram"
+                            _, r_safe, _ = run_probe(ram_cand, "throughput: cache=ram")
+                            if r_safe:
+                                logger.log(f"[Calibrate] throughput: enabling cache=ram (est {est_gb:.1f} GB < {avail:.1f} GB budget)")
+                                nonlocal_cfg = ram_cand
+                    except Exception:
+                        pass
+
+        if degraded and nonlocal_cfg["batch"] < MIN_HEALTHY_BATCH:
+            warn = (
+                f"[WARNING] No config fit batch>={MIN_HEALTHY_BATCH}; using batch={nonlocal_cfg['batch']}. "
+                "BatchNorm running stats will be noisier — expect lower quality than a healthy-batch run."
+            )
+            logger.log(warn)
+            print(warn)
+
+        # Stash probe timing for ETA (scale probe fraction → full epoch estimate)
+        if last_probe_elapsed[0] is not None and fraction > 0:
+            nonlocal_cfg["_probe_sec"] = last_probe_elapsed[0]
+            nonlocal_cfg["_probe_fraction"] = fraction
+            nonlocal_cfg["_est_sec_per_epoch"] = last_probe_elapsed[0] / max(fraction, 1e-6)
+
+        warn_object_size_vs_imgsz(logger, ds_fp.get("label_stats") or {}, nonlocal_cfg["imgsz"], native_size)
+        return nonlocal_cfg, final_safe
 
     tried = []
     for model in models:
         for imgsz in imgszs:
             tried.append(f"{model}@{imgsz}px")
-            est0 = calc_batch(hw.get("vram_gb"), model, imgsz, 0.0, profile["gpu"]) if use_gpu else None
-
             if args.batch is not None:
-                probe_batches = [int(args.batch)]
+                healthy = [int(args.batch)]
+                degraded = []
             else:
-                allowed = [b for b in (PREFERRED_AUTO_BATCH, MIN_AUTO_BATCH)
-                           if est0 is None or est0 == 0 or b <= est0]
-                probe_batches = allowed or [MIN_AUTO_BATCH]
+                healthy = list(HEALTHY_BATCH_CANDIDATES)
+                degraded = list(DEGRADED_BATCH_CANDIDATES)
 
-            safe_batch = None
-            for b in probe_batches:
-                _, safe = run_probe(build_chosen(model, imgsz, b, 0, 0.0, 1.0),
-                                    f"{model} @ {imgsz}px batch {b} workers 0 full aug")
-                if safe:
-                    safe_batch = b
+            # Phase A: batch >= floor — lighten aug before leaving this phase.
+            chosen_aug = None
+            for b in healthy:
+                for rung, (mosaic, copy_paste, mixup, multi_scale) in enumerate(ladder):
+                    cfg = make_cfg(model, imgsz, b, 0, mosaic, copy_paste, mixup, multi_scale)
+                    _, safe, _ = run_probe(
+                        cfg,
+                        f"healthy batch {b} aug rung {rung} (mosaic {mosaic}, copy_paste {copy_paste}, "
+                        f"mixup {mixup}, multi_scale {multi_scale})",
+                    )
+                    if safe:
+                        chosen_aug = cfg
+                        break
+                if chosen_aug is not None:
                     break
-            if safe_batch is None:
+
+            degraded_pick = False
+            if chosen_aug is None and degraded:
+                logger.log(
+                    f"[Calibrate] {model}@{imgsz}px: no probe-safe config at batch>={MIN_HEALTHY_BATCH}; "
+                    f"trying degraded batches {degraded}."
+                )
+                for b in degraded:
+                    for rung, (mosaic, copy_paste, mixup, multi_scale) in enumerate(ladder):
+                        cfg = make_cfg(model, imgsz, b, 0, mosaic, copy_paste, mixup, multi_scale)
+                        _, safe, _ = run_probe(
+                            cfg,
+                            f"degraded batch {b} aug rung {rung} (mosaic {mosaic}, copy_paste {copy_paste}, "
+                            f"mixup {mixup}, multi_scale {multi_scale})",
+                        )
+                        if safe:
+                            chosen_aug = cfg
+                            degraded_pick = True
+                            break
+                    if chosen_aug is not None:
+                        break
+
+            if chosen_aug is None:
                 if args.batch is not None and args.force_unsafe:
-                    safe_batch = int(args.batch)
-                    logger.log(f"[Calibrate] --force-unsafe: accepting explicit batch {safe_batch} at {model}@{imgsz}px despite failed probe.")
+                    mosaic, copy_paste, mixup, multi_scale = ladder[-1]
+                    chosen_aug = make_cfg(model, imgsz, int(args.batch), 0, mosaic, copy_paste, mixup, multi_scale)
+                    logger.log(f"[Calibrate] --force-unsafe: accepting explicit batch {args.batch} at {model}@{imgsz}px.")
                 else:
-                    logger.log(f"[Calibrate] {model}@{imgsz}px: no probe-safe batch; trying next candidate.")
+                    logger.log(f"[Calibrate] {model}@{imgsz}px: no probe-safe batch/aug; trying next candidate.")
                     continue
 
-            # Augmentation ladder (probe workers 0 so comparison with the base
-            # batch probe is batch/memory apples-to-apples): attempt the
-            # heaviest rung first; a rung that is unsafe at the current safe
-            # batch is retried at the next-smaller probe batch before the
-            # ladder descends (nbs=64 equalizes effective batch, so batch 4 +
-            # full aug is the higher-quality pick over batch 8 + lighter aug).
-            # The base batch probe already covered rung (1.0, 0.3, 0.15, 0.0),
-            # so that rung resolves from the probe memo.
-            chosen_aug = None
-            for rung, (mosaic, copy_paste, mixup, multi_scale) in enumerate(AUG_LADDER):
-                rung_cfg = None
-                for b in [safe_batch] + [b for b in probe_batches if b < safe_batch]:
-                    _, aug_safe = run_probe(
-                        build_chosen(model, imgsz, b, 0, multi_scale, mosaic,
-                                     mixup=mixup, copy_paste=copy_paste),
-                        f"aug ladder rung {rung} (mosaic {mosaic}, copy_paste {copy_paste}, mixup {mixup}, multi_scale {multi_scale}) at batch {b}",
-                    )
-                    if aug_safe:
-                        rung_cfg = build_chosen(model, imgsz, b, 0, multi_scale, mosaic,
-                                                mixup=mixup, copy_paste=copy_paste)
-                        break
-                if rung_cfg is not None:
-                    if rung_cfg["batch"] != safe_batch:
-                        logger.log(f"[Calibrate] heaviest probe-safe augmentation kept at smaller batch {rung_cfg['batch']} instead of a lighter rung at batch {safe_batch} (quality-first, effective batch held by nbs=64).")
-                    safe_batch = rung_cfg["batch"]
-                    chosen_aug = rung_cfg
-                    break
-            if chosen_aug is None:
-                logger.log(f"[Calibrate] {model}@{imgsz}px batch {safe_batch}: no probe-safe augmentation rung; trying next candidate.")
-                continue
-
-            # Final verification probe with the REAL dataloader worker count
-            # (dataloader subprocesses count toward measured CPU RSS).
-            chosen_cfg = None
-            final_probe_safe = False
-            if args.workers is not None:
-                cfg = build_chosen(model, imgsz, safe_batch, base_workers,
-                                   chosen_aug["multi_scale"], chosen_aug["mosaic"],
-                                   mixup=chosen_aug["mixup"], copy_paste=chosen_aug["copy_paste"])
-                _, safe = run_probe(cfg, f"final verify: workers {base_workers} (explicit)")
-                if safe:
-                    chosen_cfg = cfg
-                    final_probe_safe = True
-                elif args.force_unsafe:
-                    logger.log("[Calibrate] --force-unsafe: accepting explicit workers despite UNSAFE final verification probe (this config is NOT recorded as measured-safe).")
-                    chosen_cfg = cfg
-                else:
-                    raise CalibrateFail(
-                        f"Explicit --workers {base_workers} is unsafe on the final verification probe. "
-                        "Lower --workers or pass --force-unsafe."
-                    )
-            else:
-                for w in sorted({base_workers, 2, 0}, reverse=True):
-                    if w > base_workers:
-                        continue
-                    cfg = build_chosen(model, imgsz, safe_batch, w,
-                                       chosen_aug["multi_scale"], chosen_aug["mosaic"],
-                                       mixup=chosen_aug["mixup"], copy_paste=chosen_aug["copy_paste"])
-                    _, safe = run_probe(cfg, f"final verify: workers {w}")
-                    if safe:
-                        chosen_cfg = cfg
-                        final_probe_safe = True
-                        break
+            chosen_cfg, final_probe_safe = finalize_with_workers(
+                model, imgsz, chosen_aug, degraded=degraded_pick or chosen_aug["batch"] < MIN_HEALTHY_BATCH
+            )
             if chosen_cfg is None:
-                logger.log(f"[Calibrate] {model}@{imgsz}px batch {safe_batch}: dataloader workers unsafe at every level; trying next candidate.")
+                logger.log(f"[Calibrate] {model}@{imgsz}px: dataloader workers unsafe at every level; trying next candidate.")
                 continue
 
-            key = config_signature(**chosen_cfg)
-            peaks = probe_memo[key][0]
-            record_calibration(cache, logger, hw_fp, ds_fp, sel_key, chosen_cfg, peaks, safe=final_probe_safe, measured=True, make_selection=final_probe_safe)
+            key = config_signature(**{k: v for k, v in chosen_cfg.items() if not str(k).startswith("_")})
+            peaks = probe_memo.get(key, ((None, None, None), final_probe_safe, None))[0]
+            record_calibration(
+                cache, logger, hw_fp, ds_fp, sel_key,
+                {k: v for k, v in chosen_cfg.items() if not str(k).startswith("_")},
+                peaks, safe=final_probe_safe, measured=True, make_selection=final_probe_safe,
+            )
             if not final_probe_safe:
                 logger.log(f"[Calibrate] SELECTED --force-unsafe config (final verification probe UNSAFE): {key}")
                 print(f"[Calibration] Force-unsafe config: {chosen_cfg['model']} @ {chosen_cfg['imgsz']}px batch {chosen_cfg['batch']} workers {chosen_cfg['workers']} multi_scale {chosen_cfg['multi_scale']} mosaic {chosen_cfg['mosaic']}")
@@ -2355,7 +2870,8 @@ def calibrate_training_config(args, logger, cache, hw_fp, hw, device, data_yaml,
         imgsz0 = int(args.imgsz) if args.imgsz is not None else imgszs[0]
         batch0 = int(args.batch) if args.batch is not None else MIN_AUTO_BATCH
         workers0 = int(args.workers) if args.workers is not None else 0
-        chosen = build_chosen(model0, imgsz0, batch0, workers0, 0.0, 1.0)
+        mosaic, copy_paste, mixup, multi_scale = ladder[-1]
+        chosen = make_cfg(model0, imgsz0, batch0, workers0, mosaic, copy_paste, mixup, 0.0)
         logger.log("[Calibrate] --force-unsafe: NO probe-safe config found; proceeding with an explicitly UNSAFE config anyway.")
         record_calibration(cache, logger, hw_fp, ds_fp, sel_key, chosen, (None, None, None), safe=False, measured=False, make_selection=True)
         return chosen, "force-unsafe"
@@ -2432,6 +2948,26 @@ def parse_args():
     parser.add_argument(
         "--patience", type=int, default=100,
         help="Early stopping patience in epochs (default: 100)",
+    )
+    parser.add_argument(
+        "--degrees", type=float, default=0.0,
+        help="Random rotation degrees (+/-). Default 0 (opt-in; was previously hardcoded 180).",
+    )
+    parser.add_argument(
+        "--flipud", type=float, default=0.0,
+        help="Vertical flip probability. Default 0.0 (opt-in; was previously hardcoded 0.5).",
+    )
+    parser.add_argument(
+        "--mixup", type=float, default=None,
+        help="Mixup probability. Default: 0.0 for detect/pose; segment ladder may use 0.15 at the top rung.",
+    )
+    parser.add_argument(
+        "--time-budget", type=float, default=None,
+        help="Max training wall-clock hours (passed as Ultralytics time=). Early stop / patience may end sooner.",
+    )
+    parser.add_argument(
+        "--skip-pilot", action="store_true",
+        help="Skip the short pre-flight learnability pilot and start the long run after calibration.",
     )
     parser.add_argument(
         "--memory-profile", choices=["safe", "balanced", "aggressive"], default="safe",
@@ -4410,8 +4946,8 @@ def log_resume_checkpoint_info(logger, last_pt: Path):
 def chosen_augmentation(chosen: dict) -> dict:
     """Full Ultralytics augmentation kwargs built from a calibrated selection."""
     aug = {
-        "degrees": chosen.get("degrees", 180),
-        "flipud": chosen.get("flipud", 0.5),
+        "degrees": chosen.get("degrees", 0.0),
+        "flipud": chosen.get("flipud", 0.0),
         "copy_paste": chosen["copy_paste"],
         "mixup": chosen["mixup"],
         "mosaic": chosen["mosaic"],
@@ -4420,36 +4956,102 @@ def chosen_augmentation(chosen: dict) -> dict:
         "cos_lr": chosen.get("cos_lr", True),
         "nbs": chosen.get("nbs", 64),
     }
+    if chosen.get("cache"):
+        aug["cache"] = chosen["cache"]
     return aug
+
+
+def explain_augmentation(task: str, aug: dict) -> str:
+    """One-line why each aug knob is on/off."""
+    bits = [
+        f"degrees={aug['degrees']} ({'opt-in' if aug['degrees'] else 'off — no random rotation'})",
+        f"flipud={aug['flipud']} ({'opt-in' if aug['flipud'] else 'off — no vertical flip'})",
+    ]
+    if task == "segment":
+        bits.append(f"copy_paste={aug['copy_paste']} (segment: pastes polygons when >0)")
+    else:
+        bits.append(f"copy_paste={aug['copy_paste']} (off for {task}: CopyPaste is a no-op without polygons)")
+    bits.append(f"mixup={aug['mixup']} ({'on' if aug['mixup'] else 'off'})")
+    bits.append(f"mosaic={aug['mosaic']} ({'on' if aug['mosaic'] else 'off'})")
+    bits.append(f"multi_scale={aug['multi_scale']} ({'on' if aug['multi_scale'] else 'off'})")
+    return "; ".join(bits)
+
+
+def format_duration(seconds) -> str:
+    if seconds is None:
+        return "unknown"
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
 
 def print_auto_config(logger, chosen, provenance, args, hw, ds_fp, device):
     aug = chosen_augmentation(chosen)
+    task = ds_fp.get("task") or getattr(args, "dataset_task", "detect")
 
     logger.log("[Hardware Detected]")
     logger.log(f"  GPU        : {hw['gpu_name']}")
     logger.log(f"  VRAM       : {hw['vram_gb']:.1f} GB" if hw['vram_gb'] else "  VRAM       : N/A (CPU)")
     logger.log(f"  CPU cores  : {hw['cpu_cores']}")
     logger.log(f"  RAM        : {hw['ram_gb']:.1f} GB" if hw['ram_gb'] else "  RAM        : Unknown")
+    alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    logger.log(f"  CUDA alloc : PYTORCH_CUDA_ALLOC_CONF={alloc_conf or '(unset)'}")
 
     logger.log(f"\n[Dataset]")
     logger.log(f"  train imgs : {ds_fp.get('image_count')}")
+    logger.log(f"  task       : {task}")
     native = ds_fp.get("median_img_size")
     logger.log(f"  native res : {native}px" if native else "  native res : unknown")
+    ls = ds_fp.get("label_stats") or {}
+    if ls:
+        logger.log(
+            f"  label stats: median box {ls.get('median_box_w')}x{ls.get('median_box_h')} "
+            f"(frac), p25 {ls.get('p25_box_w')}x{ls.get('p25_box_h')}, "
+            f"boxes/img {ls.get('boxes_per_image')}, empty {ls.get('empty_label_fraction')}"
+        )
+    if ds_fp.get("val_label_stats"):
+        warn_train_val_label_stats(logger, ls, ds_fp["val_label_stats"])
 
-    logger.log("\n[Selection policy] quality-first (largest model / heaviest safe aug); speed not prioritized")
-    logger.log("  downgrades and step-ups happen only on measured probe/adaptive signals (see [Calibrate]/[Adaptive] lines)")
+    logger.log(
+        f"\n[Selection policy] quality-v2: largest model that fits a healthy batch "
+        f"(>={MIN_HEALTHY_BATCH}), task-aware aug, object-resolving imgsz"
+    )
+    logger.log(
+        "  lighten multi_scale/mosaic before dropping below the healthy batch floor; "
+        "downgrades/step-ups only on measured probe/adaptive signals"
+    )
 
     logger.log(f"\n[Selected Config] (source: {provenance})")
     logger.log(f"  model      : {chosen['model']}")
     logger.log(f"  imgsz      : {chosen['imgsz']}px")
     logger.log(f"  batch      : {chosen['batch']}")
+    if chosen["batch"] < MIN_HEALTHY_BATCH:
+        logger.log(f"  WARNING    : batch < {MIN_HEALTHY_BATCH} — BatchNorm quality may be degraded")
     if chosen["batch"] < 64:
         effective = chosen["batch"] * ((64 + chosen["batch"] - 1) // chosen["batch"])
-        logger.log(f"  effective batch : {effective}  (nbs=64 gradient accumulation)")
+        logger.log(
+            f"  effective batch : {effective}  "
+            "(nbs=64 gradient accumulation; does not fix small-batch BN noise)"
+        )
     logger.log(f"  workers    : {chosen['workers']}")
+    if chosen.get("cache"):
+        logger.log(f"  cache      : {chosen['cache']}")
     if args.batch is not None or args.workers is not None or provenance == "force-unsafe":
         logger.log("  NOTE: config was pinned/forced by user flags; dynamic safety may have been overridden (--force-unsafe).")
+
+    est = chosen.get("_est_sec_per_epoch")
+    epochs = int(getattr(args, "epochs", 600) or 600)
+    if est:
+        logger.log(f"\n[Schedule ETA] ~{format_duration(est)}/epoch (from final probe, scaled by fraction)")
+        logger.log(f"  full schedule ({epochs} epochs): ~{format_duration(est * epochs)}")
+        logger.log("  note: patience / --time-budget can end sooner — ETA is a schedule ceiling, not a promise")
+        if getattr(args, "time_budget", None):
+            logger.log(f"  time budget : {args.time_budget} hours (Ultralytics time=)")
 
     logger.log(f"\n[Augmentation Config]")
     logger.log(f"  degrees      : {aug['degrees']}")
@@ -4457,10 +5059,11 @@ def print_auto_config(logger, chosen, provenance, args, hw, ds_fp, device):
     logger.log(f"  copy_paste   : {aug['copy_paste']}")
     logger.log(f"  mixup        : {aug['mixup']}")
     logger.log(f"  mosaic       : {aug['mosaic']}")
-    ms_status = "(enabled)" if aug["multi_scale"] > 0 else "(disabled - memory probe/static said unsafe)"
+    ms_status = "(enabled)" if aug["multi_scale"] > 0 else "(disabled)"
     logger.log(f"  multi_scale  : {aug['multi_scale']}  {ms_status}")
     logger.log(f"  close_mosaic : {aug['close_mosaic']}")
     logger.log(f"  cos_lr       : {aug['cos_lr']}")
+    logger.log(f"  why          : {explain_augmentation(task, aug)}")
 
 
 # -- Resume calibration ----------------------------------------------------------
@@ -4520,13 +5123,21 @@ def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run
         mosaic = float(mosaic)
     except Exception:
         mosaic = 1.0
-    mixup = ckpt_cfg.get("mixup", 0.15)
-    copy_paste = ckpt_cfg.get("copy_paste", 0.3)
+    mixup = ckpt_cfg.get("mixup", 0.0)
+    copy_paste = ckpt_cfg.get("copy_paste", 0.0)
     try:
         mixup = float(mixup)
         copy_paste = float(copy_paste)
     except Exception:
-        mixup, copy_paste = 0.15, 0.3
+        mixup, copy_paste = 0.0, 0.0
+    try:
+        degrees = float(ckpt_cfg.get("degrees", 0.0) or 0.0)
+    except Exception:
+        degrees = 0.0
+    try:
+        flipud = float(ckpt_cfg.get("flipud", 0.0) or 0.0)
+    except Exception:
+        flipud = 0.0
 
     # unsafe reasons from original ckpt config (pre-probe flags; multi_scale is
     # probe-verified below instead of being zeroed unconditionally)
@@ -4537,13 +5148,15 @@ def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run
     if unsafe_reasons:
         logger.log("[RESUME CALIBRATE] original checkpoint config flagged for verification: " + "; ".join(unsafe_reasons))
 
+    # Resume keeps the checkpoint's own augmentation (including degrees/flipud).
     chosen = build_chosen(model_name, imgsz, batch, workers, multi_scale, mosaic,
-                          mixup=mixup, copy_paste=copy_paste)
+                          mixup=mixup, copy_paste=copy_paste, degrees=degrees, flipud=flipud,
+                          cache=ckpt_cfg.get("cache", False))
 
     # cache lookup for resume selections
     cache_key = "resume_selections"
     pid = fingerprint_hash(hw_fp)
-    ds_key = f"{fingerprint_hash(ds_fp)}|intent:quality-v1"
+    ds_key = f"{fingerprint_hash(ds_fp)}|intent:{SELECTION_INTENT}"
     profile = cache.get("hardware_profiles", {}).get(pid) if cache.get("hardware_profiles") else None
     rsel = None
     if profile:
@@ -4667,19 +5280,36 @@ def calibrate_resume_config(args, logger, cache, hw, hw_fp, ds_fp, ckpt_cfg, run
     return chosen, provenance
 
 
-def aug_step_up_candidate(cfg: dict):
+def aug_step_up_candidate(cfg: dict, task: str = "detect"):
     """
-    Next-heavier AUG_LADDER rung for cfg's augmentation combo, or None when the
-    combo is already the heaviest rung or is off-ladder (e.g. a checkpoint's
-    custom aug values — no defined heavier target).
+    Next-heavier task aug ladder rung for cfg's augmentation combo, or None when
+    already heaviest or off-ladder (e.g. a checkpoint's custom aug values).
+    Never changes the model.
     """
+    ladder = aug_ladder_for_task(task)
     cur = (cfg["mosaic"], cfg["copy_paste"], cfg["mixup"], cfg["multi_scale"])
     cur_r = (round(cur[0], 2), round(cur[1], 2), round(cur[2], 2), round(cur[3], 2))
-    for i, t in enumerate(AUG_LADDER):
+    for i, t in enumerate(ladder):
         if (round(t[0], 2), round(t[1], 2), round(t[2], 2), round(t[3], 2)) == cur_r:
             if i == 0:
                 return None
-            t = AUG_LADDER[i - 1]
+            t = ladder[i - 1]
+            new = dict(cfg)
+            new["mosaic"], new["copy_paste"], new["mixup"], new["multi_scale"] = t
+            return new
+    return None
+
+
+def aug_step_down_candidate(cfg: dict, task: str = "detect"):
+    """Next-lighter task aug ladder rung, or None if already lightest / off-ladder."""
+    ladder = aug_ladder_for_task(task)
+    cur = (cfg["mosaic"], cfg["copy_paste"], cfg["mixup"], cfg["multi_scale"])
+    cur_r = (round(cur[0], 2), round(cur[1], 2), round(cur[2], 2), round(cur[3], 2))
+    for i, t in enumerate(ladder):
+        if (round(t[0], 2), round(t[1], 2), round(t[2], 2), round(t[3], 2)) == cur_r:
+            if i + 1 >= len(ladder):
+                return None
+            t = ladder[i + 1]
             new = dict(cfg)
             new["mosaic"], new["copy_paste"], new["mixup"], new["multi_scale"] = t
             return new
@@ -4730,6 +5360,10 @@ def run_attempt(args, logger, run_dir, last_pt, chosen, target_epochs, device, g
                 opt_name = "AdamW"
         except Exception:
             opt_name = "MuSGD"
+    # Optimizer / lr pins match Ultralytics optimizer=auto for large iteration
+    # counts (MuSGD, lr0=0.01, momentum=0.9, warmup_bias_lr=0.0). Kept for
+    # reproducibility across adaptive resume attempts — see ultralytics
+    # engine/trainer.py build_optimizer auto path.
     forced_args = {
         "imgsz": int(chosen["imgsz"]),
         "batch": int(chosen["batch"]),
@@ -4738,6 +5372,8 @@ def run_attempt(args, logger, run_dir, last_pt, chosen, target_epochs, device, g
         "mosaic": float(chosen["mosaic"]),
         "mixup": float(chosen["mixup"]),
         "copy_paste": float(chosen["copy_paste"]),
+        "degrees": float(chosen.get("degrees", 0.0)),
+        "flipud": float(chosen.get("flipud", 0.0)),
         "data": str(yaml_path) if yaml_path is not None else (ckpt_cfg.get("data") if isinstance(ckpt_cfg, dict) else None),
         "device": device,
         "epochs": int(target_epochs),
@@ -4748,6 +5384,10 @@ def run_attempt(args, logger, run_dir, last_pt, chosen, target_epochs, device, g
         "momentum": 0.9,
         "warmup_bias_lr": 0.0,
     }
+    if chosen.get("cache"):
+        forced_args["cache"] = chosen["cache"]
+    if getattr(args, "time_budget", None):
+        forced_args["time"] = float(args.time_budget)
     # remove None data
     if forced_args.get("data") is None:
         forced_args.pop("data", None)
@@ -4756,6 +5396,7 @@ def run_attempt(args, logger, run_dir, last_pt, chosen, target_epochs, device, g
         logger=logger, guard=guard, run_dir=run_dir, target_epochs=target_epochs,
         intended_cfg=dict(chosen), state=state,
         on_emergency=None, on_adaptive=None, on_complete=None, on_crash=None,
+        patience=int(getattr(args, "patience", 100) or 100),
     )
 
     # Every attempt targets the full schedule. Mid-run stops (adaptive pressure,
@@ -4812,11 +5453,15 @@ def run_attempt(args, logger, run_dir, last_pt, chosen, target_epochs, device, g
             train_kwargs["plots"] = True
             train_kwargs["verbose"] = True
             train_kwargs.update(chosen_augmentation(chosen))
+            if getattr(args, "time_budget", None):
+                train_kwargs["time"] = float(args.time_budget)
 
         if resume_pt is not None:
             # Resume extends from the checkpoint epoch to the full target schedule;
             # guarded forced_args pin args.epochs to the same value after check_resume.
             train_kwargs["epochs"] = int(target_epochs)
+            if getattr(args, "time_budget", None):
+                train_kwargs["time"] = float(args.time_budget)
 
         # Inject trainer class via model.train(trainer=...)
         # callbacks attach via model.add_callback; trainer class passed separately below
@@ -4934,53 +5579,56 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
     state.setdefault("stable_epochs", 0)
     state.setdefault("downgrade_count", 0)
     state.setdefault("history", [])
-    # downgrade ladder helpers
+    task = getattr(args, "dataset_task", None) or (ckpt_cfg.get("task") if isinstance(ckpt_cfg, dict) else None) or "detect"
+
     def downgrade_config(cfg):
-        # returns new cfg or None if no more
-        # try batch down first
-        b = cfg["batch"]
-        if b in BATCH_LADDER_DOWN:
-            idx = BATCH_LADDER_DOWN.index(b)
-            if idx + 1 < len(BATCH_LADDER_DOWN):
-                new = dict(cfg)
-                new["batch"] = BATCH_LADDER_DOWN[idx + 1]
-                return new, "batch"
-        # aug ladder
-        cur = (cfg["mosaic"], cfg["copy_paste"], cfg["mixup"], cfg["multi_scale"])
-        # find current index
-        ai = None
-        for i, t in enumerate(AUG_LADDER):
-            if (round(t[0],2), round(t[1],2), round(t[2],2), round(t[3],2)) == (round(cur[0],2), round(cur[1],2), round(cur[2],2), round(cur[3],2)):
-                ai = i
-                break
-        if ai is None:
-            # find nearest by mosaic
-            ai = 0
-        if ai + 1 < len(AUG_LADDER):
-            t = AUG_LADDER[ai + 1]
+        """
+        Quality-v2 runtime downgrade (never changes model):
+          multi_scale -> 0, then batch down to healthy floor, then imgsz, then workers,
+          then lighter mosaic/mixup rung, and only last batch below the floor.
+        """
+        # 1. multi_scale -> 0
+        if float(cfg.get("multi_scale", 0.0) or 0.0) > 0.0:
             new = dict(cfg)
-            new["mosaic"], new["copy_paste"], new["mixup"], new["multi_scale"] = t
-            return new, "aug"
-        # imgsz down
-        native = None
-        try:
-            if yaml_path:
-                pass
-        except Exception:
-            pass
-        # use standard list
+            new["multi_scale"] = 0.0
+            return new, "multi_scale"
+        # 2. batch down while staying >= MIN_HEALTHY_BATCH
+        b = int(cfg["batch"])
+        healthy_lower = [x for x in BATCH_LADDER_DOWN if MIN_HEALTHY_BATCH <= x < b]
+        if healthy_lower:
+            new = dict(cfg)
+            new["batch"] = max(healthy_lower)
+            logger.log(f"[Adaptive] BATCH CHANGE (downgrade toward floor): {b} -> {new['batch']}")
+            return new, "batch"
+        # 3. imgsz down
         cands = [s for s in STANDARD_IMGSZ if s < cfg["imgsz"]]
         if cands:
             new = dict(cfg)
             new["imgsz"] = max(cands)
             return new, "imgsz"
-        # workers down
+        # 4. workers down
         if cfg["workers"] > 0:
             new = dict(cfg)
             new["workers"] = max(0, cfg["workers"] // 2)
             if new["workers"] == cfg["workers"]:
                 new["workers"] = 0
             return new, "workers"
+        # 5. lighter aug rung (mosaic/mixup/copy_paste) before unhealthy batch
+        lighter = aug_step_down_candidate(cfg, task=task)
+        if lighter is not None:
+            return lighter, "aug"
+        # 6. batch below the healthy floor
+        below = [x for x in BATCH_LADDER_DOWN if x < b]
+        if below:
+            new = dict(cfg)
+            new["batch"] = max(below)
+            warn = (
+                f"[WARNING] BATCH CHANGE below healthy floor {MIN_HEALTHY_BATCH}: "
+                f"{b} -> {new['batch']} (BatchNorm quality degraded)"
+            )
+            logger.log(warn)
+            print(warn)
+            return new, "batch-below-floor"
         return None, None
 
     probe_cache = {}
@@ -4991,7 +5639,7 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
         try:
             pm = str(probe_model or "")
             if Path(pm).name.lower() in ("last.pt", "best.pt") or "weights" in pm.lower().replace("/", "\\"):
-                probe_model = _infer_resume_architecture_model(run_dir, ckpt_cfg, task=ds_fp.get("task", "detect"))
+                probe_model = _infer_resume_architecture_model(run_dir, ckpt_cfg, task=task)
         except Exception:
             pass
         if getattr(args, "no_memory_probe", False):
@@ -5002,7 +5650,8 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
         if not use_gpu:
             logger.log(f"[Probe] non-GPU device '{dev}'; skipping probe for {probe_model}.")
             return True
-        sig = config_signature(**cfg)
+        sig_cfg = {k: v for k, v in cfg.items() if not str(k).startswith("_")}
+        sig = config_signature(**sig_cfg)
         if sig in probe_cache:
             verdict = probe_cache[sig]
             logger.log(f"[Probe] reusing measured verdict for {probe_model} @ {cfg.get('imgsz')}px batch {cfg.get('batch')} (no new probe run).")
@@ -5025,14 +5674,16 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
             peaks = probe_train_once(
                 probe_model, dev, yaml_path, cfg["imgsz"], cfg["batch"], cfg["multi_scale"],
                 cfg["mosaic"], cfg["mixup"], cfg["copy_paste"], fraction, cuda_index, workers=cfg["workers"],
+                degrees=cfg.get("degrees", 0.0), flipud=cfg.get("flipud", 0.0),
+                cache=cfg.get("cache", False),
             )
-            # evaluate against profile caps
+            # evaluate against profile caps — SAFE is a memory estimate only
             profile = GUARD_PROFILE_CAPS.get(args.memory_profile, GUARD_PROFILE_CAPS["safe"])
             vram = hw.get("vram_gb") or 0.0
             ram = hw.get("ram_gb") or 0.0
             gpu_cap = vram * profile["gpu"]
             cpu_cap = ram * profile["cpu"]
-            alloc, res, rss = peaks
+            alloc, res, rss = peaks[0], peaks[1], peaks[2]
             if res is not None and res > gpu_cap:
                 logger.log(f"[Probe] UNSAFE {probe_model}: reserved {res:.2f} GB > cap {gpu_cap:.2f} GB")
                 probe_cache[sig] = False
@@ -5043,7 +5694,7 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
                 return False
             logger.log(
                 f"[Probe] SAFE {probe_model}: alloc={alloc} reserved={res} rss={rss} "
-                f"(caps gpu={gpu_cap:.2f} cpu={cpu_cap:.2f})"
+                f"(caps gpu={gpu_cap:.2f} cpu={cpu_cap:.2f}; memory estimate only, not convergence)"
             )
             probe_cache[sig] = True
             return True
@@ -5190,23 +5841,45 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
                 if not step_up_probing_ok:
                     logger.log("[Adaptive] step-up skipped: probing unavailable (CPU device or --no-memory-probe); step-ups require measured probe verdicts.")
                 else:
-                    # Quality-first step-up: batch first, then climb one rung up the
-                    # AUG_LADDER (mosaic 0.5->1.0, ms 0->0.5 etc.); every candidate
-                    # must pass probe_config_safe before it is adopted.
+                    # Quality-v2 step-up = reverse of downgrade: batch toward floor,
+                    # workers, imgsz, batch above floor, then heavier aug / multi_scale.
+                    # Never changes model. Every candidate must pass probe_config_safe.
                     stepped = False
-                    if current_cfg["batch"] < 8:
-                        new_batch = next((b for b in (1, 2, 4, 8) if b > current_cfg["batch"]), None)
-                        if new_batch is not None:
+                    b = int(current_cfg["batch"])
+                    # batch up toward / past the healthy floor
+                    next_batches = [x for x in BATCH_LADDER_UP if x > b]
+                    if next_batches:
+                        new_batch = next_batches[0]
+                        cand = dict(current_cfg)
+                        cand["batch"] = new_batch
+                        if probe_config_safe(cand):
+                            logger.log(f"[Adaptive] BATCH CHANGE (step-up): {b} -> {new_batch}")
+                            state.setdefault("history", []).append({
+                                "event": "batch-step-up", "from": b, "to": new_batch,
+                                "epoch": state.get("completed_epoch"),
+                            })
+                            current_cfg = cand
+                            stepped = True
+                        else:
+                            logger.log(f"[Adaptive] batch step-up to {new_batch} probe-rejected.")
+                    if not stepped and current_cfg.get("workers", 0) < 8:
+                        cand = dict(current_cfg)
+                        cand["workers"] = min(8, max(2, current_cfg["workers"] * 2 or 2))
+                        if cand["workers"] != current_cfg["workers"] and probe_config_safe(cand):
+                            logger.log(f"[Adaptive] step-up approved (workers): {current_cfg['workers']} -> {cand['workers']}")
+                            current_cfg = cand
+                            stepped = True
+                    if not stepped:
+                        higher = [s for s in STANDARD_IMGSZ if s > current_cfg["imgsz"]]
+                        if higher:
                             cand = dict(current_cfg)
-                            cand["batch"] = new_batch
+                            cand["imgsz"] = min(higher)
                             if probe_config_safe(cand):
-                                logger.log(f"[Adaptive] step-up approved (batch): {current_cfg['batch']} -> {new_batch}")
+                                logger.log(f"[Adaptive] step-up approved (imgsz): {current_cfg['imgsz']} -> {cand['imgsz']}")
                                 current_cfg = cand
                                 stepped = True
-                            else:
-                                logger.log(f"[Adaptive] batch step-up to {new_batch} probe-rejected; trying augmentation step-up.")
                     if not stepped:
-                        cand = aug_step_up_candidate(current_cfg)
+                        cand = aug_step_up_candidate(current_cfg, task=task)
                         if cand is not None and probe_config_safe(cand):
                             cur_a = (current_cfg['mosaic'], current_cfg['copy_paste'], current_cfg['mixup'], current_cfg['multi_scale'])
                             new_a = (cand['mosaic'], cand['copy_paste'], cand['mixup'], cand['multi_scale'])
@@ -5237,6 +5910,15 @@ def run_adaptive_supervisor(args, logger, run_dir, run_name, last_pt, chosen, ta
                 current_cfg, reason = res
                 state["downgrade_count"] = state.get("downgrade_count", 0) + 1
                 state["provisional"] = True
+                state.setdefault("history", []).append({
+                    "event": "adaptive-downgrade", "reason": reason,
+                    "config": {k: current_cfg.get(k) for k in (
+                        "model", "imgsz", "batch", "workers", "multi_scale", "mosaic", "mixup", "copy_paste",
+                    )},
+                    "completed_epoch": state.get("completed_epoch"),
+                })
+                if reason and "batch" in str(reason):
+                    logger.log(f"[Adaptive] BATCH CHANGE recorded in state history ({reason}).")
                 # resume_pending stays True: the hidden checkpoint is the continuation
                 # point for the next (downgraded) attempt.
                 write_adaptive_state(run_dir, state)
@@ -5585,6 +6267,176 @@ def resolve_train_device(args, logger=None):
     return device
 
 
+def _write_subset_list(image_paths, out_file: Path):
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    out_file.write_text("\n".join(str(p) for p in image_paths) + ("\n" if image_paths else ""), encoding="utf-8")
+
+
+def build_pilot_dataset(yaml_path: Path, run_dir: Path, logger, train_n=PILOT_TRAIN_IMAGES, val_n=PILOT_VAL_IMAGES):
+    """
+    Build a temporary pilot data.yaml under <run>/.pilot/ pointing at image-list
+    subsets. Does not touch the real run's weights/.
+    """
+    pilot_dir = Path(run_dir) / PILOT_DIRNAME
+    if pilot_dir.exists():
+        shutil.rmtree(pilot_dir, ignore_errors=True)
+    pilot_dir.mkdir(parents=True, exist_ok=True)
+    data = yaml.safe_load(Path(yaml_path).read_text(encoding="utf-8")) or {}
+    train_images = resolve_yaml_split_path(yaml_path, str(data["train"]))
+    val_key = data.get("val") or data["train"]
+    val_images = resolve_yaml_split_path(yaml_path, str(val_key))
+    train_files = image_files(train_images)
+    val_files = image_files(val_images) if val_images else []
+    if len(train_files) > train_n:
+        step = len(train_files) / float(train_n)
+        train_files = [train_files[int(i * step)] for i in range(train_n)]
+    if val_files and len(val_files) > val_n:
+        step = len(val_files) / float(val_n)
+        val_files = [val_files[int(i * step)] for i in range(val_n)]
+    elif not val_files:
+        val_files = train_files[: max(1, min(val_n, len(train_files)))]
+    train_list = pilot_dir / "train.txt"
+    val_list = pilot_dir / "val.txt"
+    _write_subset_list(train_files, train_list)
+    _write_subset_list(val_files, val_list)
+    pilot_yaml = {
+        "path": str(pilot_dir.resolve()),
+        "train": str(train_list.resolve()),
+        "val": str(val_list.resolve()),
+        "nc": data.get("nc"),
+        "names": data.get("names"),
+    }
+    if data.get("kpt_shape") is not None:
+        pilot_yaml["kpt_shape"] = data["kpt_shape"]
+    if data.get("flip_idx") is not None:
+        pilot_yaml["flip_idx"] = data["flip_idx"]
+    out_yaml = pilot_dir / "data.yaml"
+    with open(out_yaml, "w", encoding="utf-8") as f:
+        yaml.safe_dump(pilot_yaml, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    logger.log(f"[Pilot] subset dataset: {len(train_files)} train / {len(val_files)} val -> {out_yaml}")
+    return out_yaml, pilot_dir
+
+
+def pilot_trend_ok(history: list) -> bool:
+    """Train loss decreasing AND check-set score rising from the first epoch."""
+    if len(history) < 2:
+        return True  # too short to fail
+    losses = [h["loss"] for h in history if h.get("loss") is not None]
+    scores = [h["score"] for h in history if h.get("score") is not None]
+    if len(losses) < 2 or len(scores) < 2:
+        return True
+    loss_down = losses[-1] < losses[0] - 1e-6
+    score_up = scores[-1] > scores[0] + 1e-4
+    return bool(loss_down and score_up)
+
+
+def run_preflight_pilot(args, logger, run_dir, chosen, yaml_path, device, hw, guard, ds_fp):
+    """
+    Short learnability check using the chosen model/aug on a subset.
+    Uses MemoryGuard; artifacts stay under <run>/.pilot/ (never weights/).
+    Returns (ok: bool, sample_grid_path or None, diagnostics: str).
+    """
+    if getattr(args, "skip_pilot", False):
+        logger.log("[Pilot] skipped (--skip-pilot).")
+        return True, None, "skipped"
+    pilot_yaml, pilot_dir = build_pilot_dataset(yaml_path, run_dir, logger)
+    pilot_project = pilot_dir / "runs"
+    pilot_name = "pilot"
+    epochs = min(PILOT_EPOCHS, max(3, int(getattr(args, "epochs", 5) or 5)))
+    if int(getattr(args, "epochs", 600) or 600) < 3:
+        epochs = max(1, int(args.epochs))
+    logger.log(f"[Pilot] starting {epochs}-epoch learnability check with {chosen['model']} "
+               f"@ {chosen['imgsz']}px batch {chosen['batch']}")
+    print(f"[Pilot] Running a short learnability check ({epochs} epochs on a ~{PILOT_TRAIN_IMAGES}-image subset)...")
+    history = []
+    sample_grid = None
+    try:
+        weights = resolve_pretrained_weights(chosen["model"])
+        model = YOLO(str(weights))
+        # Lightweight metric capture via callback
+        state = {"t0": None}
+
+        def on_fit_end(trainer):
+            ep = getattr(trainer, "epoch", 0)
+            loss = _metric_from_trainer(trainer, "train/box_loss", "train/loss", "loss")
+            score = _metric_from_trainer(
+                trainer, "metrics/mAP50(B)", "metrics/mAP50(M)", "metrics/mAP50", "mAP50",
+            )
+            history.append({"epoch": int(ep) + 1, "loss": loss, "score": score})
+            logger.log(f"[Pilot] epoch {int(ep)+1}: loss={loss} score={score}")
+
+        model.add_callback("on_fit_epoch_end", on_fit_end)
+        if guard is not None:
+            try:
+                guard.start()
+            except Exception:
+                pass
+        aug = chosen_augmentation(chosen)
+        model.train(
+            data=str(pilot_yaml),
+            epochs=epochs,
+            imgsz=int(chosen["imgsz"]),
+            batch=int(chosen["batch"]),
+            workers=int(chosen["workers"]),
+            device=device,
+            project=str(pilot_project),
+            name=pilot_name,
+            exist_ok=True,
+            save=True,
+            plots=True,
+            verbose=False,
+            patience=epochs,
+            **aug,
+        )
+    except Exception as e:
+        logger.log(f"[Pilot] failed: {_short(str(e))}")
+        print(f"[Pilot] WARNING: pilot failed ({e}); continuing to full run (use diagnostics if training looks stuck).")
+        return True, None, f"pilot-error: {e}"
+    finally:
+        if guard is not None:
+            try:
+                guard.stop()
+            except Exception:
+                pass
+
+    # Find sample batch grid if Ultralytics wrote one
+    for candidate in (
+        pilot_project / pilot_name / "train_batch0.jpg",
+        pilot_project / pilot_name / "train_batch1.jpg",
+        pilot_project / pilot_name / "val_batch0_labels.jpg",
+    ):
+        if candidate.is_file():
+            sample_grid = candidate
+            break
+    if sample_grid:
+        logger.log(f"[Pilot] sample grid: {sample_grid}")
+        print(f"[Pilot] Augmented sample grid: {sample_grid}")
+
+    # Remove pilot weights so they cannot be mistaken for the real run
+    for wdir in (pilot_project / pilot_name / "weights",):
+        if wdir.is_dir():
+            shutil.rmtree(wdir, ignore_errors=True)
+
+    ok = pilot_trend_ok(history)
+    if ok:
+        logger.log("[Pilot] PASS: train loss trending down and check-set score rising.")
+        print("[Pilot] PASS — learning signal looks healthy; starting the full run.")
+        return True, sample_grid, "pass"
+    ls = ds_fp.get("label_stats") or {}
+    diag = (
+        "Pilot FAIL: train loss and check-set score both look flat.\n"
+        f"  label stats: median box {ls.get('median_box_w')}x{ls.get('median_box_h')}, "
+        f"boxes/img {ls.get('boxes_per_image')}, empty {ls.get('empty_label_fraction')}\n"
+        f"  sample grid: {sample_grid or '(none)'}\n"
+        "  likely causes: wrong/empty labels, objects too small for imgsz, "
+        "class mismatch, or augmentation destroying boxes.\n"
+        "  re-run with --skip-pilot only if you have verified the labels manually."
+    )
+    logger.log("[Pilot] " + diag.replace("\n", "\n[Pilot] "))
+    print("\n[Pilot] " + diag)
+    return False, sample_grid, diag
+
+
 def train(args):
     if not args.input:
         print("[ERROR] --input is required for fresh training.")
@@ -5666,6 +6518,8 @@ def train(args):
         print(f"  epochs     : {args.epochs}")
         print(f"  image size : {chosen['imgsz']}px")
         print(f"  patience   : {args.patience} epochs early stopping")
+        if getattr(args, "time_budget", None):
+            print(f"  time budget: {args.time_budget} hours")
         print(f"  device     : {device}")
         print(f"  output     : {run_dir}")
         print()
@@ -5676,11 +6530,21 @@ def train(args):
         guard_enabled = not getattr(args, "no_guard", False)
         guard = monitor
 
+        pilot_ok, sample_grid, pilot_diag = run_preflight_pilot(
+            args, logger, run_dir, chosen, yaml_path, device, hw, guard, ds_fp,
+        )
+        if not pilot_ok:
+            logger.log("[Run] Aborted before long training: pilot learnability check failed.")
+            return {
+                "mode": "fresh", "best": None, "run_name": run_name, "status": "pilot-failed",
+                "diagnostics": pilot_diag, "sample_grid": str(sample_grid) if sample_grid else None,
+            }
+
         state = {"run_name": run_name, "target_epochs": args.epochs, "completed_epoch": 0,
                  "provisional": True, "stable_epochs": 0, "downgrade_count": 0, "history": []}
         write_adaptive_state(run_dir, state)
 
-        chosen_cfg = chosen
+        chosen_cfg = {k: v for k, v in chosen.items() if not str(k).startswith("_")}
         status = run_adaptive_supervisor(
             args=args, logger=logger, run_dir=run_dir, run_name=run_name,
             last_pt=None, chosen=chosen_cfg, target_epochs=args.epochs,
@@ -5742,11 +6606,25 @@ def run_dry_summary(logger, args, cache, hw, hw_fp, ds_fp, device, run_name, run
     else:
         logger.log(f"[Dry Run] Cache lookup MISS for selection key {sel_key}; a real run would calibrate with probe runs.")
 
+    task = getattr(args, "dataset_task", None) or ds_fp.get("task", "detect")
+    ladder = aug_ladder_for_task(task)
+    degrees, flipud = resolve_geometry_aug(args)
+    logger.log(f"[Dry Run] Planned selection order: models largest-first × imgsz (object-size aware) × "
+               f"healthy batches {HEALTHY_BATCH_CANDIDATES} × task aug ladder ({len(ladder)} rungs); "
+               f"degraded batches {DEGRADED_BATCH_CANDIDATES} only if nothing fits batch>={MIN_HEALTHY_BATCH}.")
+    logger.log(f"[Dry Run] Task-aware aug ladder ({task}): {ladder}")
+
     cfg = static_candidate_config(args, hw, ds_fp.get("image_count") or 0, ds_fp.get("median_img_size"), cuda_available_for(device))
     if cfg:
         for note in cfg["notes"]:
             logger.log(f"[Dry Run] static note: {note}")
-        chosen = build_chosen(cfg["model"], cfg["imgsz"], cfg["batch"], cfg["workers"], cfg["multi_scale"], 1.0)
+        mosaic, copy_paste, mixup, multi_scale = ladder[0]
+        mixup = resolve_mixup(args, task, mixup)
+        chosen = build_chosen(
+            cfg["model"], cfg["imgsz"], cfg["batch"], cfg["workers"],
+            cfg["multi_scale"] if cfg["multi_scale"] else multi_scale, mosaic,
+            mixup=mixup, copy_paste=copy_paste, degrees=degrees, flipud=flipud,
+        )
         print_auto_config(logger, chosen, "dry-run static estimate (no probes)", args, hw, ds_fp, device)
         print(f"[Dry Run] Static config preview: {chosen['model']} @ {chosen['imgsz']}px batch {chosen['batch']} "
               f"workers={chosen['workers']} multi_scale={chosen['multi_scale']} mosaic={chosen['mosaic']} "
