@@ -80,10 +80,32 @@ Output:
     train_detector/runs/detect/<name>/confusion_matrix.png
 """
 
-# Expandable CUDA segments reduce fragmentation when available. Set before torch
-# import; unsupported builds/OS variants ignore the value (logged at startup).
+# Expandable CUDA segments reduce fragmentation when available. Must be set before
+# torch import. Windows / some PyTorch builds do not support it and emit a
+# UserWarning — skip (or strip) there and record what was applied for logging.
 import os as _os_for_cuda_alloc
-_os_for_cuda_alloc.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import sys as _sys_for_cuda_alloc
+
+_CUDA_ALLOC_CONF_KEY = "PYTORCH_CUDA_ALLOC_CONF"
+_CUDA_ALLOC_EXPANDABLE = "expandable_segments:True"
+
+
+def _configure_cuda_alloc_conf() -> str:
+    """Return a short description of the effective PYTORCH_CUDA_ALLOC_CONF policy."""
+    if _sys_for_cuda_alloc.platform == "win32":
+        cur = _os_for_cuda_alloc.environ.get(_CUDA_ALLOC_CONF_KEY, "")
+        if "expandable_segments" in cur:
+            parts = [p.strip() for p in cur.split(",") if p.strip() and "expandable_segments" not in p]
+            if parts:
+                _os_for_cuda_alloc.environ[_CUDA_ALLOC_CONF_KEY] = ",".join(parts)
+            else:
+                _os_for_cuda_alloc.environ.pop(_CUDA_ALLOC_CONF_KEY, None)
+        return "(unset; expandable_segments unsupported on Windows)"
+    _os_for_cuda_alloc.environ.setdefault(_CUDA_ALLOC_CONF_KEY, _CUDA_ALLOC_EXPANDABLE)
+    return _os_for_cuda_alloc.environ.get(_CUDA_ALLOC_CONF_KEY, "(unset)")
+
+
+CUDA_ALLOC_CONF_APPLIED = _configure_cuda_alloc_conf()
 
 import argparse
 import contextlib
@@ -5032,8 +5054,8 @@ def print_auto_config(logger, chosen, provenance, args, hw, ds_fp, device):
     logger.log(f"  VRAM       : {hw['vram_gb']:.1f} GB" if hw['vram_gb'] else "  VRAM       : N/A (CPU)")
     logger.log(f"  CPU cores  : {hw['cpu_cores']}")
     logger.log(f"  RAM        : {hw['ram_gb']:.1f} GB" if hw['ram_gb'] else "  RAM        : Unknown")
-    alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-    logger.log(f"  CUDA alloc : PYTORCH_CUDA_ALLOC_CONF={alloc_conf or '(unset)'}")
+    env_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "") or "(unset)"
+    logger.log(f"  CUDA alloc : applied={CUDA_ALLOC_CONF_APPLIED} | env={env_conf}")
 
     logger.log(f"\n[Dataset]")
     logger.log(f"  train imgs : {ds_fp.get('image_count')}")
