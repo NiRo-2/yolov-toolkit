@@ -85,6 +85,30 @@ def test_filter_pilot_history_drops_final_eval_refire():
     assert not td.pilot_trend_ok(history)  # unfiltered would false-fail
 
 
+def test_metric_from_trainer_prefers_tloss_dict_over_last_batch_loss():
+    """on_fit_epoch_end: trainer.metrics is val-only, trainer.loss is last-batch raw,
+    trainer.tloss is the epoch-mean dict shown in the progress bar (rust_Merged false FAIL)."""
+    class _Trainer:
+        metrics = {"metrics/mAP50(B)": 0.00022, "val/box_loss": 4.39766}
+        loss = 50.599632263183594  # last-batch raw — must NOT win for train/box_loss
+        tloss = {"box_loss": 2.536, "cls_loss": 7.792, "l1_loss": 0.04277}
+
+        def label_loss_items(self, loss_items=None, prefix="train"):
+            if loss_items is None:
+                return [f"{prefix}/{x}" for x in ("box_loss", "cls_loss", "l1_loss")]
+            return {f"{prefix}/{k}": float(v) for k, v in loss_items.items()}
+
+    t = _Trainer()
+    assert td._metric_from_trainer(t, "train/box_loss", "train/loss") == 2.536
+    assert td._metric_from_trainer(t, "metrics/mAP50(B)", "mAP50") == 0.00022
+    # rust_Merged pilot numbers with correct loss → PASS
+    history = [
+        {"epoch": 1, "loss": 2.536, "score": 0.00022},
+        {"epoch": 5, "loss": 2.436, "score": 0.00076},
+    ]
+    assert td.pilot_trend_ok(history)
+
+
 def test_estimate_calibration_probe_budget():
     # 2 healthy × 4 rungs + 2 degraded × 4 rungs + finalize slack
     assert td.estimate_calibration_probe_budget(

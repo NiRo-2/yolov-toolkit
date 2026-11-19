@@ -1453,31 +1453,55 @@ def record_calibration(cache: dict, logger, hw_fp: dict, ds_fp: dict, sel_key: s
 
 # -- Attempt tracker (callbacks + status) ---------------------------------------
 def _metric_from_trainer(trainer, *keys):
-    """Pull a float metric from trainer.metrics / trainer.validator / loss items."""
+    """
+    Pull a float metric from trainer state at on_fit_epoch_end.
+
+    Ultralytics keeps epoch-mean train losses in ``trainer.tloss`` (a dict like
+    ``{box_loss, cls_loss, ...}``), while ``trainer.metrics`` is usually val-only
+    after ``validate()``, and ``trainer.loss`` is the *last-batch* raw tensor —
+    never use that as the epoch train loss (it false-failed the rust_Merged pilot).
+    """
+    lookup = {}
     metrics = getattr(trainer, "metrics", None) or {}
     if isinstance(metrics, dict):
+        lookup.update(metrics)
+
+    tloss = getattr(trainer, "tloss", None)
+    if isinstance(tloss, dict) and tloss:
+        labeled = None
+        labeler = getattr(trainer, "label_loss_items", None)
+        if callable(labeler):
+            try:
+                labeled = labeler(tloss)
+            except Exception:
+                labeled = None
+        if not isinstance(labeled, dict):
+            labeled = {f"train/{k}": v for k, v in tloss.items()}
+        # Train epoch means win over any colliding val keys.
+        for k, v in labeled.items():
+            lookup[k] = v
+
+    for k in keys:
+        if k in lookup:
+            try:
+                return float(lookup[k])
+            except (TypeError, ValueError):
+                pass
+
+    for mk, mv in lookup.items():
+        mk_l = str(mk).lower()
         for k in keys:
-            if k in metrics:
+            # Bare "loss" is too greedy (matches val/box_loss, train/cls_loss, …).
+            if k.lower() == "loss":
+                continue
+            if k.lower() in mk_l:
                 try:
-                    return float(metrics[k])
+                    return float(mv)
                 except (TypeError, ValueError):
                     pass
-        for mk, mv in metrics.items():
-            mk_l = str(mk).lower()
-            for k in keys:
-                if k.lower() in mk_l:
-                    try:
-                        return float(mv)
-                    except (TypeError, ValueError):
-                        pass
-    loss = getattr(trainer, "loss", None)
-    if loss is not None and "train/loss" in keys:
-        try:
-            return float(loss.detach().item() if hasattr(loss, "detach") else loss)
-        except Exception:
-            pass
-    tloss = getattr(trainer, "tloss", None)
-    if tloss is not None and any("loss" in k.lower() for k in keys):
+
+    # Tensor/list epoch mean (legacy); never fall back to last-batch trainer.loss.
+    if tloss is not None and not isinstance(tloss, dict) and any("loss" in k.lower() for k in keys):
         try:
             if hasattr(tloss, "mean"):
                 return float(tloss.mean().item() if hasattr(tloss.mean(), "item") else tloss.mean())
@@ -6489,7 +6513,10 @@ def run_preflight_pilot(args, logger, run_dir, chosen, yaml_path, device, hw, gu
                 guard.start()
             except Exception:
                 pass
-        aug = chosen_augmentation(chosen)
+        aug = dict(chosen_augmentation(chosen))
+        # close_mosaic=60 on a 5-epoch pilot closes mosaic for the entire check;
+        # keep the calibrated mosaic setting active so the pilot matches real training.
+        aug["close_mosaic"] = 0
         model.train(
             data=str(pilot_yaml),
             epochs=epochs,
