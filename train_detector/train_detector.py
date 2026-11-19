@@ -2413,7 +2413,7 @@ def silence_ultralytics_training_banners():
 
 def probe_train_once(model_name, device, data_yaml, imgsz, batch, multi_scale, mosaic, mixup,
                      copy_paste, fraction, cuda_index, workers=0, degrees=0.0, flipud=0.0,
-                     cache=False, sample_gpu_util=False):
+                     cache=False, sample_gpu_util=False, probe_index=None, probe_total=None):
     """
     One 1-epoch real-dataset probe run on a representative subset (never a
     synthetic blank image probe). Returns (peak_gpu_allocated_gb,
@@ -2447,10 +2447,15 @@ def probe_train_once(model_name, device, data_yaml, imgsz, batch, multi_scale, m
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats(cuda_index)
         # Plain-English status: this is a hardware/config fit test, not training.
-        print(
-            f"[Hardware test] Checking fit: {Path(str(model_name)).name} @ {imgsz}px "
-            f"batch {batch} workers {workers} (not the real training run — probe weights discarded)"
-        )
+        if probe_index is not None and probe_total is not None:
+            print(format_hardware_test_progress(
+                probe_index, probe_total, model_name, imgsz, batch, workers,
+            ))
+        else:
+            print(
+                f"[Hardware test] Checking fit: {Path(str(model_name)).name} @ {imgsz}px "
+                f"batch {batch} workers {workers} (not the real training run — probe weights discarded)"
+            )
         with tempfile.TemporaryDirectory(prefix="yolo_mem_probe_") as tmp:
             with silence_ultralytics_training_banners():
                 model.train(
@@ -2674,11 +2679,6 @@ def calibrate_training_config(args, logger, cache, hw_fp, hw, device, data_yaml,
         "task-aware aug; lighten aug before dropping below the healthy batch floor. "
         "SAFE = memory estimate only, not a convergence guarantee."
     )
-    print(
-        "[Hardware test] Finding a safe training config for this machine "
-        "(short memory probes on a small data subset — not the real training run; probe weights are discarded)..."
-    )
-
     task = getattr(args, "dataset_task", ds_fp.get("task", "detect"))
     ladder = aug_ladder_for_task(task)
     degrees, flipud = resolve_geometry_aug(args)
@@ -2696,8 +2696,25 @@ def calibrate_training_config(args, logger, cache, hw_fp, hw, device, data_yaml,
     base_workers = int(args.workers) if args.workers is not None else min(
         calc_workers(hw.get("cpu_cores") or 4, hw.get("ram_gb")), auto_workers_limit())
 
+    # Progress budget for the first model@imgsz plan (recomputed per candidate below).
+    _budget_healthy = list(HEALTHY_BATCH_CANDIDATES) if args.batch is None else [int(args.batch)]
+    _budget_degraded = list(DEGRADED_BATCH_CANDIDATES) if args.batch is None else []
+    probe_budget = estimate_calibration_probe_budget(
+        _budget_healthy, _budget_degraded, len(ladder), finalize_extra=4,
+    )
+    print(
+        "[Hardware test] Finding a safe training config for this machine "
+        "(short memory probes on a small data subset — not the real training run; probe weights are discarded)..."
+    )
+    print(
+        f"[Hardware test] Up to ~{probe_budget} probes for this model size "
+        f"(stops early when a safe config is found; each line shows N/{probe_budget})"
+    )
+
     probe_memo = {}
     last_probe_elapsed = [None]  # mutable cell: sec for final verification probe
+    probe_counter = [0]  # mutable: number of live probes run (not memo hits)
+    probe_total = [probe_budget]
 
     def evaluate_peaks(peaks, label):
         alloc, res, rss = peaks[0], peaks[1], peaks[2]
@@ -2720,6 +2737,10 @@ def calibrate_training_config(args, logger, cache, hw_fp, hw, device, data_yaml,
             safe = probe_memo[key][1]
             logger.log(f"[Calibrate] {label}: reusing earlier probe result for {key} ({'SAFE' if safe else 'UNSAFE'})")
             return probe_memo[key]
+        probe_counter[0] += 1
+        # If finalize/throughput exceeds the estimate, stretch the denominator.
+        if probe_counter[0] > probe_total[0]:
+            probe_total[0] = probe_counter[0]
         t0 = time.perf_counter()
         try:
             peaks = probe_train_once(
@@ -2728,6 +2749,7 @@ def calibrate_training_config(args, logger, cache, hw_fp, hw, device, data_yaml,
                 fraction, cuda_index, workers=chosen_cfg["workers"],
                 degrees=chosen_cfg.get("degrees", 0.0), flipud=chosen_cfg.get("flipud", 0.0),
                 cache=chosen_cfg.get("cache", False), sample_gpu_util=sample_gpu_util,
+                probe_index=probe_counter[0], probe_total=probe_total[0],
             )
         except ProbeOOMError as e:
             logger.log(f"[Calibrate] {label}: OOM ({_short(str(e))})")
@@ -6372,6 +6394,29 @@ def build_pilot_dataset(yaml_path: Path, run_dir: Path, logger, train_n=PILOT_TR
     return out_yaml, pilot_dir
 
 
+def filter_pilot_history(history: list, scheduled_epochs: int) -> list:
+    """
+    Drop Ultralytics final_eval() re-fires of on_fit_epoch_end past the pilot schedule.
+    Those entries often carry a bogus loss spike and must not flip a healthy pilot to FAIL.
+    """
+    if not history or scheduled_epochs is None:
+        return list(history or [])
+    limit = int(scheduled_epochs)
+    out = []
+    for h in history:
+        ep = h.get("epoch")
+        if ep is not None:
+            if int(ep) > limit:
+                continue
+            out.append(h)
+        else:
+            out.append(h)
+    # Defense: if epochs were missing, still cap by count.
+    if all(h.get("epoch") is None for h in history):
+        return list(history)[:limit]
+    return out
+
+
 def pilot_trend_ok(history: list) -> bool:
     """Train loss decreasing AND check-set score rising from the first epoch."""
     if len(history) < 2:
@@ -6383,6 +6428,20 @@ def pilot_trend_ok(history: list) -> bool:
     loss_down = losses[-1] < losses[0] - 1e-6
     score_up = scores[-1] > scores[0] + 1e-4
     return bool(loss_down and score_up)
+
+
+def estimate_calibration_probe_budget(healthy, degraded, ladder_len, finalize_extra=4) -> int:
+    """Upper bound of memory probes for one model@imgsz (stops early on first SAFE)."""
+    return int(len(healthy) * ladder_len + len(degraded) * ladder_len + finalize_extra)
+
+
+def format_hardware_test_progress(index, total, model, imgsz, batch, workers) -> str:
+    """Plain-English N/M probe progress line for calibration."""
+    return (
+        f"[Hardware test] {int(index)}/{int(total)}: Checking fit: "
+        f"{Path(str(model)).name} @ {imgsz}px batch {batch} workers {workers} "
+        f"(not the real training run — probe weights discarded)"
+    )
 
 
 def run_preflight_pilot(args, logger, run_dir, chosen, yaml_path, device, hw, guard, ds_fp):
@@ -6412,13 +6471,17 @@ def run_preflight_pilot(args, logger, run_dir, chosen, yaml_path, device, hw, gu
         state = {"t0": None}
 
         def on_fit_end(trainer):
-            ep = getattr(trainer, "epoch", 0)
-            loss = _metric_from_trainer(trainer, "train/box_loss", "train/loss", "loss")
+            ep = int(getattr(trainer, "epoch", 0)) + 1
+            # final_eval() re-fires on_fit_epoch_end past the schedule with a bogus loss spike.
+            if ep > epochs:
+                return
+            # Prefer train/* metrics; bare "loss" substring matches val/box_loss and misleads the gate.
+            loss = _metric_from_trainer(trainer, "train/box_loss", "train/loss")
             score = _metric_from_trainer(
                 trainer, "metrics/mAP50(B)", "metrics/mAP50(M)", "metrics/mAP50", "mAP50",
             )
-            history.append({"epoch": int(ep) + 1, "loss": loss, "score": score})
-            logger.log(f"[Pilot] epoch {int(ep)+1}: loss={loss} score={score}")
+            history.append({"epoch": ep, "loss": loss, "score": score})
+            logger.log(f"[Pilot] epoch {ep}: loss={loss} score={score}")
 
         model.add_callback("on_fit_epoch_end", on_fit_end)
         if guard is not None:
@@ -6472,6 +6535,7 @@ def run_preflight_pilot(args, logger, run_dir, chosen, yaml_path, device, hw, gu
         if wdir.is_dir():
             shutil.rmtree(wdir, ignore_errors=True)
 
+    history = filter_pilot_history(history, scheduled_epochs=epochs)
     ok = pilot_trend_ok(history)
     if ok:
         logger.log("[Pilot] PASS: train loss trending down and check-set score rising.")

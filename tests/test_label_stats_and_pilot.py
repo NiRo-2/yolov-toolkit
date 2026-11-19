@@ -68,6 +68,39 @@ def test_pilot_trend_ok_requires_loss_down_and_score_up():
     ])
 
 
+def test_filter_pilot_history_drops_final_eval_refire():
+    """Ultralytics final_eval() re-fires on_fit_epoch_end past the scheduled epochs
+    with a bogus loss spike; that must not flip a healthy pilot to FAIL (rust_Merged)."""
+    history = [
+        {"epoch": 1, "loss": 4.39766, "score": 0.00022},
+        {"epoch": 2, "loss": 4.36458, "score": 0.00057},
+        {"epoch": 3, "loss": 4.0965, "score": 0.00031},
+        {"epoch": 4, "loss": 4.1126, "score": 0.00092},
+        {"epoch": 5, "loss": 4.08877, "score": 0.00076},
+        {"epoch": 6, "loss": 51.484, "score": 0.00076},  # final_eval re-fire
+    ]
+    filtered = td.filter_pilot_history(history, scheduled_epochs=5)
+    assert [h["epoch"] for h in filtered] == [1, 2, 3, 4, 5]
+    assert td.pilot_trend_ok(filtered)
+    assert not td.pilot_trend_ok(history)  # unfiltered would false-fail
+
+
+def test_estimate_calibration_probe_budget():
+    # 2 healthy × 4 rungs + 2 degraded × 4 rungs + finalize slack
+    assert td.estimate_calibration_probe_budget(
+        healthy=[32, 16], degraded=[8, 4], ladder_len=4, finalize_extra=4,
+    ) == 2 * 4 + 2 * 4 + 4
+
+
+def test_format_hardware_test_progress():
+    msg = td.format_hardware_test_progress(
+        7, 20, model="yolo26x.pt", imgsz=640, batch=8, workers=0,
+    )
+    assert msg.startswith("[Hardware test] 7/20:")
+    assert "yolo26x.pt" in msg
+    assert "batch 8" in msg
+
+
 def test_object_px_at_imgsz():
     assert td.object_px_at_imgsz(0.05, 640) == 32.0
     assert td.object_px_at_imgsz(None, 640) is None
