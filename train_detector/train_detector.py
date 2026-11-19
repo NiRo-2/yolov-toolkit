@@ -86,9 +86,11 @@ import os as _os_for_cuda_alloc
 _os_for_cuda_alloc.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
+import contextlib
 import functools
 import hashlib
 import json
+import logging
 import os
 import platform
 import re
@@ -2365,6 +2367,28 @@ def probe_fraction(image_count: int) -> float:
     return 64.0 / float(image_count)
 
 
+@contextlib.contextmanager
+def silence_ultralytics_training_banners():
+    """
+    Hide Ultralytics INFO lines like "Starting training for 1 epochs..." during
+    hardware memory probes so they are not mistaken for the real training run.
+    """
+    try:
+        from ultralytics.utils import LOGGER as ul_logger  # type: ignore
+    except Exception:
+        yield
+        return
+    prev = ul_logger.level
+    ul_logger.setLevel(logging.ERROR)
+    try:
+        yield
+    finally:
+        try:
+            ul_logger.setLevel(prev)
+        except Exception:
+            pass
+
+
 def probe_train_once(model_name, device, data_yaml, imgsz, batch, multi_scale, mosaic, mixup,
                      copy_paste, fraction, cuda_index, workers=0, degrees=0.0, flipud=0.0,
                      cache=False, sample_gpu_util=False):
@@ -2400,32 +2424,38 @@ def probe_train_once(model_name, device, data_yaml, imgsz, batch, multi_scale, m
         if cuda_index is not None:
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats(cuda_index)
+        # Plain-English status: this is a hardware/config fit test, not training.
+        print(
+            f"[Hardware test] Checking fit: {Path(str(model_name)).name} @ {imgsz}px "
+            f"batch {batch} workers {workers} (not the real training run — probe weights discarded)"
+        )
         with tempfile.TemporaryDirectory(prefix="yolo_mem_probe_") as tmp:
-            model.train(
-                data=str(data_yaml),
-                epochs=1,
-                fraction=fraction,
-                imgsz=int(imgsz),
-                batch=int(batch),
-                multi_scale=float(multi_scale),
-                mosaic=float(mosaic),
-                mixup=float(mixup),
-                copy_paste=float(copy_paste),
-                degrees=float(degrees),
-                flipud=float(flipud),
-                close_mosaic=0,   # keep mosaic ACTIVE during 1-epoch probes
-                workers=int(workers),
-                val=False,
-                save=False,
-                plots=False,
-                verbose=False,
-                cache=cache,
-                device=device,
-                project=str(Path(tmp) / "runs"),
-                name="memory_probe",
-                exist_ok=True,
-                save_dir=str(Path(tmp) / "runs" / "memory_probe"),
-            )
+            with silence_ultralytics_training_banners():
+                model.train(
+                    data=str(data_yaml),
+                    epochs=1,
+                    fraction=fraction,
+                    imgsz=int(imgsz),
+                    batch=int(batch),
+                    multi_scale=float(multi_scale),
+                    mosaic=float(mosaic),
+                    mixup=float(mixup),
+                    copy_paste=float(copy_paste),
+                    degrees=float(degrees),
+                    flipud=float(flipud),
+                    close_mosaic=0,   # keep mosaic ACTIVE during 1-epoch probes
+                    workers=int(workers),
+                    val=False,
+                    save=False,
+                    plots=False,
+                    verbose=False,
+                    cache=cache,
+                    device=device,
+                    project=str(Path(tmp) / "runs"),
+                    name="memory_probe",
+                    exist_ok=True,
+                    save_dir=str(Path(tmp) / "runs" / "memory_probe"),
+                )
     except Exception as e:
         if cuda_index is not None:
             try:
@@ -2622,7 +2652,10 @@ def calibrate_training_config(args, logger, cache, hw_fp, hw, device, data_yaml,
         "task-aware aug; lighten aug before dropping below the healthy batch floor. "
         "SAFE = memory estimate only, not a convergence guarantee."
     )
-    print("[Calibration] Running 1-epoch probe runs on a representative dataset subset to find a measured-safe config (probe weights are discarded)...")
+    print(
+        "[Hardware test] Finding a safe training config for this machine "
+        "(short memory probes on a small data subset — not the real training run; probe weights are discarded)..."
+    )
 
     task = getattr(args, "dataset_task", ds_fp.get("task", "detect"))
     ladder = aug_ladder_for_task(task)
