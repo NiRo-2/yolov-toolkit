@@ -72,7 +72,8 @@ def make_cfg(mosaic, copy_paste, mixup, multi_scale, batch=8):
 
 def make_supervisor_args():
     return argparse.Namespace(patience=100, memory_profile="safe",
-                              no_memory_probe=False, force_unsafe=False)
+                              no_memory_probe=False, force_unsafe=False,
+                              dataset_task="detect", time_budget=None)
 
 
 def fake_hw():
@@ -156,7 +157,8 @@ def test_supervisor_continues_after_stopped_adaptive_with_hidden_checkpoint(monk
                          yaml_path, ckpt_cfg, mode, attempt_no, state):
         seen_completed = state.get("completed_epoch")
         attempts.append({
-            "no": attempt_no, "batch": cfg["batch"], "mode": mode,
+            "no": attempt_no, "batch": cfg["batch"], "multi_scale": cfg["multi_scale"],
+            "mode": mode,
             "resume_pt": Path(resume_pt) if resume_pt else None,
             "resume_pending": state.get("resume_pending"),
             "completed_before": seen_completed,
@@ -194,17 +196,19 @@ def test_supervisor_continues_after_stopped_adaptive_with_hidden_checkpoint(monk
     logger = FakeAdaptiveLogger()
     status = td.run_adaptive_supervisor(
         args=make_supervisor_args(), logger=logger, run_dir=run_dir, run_name="t",
-        last_pt=weights / "last.pt", chosen=make_cfg(1.0, 0.3, 0.15, 0.5, batch=4), target_epochs=600,
+        last_pt=weights / "last.pt", chosen=make_cfg(1.0, 0.0, 0.0, 0.5, batch=4), target_epochs=600,
         device="0", hw=fake_hw(), guard=FakeAdaptiveGuard(), state=state,
         yaml_path=None, ckpt_cfg={}, mode="resume",
     )
 
     assert status == "completed-target"
     assert len(attempts) == 2
-    # Attempt 1 ran batch 4 and hit adaptive pressure.
+    # Attempt 1 ran batch 4 + multi_scale 0.5 and hit adaptive pressure.
     assert attempts[0]["batch"] == 4
-    # Supervisor downgraded the ladder step and resumed the SAME run from the hidden checkpoint.
-    assert attempts[1]["batch"] == 2
+    assert attempts[0]["multi_scale"] == 0.5
+    # Quality-v2: multi_scale -> 0 first (batch stays 4 until floor steps are exhausted).
+    assert attempts[1]["batch"] == 4
+    assert attempts[1]["multi_scale"] == 0.0
     assert attempts[1]["mode"] == "resume"
     assert attempts[1]["resume_pt"] == run_dir / ".adaptive" / "resumable_last.pt"
     assert attempts[1]["resume_pending"] is True
